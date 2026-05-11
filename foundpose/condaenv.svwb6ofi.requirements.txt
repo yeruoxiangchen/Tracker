@@ -1,0 +1,19 @@
+cython==3.0.10
+xformers==0.0.20
+--extra-index-url https://pypi.nvidia.com
+cuml-cu11==23.04
+--extra-index-url https://pypi.nvidia.com
+kornia==0.7.2
+pypng==0.20220715.0
+triangle==20200424
+glumpy==1.2.1
+pycocotools==2.0
+scikit-learn==1.5.0
+scikit-image==0.22.0
+imageio==2.34.1
+pyopengl==3.1.0
+pyglet==2.0.15
+pytz==2024.1
+pyrender==0.1.45
+webdataset==0.2.86
+opencv-python==4.5.5.62

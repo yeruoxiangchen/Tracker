@@ -1,0 +1,3 @@
+dataloader:
+  _target_: dataloader.single.SingleImage
+  root_dir: ${machine.root_dir}/bop_datasets/

@@ -1,0 +1,196 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Env
+.env
+.venv/
+venv/
+env/
+conda_env/
+
+# Logs / outputs
+*.log
+logs/
+runs/
+outputs/
+output/
+tmp/
+temp/
+wandb/
+checkpoints/
+
+# Data / weights / large files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.pkl
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# IDE / system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== Large model/checkpoint files =====
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.pkl
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# ===== Archives =====
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# ===== 3D / dataset large assets =====
+*.obj
+*.ply
+*.db
+*.database
+
+# ===== Common output/cache/results =====
+results/
+result/
+outputs/
+output/
+checkpoints/
+ckpts/
+weights/
+runs/
+logs/
+tmp/
+temp/
+cache/
+.cache/
+wandb/
+
+# ===== Python/cache/env =====
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+.venv/
+venv/
+env/
+conda_env/
+
+# ===== Nested git repos copied into project =====
+**/.git/
+
+# ===== Specific directories from your find result =====
+InstantMesh/ckpts/
+gotrack/checkpoints/
+ReconViaGen/weights/
+ReconViaGen/sam2/.git/
+ReconViaGen/sam2/checkpoints/
+foundpose/results/
+foundpose/templates/
+foundpose/datasets/
+CoarseModel/results/
+CoarseModel/datasets/
+CoarseModel/configs/infer/*/*/cached_optimization_data.pkl
+sam2/.git/
+sam2/checkpoints/
+omniglue/models/
+
+# ===== Large model/checkpoint files =====
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.pkl
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# ===== Archives =====
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# ===== 3D / dataset large assets =====
+*.obj
+*.ply
+*.db
+*.database
+
+# ===== Common output/cache/results =====
+results/
+result/
+outputs/
+output/
+checkpoints/
+ckpts/
+weights/
+runs/
+logs/
+tmp/
+temp/
+cache/
+.cache/
+wandb/
+
+# ===== Python/cache/env =====
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+.venv/
+venv/
+env/
+conda_env/
+
+# ===== Nested git repos copied into project =====
+**/.git/
+
+# ===== Specific directories from your find result =====
+InstantMesh/ckpts/
+gotrack/checkpoints/
+ReconViaGen/weights/
+ReconViaGen/sam2/.git/
+ReconViaGen/sam2/checkpoints/
+foundpose/results/
+foundpose/templates/
+foundpose/datasets/
+CoarseModel/results/
+CoarseModel/datasets/
+CoarseModel/configs/infer/*/*/cached_optimization_data.pkl
+sam2/.git/
+sam2/checkpoints/
+omniglue/models/

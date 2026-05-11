@@ -1,0 +1,9 @@
+gen_templates2 copy是原版
+export PYTHONPATH=/home/zjr/Tracker/CoarseModel/external/dinov2
+export BOP_PATH=/home/zjr/Tracker/foundpose/datasets
+python CoarseModel/core/gen_templates.py --opts-path /home/zjr/Tracker/CoarseModel/configs/gen_templates/heimei.json
+python CoarseModel/core/gen_repre.py --opts-path /home/zjr/Tracker/CoarseModel/configs/gen_repre/heimei.json
+python CoarseModel/estimation.py
+
+
+python CoarseModel/estimation_4stage_defo.py 3.12最佳
