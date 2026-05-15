@@ -1,0 +1,27 @@
+{
+    "gen_repre_auto_opts": {
+        "version": "v1",
+        "templates_version": "v1",
+        "object_dataset": "reconviagen_20260514_071732",
+        "object_lids": [
+            1
+        ],
+        "extractor_name": "dinov2_version=vits14-reg_stride=14_facet=token_layer=9_logbin=0_norm=1",
+        "grid_cell_size": 14.0,
+        "apply_pca": true,
+        "pca_components": 256,
+        "pca_whiten": false,
+        "pca_max_samples_for_fitting": 100000,
+        "cluster_features": true,
+        "cluster_num": 2048,
+        "template_desc_opts": {
+            "desc_type": "tfidf",
+            "tfidf_knn_metric": "l2",
+            "tfidf_knn_k": 3,
+            "tfidf_soft_assign": false,
+            "tfidf_soft_sigma_squared": 10.0
+        },
+        "overwrite": true,
+        "debug": true
+    }
+}

@@ -156,19 +156,19 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # Stage 3: Visualization
     # -------------------------------------------------------------------------
-    logger.info("Visualizing final results...")
-    for data in tqdm(all_optimization_data, desc="Final visualization"):
-        visualize_projection(
-            image_path=data["image_path"],
-            output_dir=output_dir,
-            K=data["K"],
-            T_W2C=data["T_w2c"],
-            T_M2W=T_M2W_final,
-            model_vertices=model_vertices,
-            model_faces=model_faces,
-            image_name=f"projected_{os.path.basename(data['image_path'])}",
-            root_name="optvis"
-        )
+    # logger.info("Visualizing final results...")
+    # for data in tqdm(all_optimization_data, desc="Final visualization"):
+    #     visualize_projection(
+    #         image_path=data["image_path"],
+    #         output_dir=output_dir,
+    #         K=data["K"],
+    #         T_W2C=data["T_w2c"],
+    #         T_M2W=T_M2W_final,
+    #         model_vertices=model_vertices,
+    #         model_faces=model_faces,
+    #         image_name=f"projected_{os.path.basename(data['image_path'])}",
+    #         root_name="optvis"
+    #     )
 
     logger.info("Starting model deformation refinement...")
     t3_start = time.time()

@@ -52,8 +52,8 @@ def build_optimization_data(
     rgb_files = sorted(f for f in os.listdir(rgb_dir) if f.endswith((".jpg", ".png")))
     mask_files = sorted(f for f in os.listdir(mask_dir) if f.endswith(".png"))
 
-    rgb_files=rgb_files[::10]
-    mask_files=mask_files[::10]
+    # rgb_files=rgb_files[::10]
+    # mask_files=mask_files[::10]
     all_optimization_data = []
     all_corresps_data = []
 

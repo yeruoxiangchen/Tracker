@@ -1,6 +1,7 @@
 # core/global_optimize.py
 import os
 import cv2
+import json
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
@@ -259,6 +260,400 @@ def error_optimize_uniform_joint(params, all_data, s_init_scalar, lambda_3d):
         return np.concatenate([res_2d, [res_3d_penalty]])
     return res_2d
 
+
+def _best_pose_to_T_m2c(corr_data, scale=1.0, scaled_rotation=False):
+    best_pose = corr_data.best_pose
+    T_m2c = np.eye(4, dtype=np.float64)
+    R_m2c = np.asarray(best_pose["R_m2c"], dtype=np.float64)
+    t_m2c = np.asarray(best_pose["t_m2c"], dtype=np.float64).reshape(3)
+    T_m2c[:3, :3] = R_m2c * scale if scaled_rotation else R_m2c
+    T_m2c[:3, 3] = t_m2c * scale
+    return T_m2c
+
+
+def _camera_center_from_T_w2c(T_w2c):
+    T_w2c = np.asarray(T_w2c, dtype=np.float64)
+    return -T_w2c[:3, :3].T @ T_w2c[:3, 3]
+
+
+def _model_camera_center_from_corr(corr_data):
+    best_pose = corr_data.best_pose
+    R_m2c = np.asarray(best_pose["R_m2c"], dtype=np.float64)
+    t_m2c = np.asarray(best_pose["t_m2c"], dtype=np.float64).reshape(3)
+    return -R_m2c.T @ t_m2c
+
+
+def _robust_threshold(values, floor_value, cap_value):
+    values = np.asarray(values, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return cap_value
+    med = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - med)))
+    sigma = 1.4826 * mad
+    threshold = med + 3.0 * sigma
+    threshold = max(threshold, floor_value)
+    return min(threshold, cap_value)
+
+
+def _compute_robust_initial_scale(all_optimization_data, all_corresps_data):
+    """Estimate uniform scale from all usable camera-baseline pairs."""
+    centers_w = [_camera_center_from_T_w2c(d["T_w2c"]) for d in all_optimization_data]
+    centers_m = [_model_camera_center_from_corr(c) for c in all_corresps_data]
+
+    ratios = []
+    pair_info = []
+    for i in range(len(centers_w)):
+        for j in range(i + 1, len(centers_w)):
+            dist_w = float(np.linalg.norm(centers_w[i] - centers_w[j]))
+            dist_m = float(np.linalg.norm(centers_m[i] - centers_m[j]))
+            if dist_w < 0.01 or dist_m < 1e-5:
+                continue
+            ratio = dist_w / (dist_m + 1e-9)
+            if np.isfinite(ratio) and ratio > 0:
+                ratios.append(ratio)
+                pair_info.append((i, j, dist_w, dist_m, ratio))
+
+    if not ratios:
+        print("Warning: no usable camera-baseline pairs, fallback to scale=1.0")
+        return 1.0, {
+            "pair_count": 0,
+            "inlier_pair_count": 0,
+            "median": 1.0,
+            "min": None,
+            "max": None,
+        }
+
+    ratios = np.asarray(ratios, dtype=np.float64)
+    median = float(np.median(ratios))
+    mad = float(np.median(np.abs(ratios - median)))
+    sigma = max(1.4826 * mad, 1e-9)
+    inlier_mask = np.abs(ratios - median) <= max(3.0 * sigma, 0.15 * median)
+    inlier_ratios = ratios[inlier_mask]
+    if inlier_ratios.size == 0:
+        inlier_ratios = ratios
+
+    scale = float(np.median(inlier_ratios))
+    print("\n--- Initializing Scale via Robust Multi-frame Camera Baselines ---")
+    print(
+        f"Calculated s_init: {scale:.6f} "
+        f"(pairs: {len(ratios)}, inliers: {len(inlier_ratios)}, "
+        f"ratio min/median/max: {ratios.min():.6f}/{median:.6f}/{ratios.max():.6f})"
+    )
+    return scale, {
+        "pair_count": int(len(ratios)),
+        "inlier_pair_count": int(len(inlier_ratios)),
+        "median": median,
+        "min": float(ratios.min()),
+        "max": float(ratios.max()),
+        "scale": scale,
+        "pairs": [
+            {
+                "i": int(i),
+                "j": int(j),
+                "dist_w": float(dist_w),
+                "dist_m": float(dist_m),
+                "ratio": float(ratio),
+                "inlier": bool(inlier_mask[k]),
+            }
+            for k, (i, j, dist_w, dist_m, ratio) in enumerate(pair_info)
+        ],
+    }
+
+
+def _compose_frame_m2w(opt_data, corr_data, scale, scaled_rotation=False):
+    T_m2c = _best_pose_to_T_m2c(corr_data, scale=scale, scaled_rotation=scaled_rotation)
+    return np.linalg.inv(np.asarray(opt_data["T_w2c"], dtype=np.float64)) @ T_m2c
+
+
+def _reference_pose_from_indices(frame_Ts, indices):
+    indices = list(indices)
+    if not indices:
+        indices = list(range(len(frame_Ts)))
+    translations = np.stack([frame_Ts[i][:3, 3] for i in indices], axis=0)
+    rotations = np.stack([frame_Ts[i][:3, :3] for i in indices], axis=0)
+    t_ref = np.median(translations, axis=0)
+    R_ref = Rotation.from_matrix(rotations).mean().as_matrix()
+    return R_ref, t_ref
+
+
+def _projection_error_for_T(data, T_M2W):
+    X = data["X_3d"]
+    q = data["q_2d"]
+    if len(X) == 0:
+        return float("inf"), float("inf")
+    X_h = np.hstack([X, np.ones((len(X), 1), dtype=X.dtype)])
+    X_c = (data["T_w2c"] @ T_M2W @ X_h.T).T[:, :3]
+    valid = X_c[:, 2] > 1e-6
+    if not np.any(valid):
+        return float("inf"), float("inf")
+    X_c = X_c[valid]
+    q = q[valid]
+    uvw = (data["K"] @ X_c.T).T
+    uv = uvw[:, :2] / uvw[:, 2:3]
+    err = np.linalg.norm(uv - q, axis=1)
+    if err.size == 0:
+        return float("inf"), float("inf")
+    return float(np.median(err)), float(np.mean(err))
+
+
+def _make_project_T(R_m2w, t_m2w, scale):
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R_m2w @ np.diag([scale, scale, scale])
+    T[:3, 3] = t_m2w
+    return T
+
+
+def _measure_frame_consistency(all_optimization_data, all_corresps_data, frame_Ts, ref_indices, scale):
+    R_ref, t_ref = _reference_pose_from_indices(frame_Ts, ref_indices)
+    ref_rot = Rotation.from_matrix(R_ref)
+    T_ref_project = _make_project_T(R_ref, t_ref, scale)
+    records = []
+
+    for idx, (opt_data, corr_data, T_i) in enumerate(zip(all_optimization_data, all_corresps_data, frame_Ts)):
+        rot_err = (ref_rot.inv() * Rotation.from_matrix(T_i[:3, :3])).magnitude() * 180.0 / np.pi
+        trans_err = float(np.linalg.norm(T_i[:3, 3] - t_ref))
+        ref_reproj_median, ref_reproj_mean = _projection_error_for_T(opt_data, T_ref_project)
+        self_project_T = _compose_frame_m2w(opt_data, corr_data, scale, scaled_rotation=True)
+        self_reproj_median, self_reproj_mean = _projection_error_for_T(opt_data, self_project_T)
+        records.append(
+            {
+                "index": idx,
+                "frame_name": opt_data["frame_name"],
+                "num_corr": int(len(opt_data["q_2d"])),
+                "rot_err_deg": float(rot_err),
+                "trans_err": trans_err,
+                "ref_reproj_median_px": ref_reproj_median,
+                "ref_reproj_mean_px": ref_reproj_mean,
+                "self_reproj_median_px": self_reproj_median,
+                "self_reproj_mean_px": self_reproj_mean,
+            }
+        )
+    return records, R_ref, t_ref
+
+
+def _select_consistent_frames(records, min_keep):
+    rot_values = [r["rot_err_deg"] for r in records]
+    trans_values = [r["trans_err"] for r in records]
+    reproj_values = [r["ref_reproj_median_px"] for r in records]
+    rot_thr = _robust_threshold(rot_values, floor_value=18.0, cap_value=45.0)
+    trans_thr = _robust_threshold(trans_values, floor_value=0.04, cap_value=0.18)
+    reproj_thr = _robust_threshold(reproj_values, floor_value=30.0, cap_value=90.0)
+    min_corr = 25
+
+    kept = []
+    for r in records:
+        reasons = []
+        if r["num_corr"] < min_corr:
+            reasons.append("few_corr")
+        if r["rot_err_deg"] > rot_thr:
+            reasons.append("rot")
+        if r["trans_err"] > trans_thr:
+            reasons.append("trans")
+        if r["ref_reproj_median_px"] > reproj_thr:
+            reasons.append("reproj")
+        r["drop_reasons"] = reasons
+        r["keep"] = len(reasons) == 0
+        if r["keep"]:
+            kept.append(r["index"])
+
+    if len(kept) < min_keep:
+        def score(r):
+            corr_penalty = max(0.0, (min_corr - r["num_corr"]) / float(min_corr))
+            return (
+                r["rot_err_deg"] / max(rot_thr, 1e-6)
+                + r["trans_err"] / max(trans_thr, 1e-6)
+                + r["ref_reproj_median_px"] / max(reproj_thr, 1e-6)
+                + corr_penalty
+            )
+
+        ranked = sorted(records, key=score)
+        keep_set = set(r["index"] for r in ranked[:min_keep])
+        kept = sorted(keep_set)
+        for r in records:
+            if r["index"] in keep_set:
+                r["keep"] = True
+                r["drop_reasons"] = []
+            else:
+                r["keep"] = False
+                if not r["drop_reasons"]:
+                    r["drop_reasons"] = ["ranked_out"]
+
+    thresholds = {
+        "rot_err_deg": float(rot_thr),
+        "trans_err": float(trans_thr),
+        "ref_reproj_median_px": float(reproj_thr),
+        "min_corr": int(min_corr),
+    }
+    return kept, thresholds
+
+
+def _write_pose_consistency_outputs(
+    output_dir,
+    records,
+    thresholds,
+    scale,
+    scale_stats,
+    all_optimization_data,
+    all_corresps_data,
+    model_vertices,
+    model_faces,
+    R_ref,
+    t_ref,
+):
+    diag_dir = os.path.join(output_dir, "pose_consistency")
+    os.makedirs(diag_dir, exist_ok=True)
+
+    payload = {
+        "scale": float(scale),
+        "scale_stats": scale_stats,
+        "thresholds": thresholds,
+        "kept_frames": [r["frame_name"] for r in records if r.get("keep")],
+        "dropped_frames": [
+            {"frame_name": r["frame_name"], "reasons": r.get("drop_reasons", [])}
+            for r in records if not r.get("keep")
+        ],
+        "records": records,
+    }
+    with open(os.path.join(diag_dir, "pose_consistency.json"), "w") as f:
+        json.dump(payload, f, indent=2)
+
+    csv_path = os.path.join(diag_dir, "pose_consistency.csv")
+    with open(csv_path, "w") as f:
+        f.write(
+            "index,frame_name,keep,num_corr,rot_err_deg,trans_err,"
+            "ref_reproj_median_px,self_reproj_median_px,drop_reasons\n"
+        )
+        for r in records:
+            f.write(
+                f"{r['index']},{r['frame_name']},{int(bool(r.get('keep')))},"
+                f"{r['num_corr']},{r['rot_err_deg']:.6f},{r['trans_err']:.6f},"
+                f"{r['ref_reproj_median_px']:.6f},{r['self_reproj_median_px']:.6f},"
+                f"{'|'.join(r.get('drop_reasons', []))}\n"
+            )
+
+    row_h = 28
+    width = 1250
+    height = max(240, 120 + row_h * len(records))
+    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    cv2.putText(canvas, f"Pose consistency diagnostics  scale={scale:.6f}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2)
+    cv2.putText(
+        canvas,
+        f"thresholds: rot<={thresholds['rot_err_deg']:.1f}deg  trans<={thresholds['trans_err']:.3f}  ref_reproj<={thresholds['ref_reproj_median_px']:.1f}px",
+        (20, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (40, 40, 40),
+        1,
+    )
+    header = "idx keep frame              corr   rot_deg   trans_m   ref_px   self_px   reasons"
+    cv2.putText(canvas, header, (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1)
+    for row, r in enumerate(records):
+        y = 135 + row * row_h
+        color = (20, 130, 20) if r.get("keep") else (20, 20, 220)
+        text = (
+            f"{r['index']:03d}  {int(bool(r.get('keep')))}    {r['frame_name']:<16} "
+            f"{r['num_corr']:4d}  {r['rot_err_deg']:8.2f}  {r['trans_err']:8.4f} "
+            f"{r['ref_reproj_median_px']:7.2f}  {r['self_reproj_median_px']:7.2f} "
+            f"{'|'.join(r.get('drop_reasons', []))}"
+        )
+        cv2.putText(canvas, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+    cv2.imwrite(os.path.join(diag_dir, "pose_consistency_summary.png"), canvas)
+
+    T_ref_project = _make_project_T(R_ref, t_ref, scale)
+    for opt_data, corr_data in zip(all_optimization_data, all_corresps_data):
+        image_name = f"ref_{os.path.basename(opt_data['image_path'])}"
+        visualize_projection(
+            image_path=opt_data["image_path"],
+            output_dir=output_dir,
+            K=opt_data["K"],
+            T_W2C=opt_data["T_w2c"],
+            T_M2W=T_ref_project,
+            model_vertices=model_vertices,
+            model_faces=model_faces,
+            image_name=image_name,
+            root_name="pose_consistency_ref",
+        )
+        T_self_project = _compose_frame_m2w(opt_data, corr_data, scale, scaled_rotation=True)
+        visualize_projection(
+            image_path=opt_data["image_path"],
+            output_dir=output_dir,
+            K=opt_data["K"],
+            T_W2C=opt_data["T_w2c"],
+            T_M2W=T_self_project,
+            model_vertices=model_vertices,
+            model_faces=model_faces,
+            image_name=f"self_{os.path.basename(opt_data['image_path'])}",
+            root_name="pose_consistency_self",
+        )
+
+
+def _diagnose_and_filter_pose_frames(
+    all_optimization_data,
+    all_corresps_data,
+    model_vertices,
+    model_faces,
+    output_dir,
+    scale,
+    scale_stats,
+):
+    n = len(all_optimization_data)
+    if n <= 2:
+        print("Warning: not enough frames for pose-consistency filtering; keeping all frames.")
+        return list(range(n))
+
+    frame_Ts = [
+        _compose_frame_m2w(opt_data, corr_data, scale, scaled_rotation=False)
+        for opt_data, corr_data in zip(all_optimization_data, all_corresps_data)
+    ]
+
+    records, _R_ref, _t_ref = _measure_frame_consistency(
+        all_optimization_data,
+        all_corresps_data,
+        frame_Ts,
+        ref_indices=range(n),
+        scale=scale,
+    )
+    min_keep = min(n, max(3, min(8, n // 2)))
+    provisional_kept, _thresholds = _select_consistent_frames(records, min_keep=min_keep)
+
+    records, R_ref, t_ref = _measure_frame_consistency(
+        all_optimization_data,
+        all_corresps_data,
+        frame_Ts,
+        ref_indices=provisional_kept,
+        scale=scale,
+    )
+    kept, thresholds = _select_consistent_frames(records, min_keep=min_keep)
+    _write_pose_consistency_outputs(
+        output_dir=output_dir,
+        records=records,
+        thresholds=thresholds,
+        scale=scale,
+        scale_stats=scale_stats,
+        all_optimization_data=all_optimization_data,
+        all_corresps_data=all_corresps_data,
+        model_vertices=model_vertices,
+        model_faces=model_faces,
+        R_ref=R_ref,
+        t_ref=t_ref,
+    )
+
+    dropped = [r for r in records if not r.get("keep")]
+    if dropped:
+        print("\n--- Pose Consistency Filtering ---")
+        print(f"Kept {len(kept)}/{n} frames. Diagnostics written to: {os.path.join(output_dir, 'pose_consistency')}")
+        for r in dropped:
+            print(
+                f"Drop {r['frame_name']}: reasons={r.get('drop_reasons', [])}, "
+                f"rot={r['rot_err_deg']:.2f}deg, trans={r['trans_err']:.4f}, "
+                f"ref_reproj={r['ref_reproj_median_px']:.2f}px"
+            )
+    else:
+        print(f"Pose consistency check kept all {n} frames. Diagnostics written to: {os.path.join(output_dir, 'pose_consistency')}")
+
+    return kept
+
 def optimize_global_pose(
     all_optimization_data,
     all_corresps_data,
@@ -273,41 +668,31 @@ def optimize_global_pose(
 ):
     """两阶段优化：先联合优化，再固定 RT 优化 Scale"""
 
-    # --- 1. 获取初始位姿与 Scale ---
-    best_pose = all_corresps_data[init_frame_id].best_pose
-    T_m2c = np.eye(4)
-    T_m2c[:3, :3] = best_pose["R_m2c"]
-    T_m2c[:3, 3] = best_pose["t_m2c"]
+    if len(all_optimization_data) != len(all_corresps_data):
+        raise ValueError("Optimization data and correspondence data length mismatch.")
+    if len(all_optimization_data) == 0:
+        raise ValueError("No valid frames for global pose optimization.")
 
-    T_w2c = all_optimization_data[init_frame_id]["T_w2c"]
-    T_m2w_init = np.linalg.inv(T_w2c) @ T_m2c
+    # --- 1. Robust scale init + pose-consistency diagnostics/filtering ---
+    s_init_scalar, scale_stats = _compute_robust_initial_scale(all_optimization_data, all_corresps_data)
+    kept_indices = _diagnose_and_filter_pose_frames(
+        all_optimization_data=all_optimization_data,
+        all_corresps_data=all_corresps_data,
+        model_vertices=model_vertices,
+        model_faces=model_faces,
+        output_dir=output_dir,
+        scale=s_init_scalar,
+        scale_stats=scale_stats,
+    )
+    if len(kept_indices) < len(all_optimization_data):
+        all_optimization_data[:] = [all_optimization_data[i] for i in kept_indices]
+        all_corresps_data[:] = [all_corresps_data[i] for i in kept_indices]
+        init_frame_id = 0
+        s_init_scalar, scale_stats = _compute_robust_initial_scale(all_optimization_data, all_corresps_data)
+    else:
+        init_frame_id = min(init_frame_id, len(all_optimization_data) - 1)
 
-    R_init = T_m2w_init[:3, :3]
-    t_init = T_m2w_init[:3, 3]
-
-    print(f"\n--- Initializing Scale via Camera Baseline (Frame {init_frame_id} & {init_frame_id+2}) ---")
-    idx1 = init_frame_id
-    idx2 = init_frame_id + 2
-    def get_cam_center(opt_data, corr_data, f_id):
-        # World 空间相机中心
-        T_w2c = opt_data[f_id]["T_w2c"]
-        C_w = -T_w2c[:3, :3].T @ T_w2c[:3, 3]
-        # Model 空间相机中心 (未缩放)
-        best_pose = corr_data[f_id].best_pose
-        R_m2c, t_m2c = best_pose["R_m2c"], best_pose["t_m2c"]
-        C_m = -R_m2c.T @ t_m2c.ravel()
-        return C_w, C_m
-    try:
-        Cw1, Cm1 = get_cam_center(all_optimization_data, all_corresps_data, idx1)
-        Cw2, Cm2 = get_cam_center(all_optimization_data, all_corresps_data, idx2)
-        dist_w = np.linalg.norm(Cw1 - Cw2)
-        dist_m = np.linalg.norm(Cm1 - Cm2)
-        s_init_scalar = dist_w / (dist_m + 1e-6)
-    except (IndexError, KeyError):
-        print("Warning: Baseline frames not found, fallback to scale=1.0")
-        s_init_scalar = 1.0
     s_init = np.array([s_init_scalar, s_init_scalar, s_init_scalar])
-    print(f"Calculated s_init: {s_init_scalar:.6f} (Baseline W: {dist_w:.4f}, M: {dist_m:.4f})")
     
     best_pose = all_corresps_data[init_frame_id].best_pose
     T_m2c_scaled = np.eye(4)
@@ -1037,4 +1422,3 @@ def compute_vertex_node_weights(vertices, node_pos, k=4):
     weights = weights / (w_sum + 1e-8)
     
     return idxs, weights
-
