@@ -217,6 +217,7 @@ def default_infer_config(dataset_name: str) -> dict:
             "use_detections": True,
             "num_preds_factor": 1.0,
             "vis_results": True,
+            "use_optimization_cache": False,
             "debug": True,
         }
     }

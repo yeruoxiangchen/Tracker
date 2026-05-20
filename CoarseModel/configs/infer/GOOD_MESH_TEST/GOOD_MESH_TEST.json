@@ -27,6 +27,9 @@
         "use_detections": true,
         "num_preds_factor": 1.0,
         "vis_results": true,
-        "debug": true
+        "use_optimization_cache": false,
+        "debug": true,
+        "use_geometry_corresp_filter": true,
+        "use_pose_selection_score": false
     }
 }

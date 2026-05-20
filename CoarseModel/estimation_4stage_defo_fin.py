@@ -104,11 +104,32 @@ def main() -> None:
     # -------------------------------------------------------------------------
     logger.info("Preparing per-frame optimization data...")
     t1_start = time.time()
-    try:
-        all_optimization_data, all_corresps_data = load_optimization_cache(data_cache_path)
-        logger.info(f"Loaded cached data: {len(all_optimization_data)} frames.")
-    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
-        logger.info("Cache not found or invalid. Rebuilding...")
+    use_optimization_cache = bool(getattr(opts, "use_optimization_cache", False))
+    if use_optimization_cache:
+        try:
+            all_optimization_data, all_corresps_data = load_optimization_cache(data_cache_path)
+            logger.info(f"Loaded cached data: {len(all_optimization_data)} frames.")
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+            logger.info("Cache not found or invalid. Rebuilding...")
+            all_optimization_data, all_corresps_data = build_optimization_data(
+                rgb_dir=rgb_dir,
+                mask_dir=mask_dir,
+                colmap_dir=colmap_dir,
+                opts=opts,)
+
+            if len(all_optimization_data) == 0:
+                logger.error("No valid frames collected. Abort.")
+                return
+            save_optimization_cache(
+                {
+                    "optimization_data": all_optimization_data,
+                    "corresps_data": all_corresps_data,
+                },
+                data_cache_path,
+            )
+            logger.info(f"Saved optimization cache: {len(all_optimization_data)} frames.")
+    else:
+        logger.info("Optimization cache disabled by config. Rebuilding without reading or writing cache.")
         all_optimization_data, all_corresps_data = build_optimization_data(
             rgb_dir=rgb_dir,
             mask_dir=mask_dir,
@@ -118,14 +139,6 @@ def main() -> None:
         if len(all_optimization_data) == 0:
             logger.error("No valid frames collected. Abort.")
             return
-        save_optimization_cache(
-            {
-                "optimization_data": all_optimization_data,
-                "corresps_data": all_corresps_data,
-            },
-            data_cache_path,
-        )
-        logger.info(f"Saved optimization cache: {len(all_optimization_data)} frames.")
 
     t1_end = time.time()
     stage_1_time = t1_end - t1_start

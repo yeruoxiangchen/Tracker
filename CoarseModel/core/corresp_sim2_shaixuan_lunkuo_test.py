@@ -1137,13 +1137,14 @@ def extract_correspondences(
             # Find the best coarse pose.
             best_coarse_quality = None
             best_coarse_pose_id = 0
+            pose_score_key = "selection_score" if getattr(opts, "use_pose_selection_score", True) else "quality"
             for coarse_pose_id, pose in enumerate(coarse_poses):
                 if (
                     best_coarse_quality is None
-                    or pose["selection_score"] > best_coarse_quality
+                    or pose[pose_score_key] > best_coarse_quality
                 ):
                     best_coarse_pose_id = coarse_pose_id
-                    best_coarse_quality = pose["selection_score"]
+                    best_coarse_quality = pose[pose_score_key]
             best_corresp_id = coarse_poses[best_coarse_pose_id]["corresp_id"]
             corresp_final = coarse_poses[best_coarse_pose_id]["corresp"]
             
@@ -1152,9 +1153,11 @@ def extract_correspondences(
             logger.info(
                 f"Final selected template ID: {final_template_id} "
                 f"(from coarse_pose_id: {best_coarse_pose_id}, "
+                f"score_key={pose_score_key}, "
                 f"corr {coarse_poses[best_coarse_pose_id]['num_corr_before_pnp']} -> "
                 f"{coarse_poses[best_coarse_pose_id]['num_corr_after_pnp']}, "
                 f"score={coarse_poses[best_coarse_pose_id]['selection_score']:.3f}, "
+                f"quality={coarse_poses[best_coarse_pose_id]['quality']:.1f}, "
                 f"repr={coarse_poses[best_coarse_pose_id]['reproj_median']:.2f}px, "
                 f"cov={coarse_poses[best_coarse_pose_id]['coverage_score']:.2f}, "
                 f"mask={coarse_poses[best_coarse_pose_id]['mask_score']:.2f})"

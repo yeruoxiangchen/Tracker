@@ -58,6 +58,7 @@ class InferOpts(NamedTuple):
     geom_filter_template_edge_sigma: float = 4.0
     geom_filter_min_score_quantile: float = 0.25
     pnp_use_inlier_corresp: bool = True
+    use_pose_selection_score: bool = True
 
     # --- PnP ---
     pnp_type: str = "opencv"
@@ -80,4 +81,5 @@ class InferOpts(NamedTuple):
     vis_corresp_top_n: int = 100
     vis_feat_map: bool = True
     vis_for_paper: bool = True
+    use_optimization_cache: bool = False
     debug: bool = True
