@@ -137,21 +137,17 @@ def lift_2d_points_to_3d(
 ) -> torch.Tensor:
     device = points.device
 
-    # The considered focal length is the average of fx and fy.
-    focal = 0.5 * (camera_model.f[0] + camera_model.f[1])
-
-    # 3D points in the camera space.
-    points_3d_in_cam = torch.hstack(
-        [
-            points - torch.as_tensor(camera_model.c).to(torch.float32).to(device),
-            focal * torch.ones(points.shape[0], 1).to(torch.float32).to(device),
-        ]
-    )
     depths = depth_image[
         torch.floor(points[:, 1]).to(torch.int32),
         torch.floor(points[:, 0]).to(torch.int32),
     ].reshape(-1, 1)
-    points_3d_in_cam *= depths / points_3d_in_cam[:, 2].reshape(-1, 1)
+
+    f = torch.as_tensor(camera_model.f, dtype=torch.float32, device=device)
+    c = torch.as_tensor(camera_model.c, dtype=torch.float32, device=device)
+
+    # Depth maps store camera-space Z. Back-project with independent fx/fy.
+    xy = (points - c.reshape(1, 2)) * depths / f.reshape(1, 2)
+    points_3d_in_cam = torch.hstack([xy, depths])
 
     return points_3d_in_cam
 

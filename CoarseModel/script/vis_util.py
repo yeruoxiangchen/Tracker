@@ -70,7 +70,7 @@ def visualize_pose_overlay(
     # 绘制 Mesh 面片边缘
     for face in mesh.faces:
         p1, p2, p3 = pts_2d[face]
-        cv2.polylines(overlay, [np.array([p1, p2, p3])], True, (150, 25, 120), 1, cv2.LINE_AA)
+        cv2.polylines(overlay, [np.array([p1, p2, p3])], True, (50, 125, 120), 1, cv2.LINE_AA)
 
     # 半透明叠加
     cv2.addWeighted(overlay, alpha, vis_img, 1 - alpha, 0, vis_img)

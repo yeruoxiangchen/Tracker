@@ -9,6 +9,8 @@ import numpy.typing as npt
 import imageio.v2 as iio
 import png
 
+DEFAULT_DEPTH_SCALE = 1000.0
+
 
 def load_im(path: Union[str,Path]):
     """Loads an image from a file.
@@ -38,24 +40,48 @@ def load_depth(path: Union[str,Path]):
     :param path: Path to the depth image file to load.
     :return: ndarray with the loaded depth image.
     """
-    return iio.imread(path).astype(np.float32)
+    path = Path(path)
+    depth = iio.imread(path).astype(np.float32)
+    scale_path = Path(str(path) + ".json")
+    if scale_path.exists():
+        with open(scale_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        depth_scale = float(meta.get("depth_scale", DEFAULT_DEPTH_SCALE))
+        if depth_scale > 0:
+            depth = depth / depth_scale
+    return depth
 
 
-def save_depth(path: Union[str,Path], im: npt.NDArray):
+def save_depth(path: Union[str,Path], im: npt.NDArray, depth_scale: float = DEFAULT_DEPTH_SCALE):
     """Saves a depth image (16-bit) to a PNG file.
 
     :param path: Path to the output depth image file.
     :param im: ndarray with the depth image to save.
+    :param depth_scale: Scale factor used to preserve sub-unit depth precision.
     """
-    if Path(path).suffix.lower() != ".png":
+    path = Path(path)
+    if path.suffix.lower() != ".png":
         raise ValueError("Only PNG format is currently supported.")
 
-    im_uint16 = np.round(im).astype(np.uint16)
+    if depth_scale <= 0:
+        raise ValueError("depth_scale must be positive.")
+
+    im_scaled = np.nan_to_num(
+        np.asarray(im, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    im_uint16 = np.round(
+        np.clip(im_scaled * depth_scale, 0, np.iinfo(np.uint16).max)
+    ).astype(np.uint16)
 
     # PyPNG library can save 16-bit PNG and is faster than imageio.imwrite().
     w_depth = png.Writer(im.shape[1], im.shape[0], greyscale=True, bitdepth=16)
     with open(path, "wb") as f:
         w_depth.write(f, np.reshape(im_uint16, (-1, im.shape[1])))
+    with open(str(path) + ".json", "w", encoding="utf-8") as f:
+        json.dump({"depth_scale": float(depth_scale)}, f)
 
 
 def load_json(path: Union[str,Path], keys_to_int=False):

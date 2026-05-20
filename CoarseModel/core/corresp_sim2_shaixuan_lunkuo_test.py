@@ -33,6 +33,457 @@ logger: logging.Logger = logging.get_logger()
 
 import time
 
+
+def _to_numpy_transform(mat):
+    if torch.is_tensor(mat):
+        return mat.detach().cpu().numpy()
+    return np.asarray(mat)
+
+
+def _normalize_np_score(score, mask=None):
+    score = np.asarray(score, dtype=np.float32)
+    out = np.zeros_like(score, dtype=np.float32)
+    if mask is None:
+        valid = np.isfinite(score)
+    else:
+        valid = np.asarray(mask).astype(bool) & np.isfinite(score)
+    if not np.any(valid):
+        return out
+    vals = score[valid]
+    lo = float(np.percentile(vals, 5))
+    hi = float(np.percentile(vals, 95))
+    if hi <= lo + 1e-8:
+        hi = float(vals.max())
+        lo = float(vals.min())
+    if hi <= lo + 1e-8:
+        out[valid] = 1.0
+        return out
+    out[valid] = np.clip((score[valid] - lo) / (hi - lo), 0.0, 1.0)
+    return out
+
+
+def _normalize_torch_score(score):
+    score = score.float()
+    score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+    if score.numel() == 0:
+        return score
+    lo = torch.quantile(score, 0.05)
+    hi = torch.quantile(score, 0.95)
+    if float(hi - lo) <= 1e-8:
+        max_v = torch.max(score)
+        min_v = torch.min(score)
+        if float(max_v - min_v) <= 1e-8:
+            return torch.ones_like(score)
+        lo, hi = min_v, max_v
+    return torch.clamp((score - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _distance_to_edge_score(mask, sigma_px):
+    mask_u8 = (np.asarray(mask) > 0).astype(np.uint8) * 255
+    if mask_u8.max() == 0:
+        return np.zeros(mask_u8.shape, dtype=np.float32)
+    kernel = np.ones((3, 3), np.uint8)
+    edge = cv2.morphologyEx(mask_u8, cv2.MORPH_GRADIENT, kernel)
+    if edge.max() == 0:
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        edge = np.zeros_like(mask_u8)
+        cv2.drawContours(edge, contours, -1, 255, 1)
+    non_edge = np.where(edge > 0, 0, 255).astype(np.uint8)
+    dist = cv2.distanceTransform(non_edge, cv2.DIST_L2, 5)
+    sigma_px = max(float(sigma_px), 1e-6)
+    return np.exp(-dist / sigma_px).astype(np.float32)
+
+
+def _sample_np_map(score_map, points_xy, device):
+    if points_xy.numel() == 0:
+        return torch.empty((0,), dtype=torch.float32, device=device)
+    pts = points_xy.detach().cpu().numpy()
+    h, w = score_map.shape[:2]
+    x = np.clip(np.rint(pts[:, 0]).astype(np.int32), 0, w - 1)
+    y = np.clip(np.rint(pts[:, 1]).astype(np.int32), 0, h - 1)
+    return torch.as_tensor(score_map[y, x], dtype=torch.float32, device=device)
+
+
+def _feature_gradient_score_map(feature_map_chw):
+    feat = feature_map_chw.float()
+    c, h, w = feat.shape
+    grad = torch.zeros((h, w), dtype=torch.float32, device=feat.device)
+    if w > 1:
+        grad[:, :-1] += torch.linalg.norm(feat[:, :, 1:] - feat[:, :, :-1], dim=0)
+    if h > 1:
+        grad[:-1, :] += torch.linalg.norm(feat[:, 1:, :] - feat[:, :-1, :], dim=0)
+    flat = grad.flatten()
+    if flat.numel() == 0:
+        return grad
+    hi = torch.quantile(flat, 0.95)
+    if float(hi) <= 1e-8:
+        hi = torch.max(flat)
+    if float(hi) <= 1e-8:
+        return torch.zeros_like(grad)
+    return torch.clamp(grad / hi, 0.0, 1.0)
+
+
+def _sample_feature_score_map(score_hw, points_xy, image_size):
+    return feature_util.sample_feature_map_at_points(
+        feature_map_chw=score_hw.unsqueeze(0),
+        points=points_xy,
+        image_size=image_size,
+    ).flatten()
+
+
+def _template_geometry_maps(template_id, template_base_dir, edge_sigma):
+    tpl_id = int(template_id.item()) if torch.is_tensor(template_id) else int(template_id)
+    mask_path = os.path.join(template_base_dir, f"mask/template_{tpl_id:04d}.png")
+    depth_path = os.path.join(template_base_dir, f"depth/template_{tpl_id:04d}.png")
+
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+    mask_bin = mask > 0
+    silhouette = _distance_to_edge_score(mask_bin, edge_sigma)
+
+    depth_edge = np.zeros(mask.shape, dtype=np.float32)
+    normal_edge = np.zeros(mask.shape, dtype=np.float32)
+    depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+    if depth is not None:
+        depth_f = depth.astype(np.float32)
+        valid = mask_bin & np.isfinite(depth_f) & (depth_f > 0)
+        if np.any(valid):
+            med = float(np.median(depth_f[valid]))
+            scale = max(float(np.percentile(depth_f[valid], 95) - np.percentile(depth_f[valid], 5)), 1e-6)
+            depth_norm = np.zeros_like(depth_f, dtype=np.float32)
+            depth_norm[valid] = (depth_f[valid] - med) / scale
+            depth_norm[~valid] = 0.0
+            gx = cv2.Sobel(depth_norm, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(depth_norm, cv2.CV_32F, 0, 1, ksize=3)
+            depth_edge = _normalize_np_score(np.sqrt(gx * gx + gy * gy), valid)
+
+            nx = -gx
+            ny = -gy
+            nz = np.ones_like(depth_norm, dtype=np.float32)
+            norm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-8
+            nx, ny, nz = nx / norm, ny / norm, nz / norm
+            normal_grad = np.zeros_like(depth_norm, dtype=np.float32)
+            for comp in (nx, ny, nz):
+                cgx = cv2.Sobel(comp, cv2.CV_32F, 1, 0, ksize=3)
+                cgy = cv2.Sobel(comp, cv2.CV_32F, 0, 1, ksize=3)
+                normal_grad += cgx * cgx + cgy * cgy
+            normal_edge = _normalize_np_score(np.sqrt(normal_grad), valid)
+
+    return {
+        "silhouette": silhouette.astype(np.float32),
+        "depth_edge": depth_edge.astype(np.float32),
+        "normal_edge": normal_edge.astype(np.float32),
+        "geom_edge": np.maximum.reduce([silhouette, depth_edge, normal_edge]).astype(np.float32),
+    }
+
+
+def _project_model_points_to_template(points_3d, tpl_camera):
+    pts_np = points_3d.detach().cpu().numpy() if torch.is_tensor(points_3d) else np.asarray(points_3d)
+    if pts_np.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    T_world_from_eye = _to_numpy_transform(tpl_camera.T_world_from_eye)
+    T_eye_from_world = np.linalg.inv(T_world_from_eye)
+    pts_h = np.hstack([pts_np, np.ones((pts_np.shape[0], 1), dtype=pts_np.dtype)])
+    pts_cam = (T_eye_from_world @ pts_h.T).T[:, :3]
+    f = np.asarray(tpl_camera.f, dtype=np.float64)
+    c = np.asarray(tpl_camera.c, dtype=np.float64)
+    z = np.maximum(pts_cam[:, 2], 1e-8)
+    uv = np.zeros((pts_cam.shape[0], 2), dtype=np.float32)
+    uv[:, 0] = (pts_cam[:, 0] / z) * f[0] + c[0]
+    uv[:, 1] = (pts_cam[:, 1] / z) * f[1] + c[1]
+    return uv
+
+
+def _subset_correspondence(corresp, indices):
+    if torch.is_tensor(indices):
+        idx_cpu = indices.detach().cpu().long()
+    else:
+        idx_cpu = torch.as_tensor(indices, dtype=torch.long)
+    n = int(corresp["coord_2d"].shape[0])
+    out = {}
+    for key, value in corresp.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == n:
+            out[key] = value[idx_cpu.to(value.device)]
+        elif isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == n:
+            out[key] = value[idx_cpu.numpy()]
+        else:
+            out[key] = value
+    return out
+
+
+def _coverage_select_indices(points_3d, scores, max_points, min_points, voxel_bins, points_per_voxel):
+    n = int(points_3d.shape[0])
+    if n == 0:
+        return torch.empty((0,), dtype=torch.long, device=scores.device)
+    max_points = min(int(max_points), n)
+    min_points = min(int(min_points), n)
+    pts_np = points_3d.detach().cpu().numpy()
+    scores_np = scores.detach().cpu().numpy()
+    order = np.argsort(-scores_np)
+
+    mins = pts_np.min(axis=0)
+    maxs = pts_np.max(axis=0)
+    extent = np.maximum(maxs - mins, 1e-6)
+    bins = max(int(voxel_bins), 1)
+    vox = np.floor((pts_np - mins[None, :]) / extent[None, :] * bins).astype(np.int32)
+    vox = np.clip(vox, 0, bins - 1)
+
+    selected = []
+    voxel_counts = {}
+    for idx in order:
+        key = tuple(int(v) for v in vox[idx])
+        count = voxel_counts.get(key, 0)
+        if count >= int(points_per_voxel):
+            continue
+        selected.append(int(idx))
+        voxel_counts[key] = count + 1
+        if len(selected) >= max_points:
+            break
+
+    if len(selected) < min_points:
+        selected_set = set(selected)
+        for idx in order:
+            idx = int(idx)
+            if idx not in selected_set:
+                selected.append(idx)
+                selected_set.add(idx)
+            if len(selected) >= min_points:
+                break
+
+    return torch.as_tensor(selected, dtype=torch.long, device=scores.device)
+
+
+def _geometry_filter_correspondence(
+    corresp,
+    query_dino_edge_scores,
+    query_contour_scores,
+    repre,
+    template_base_dir,
+    template_geom_cache,
+    opts,
+):
+    n = int(corresp["coord_2d"].shape[0])
+    device = corresp["coord_2d"].device
+    min_corr = int(getattr(opts, "geom_filter_min_corr", 24))
+    if n < max(6, min_corr):
+        return corresp
+
+    q_ids = corresp.get("coord_2d_ids")
+    if q_ids is not None and torch.is_tensor(q_ids):
+        q_ids = q_ids.long().to(query_dino_edge_scores.device)
+        q_edge = query_dino_edge_scores[q_ids].to(device)
+        q_contour = query_contour_scores[q_ids].to(device)
+    else:
+        q_edge = torch.zeros((n,), dtype=torch.float32, device=device)
+        q_contour = torch.zeros((n,), dtype=torch.float32, device=device)
+
+    template_id = corresp["template_id"]
+    tpl_key = int(template_id.item()) if torch.is_tensor(template_id) else int(template_id)
+    if tpl_key not in template_geom_cache:
+        template_geom_cache[tpl_key] = _template_geometry_maps(
+            tpl_key,
+            template_base_dir,
+            getattr(opts, "geom_filter_template_edge_sigma", 4.0),
+        )
+
+    if template_geom_cache[tpl_key] is None:
+        t_silhouette = torch.zeros((n,), dtype=torch.float32, device=device)
+        t_geom = torch.zeros((n,), dtype=torch.float32, device=device)
+    else:
+        tpl_camera = repre.template_cameras_cam_from_model[tpl_key]
+        tpl_uv = _project_model_points_to_template(corresp["coord_3d"], tpl_camera)
+        tpl_uv_t = torch.as_tensor(tpl_uv, dtype=torch.float32, device=device)
+        maps = template_geom_cache[tpl_key]
+        t_silhouette = _sample_np_map(maps["silhouette"], tpl_uv_t, device)
+        t_depth = _sample_np_map(maps["depth_edge"], tpl_uv_t, device)
+        t_normal = _sample_np_map(maps["normal_edge"], tpl_uv_t, device)
+        t_geom = torch.maximum(torch.maximum(t_silhouette, t_depth), t_normal)
+
+    dino_conf = corresp.get("coord_conf", torch.ones((n,), dtype=torch.float32, device=device)).float().to(device)
+    dino_conf = _normalize_torch_score(dino_conf)
+    q_edge = _normalize_torch_score(q_edge)
+    q_contour = torch.clamp(q_contour.float(), 0.0, 1.0)
+    t_geom = torch.clamp(t_geom.float(), 0.0, 1.0)
+    t_silhouette = torch.clamp(t_silhouette.float(), 0.0, 1.0)
+
+    boundary_compat = q_contour * torch.maximum(t_silhouette, t_geom)
+    interior_compat = (1.0 - q_contour) * (1.0 - t_silhouette)
+    edge_compat = q_edge * t_geom
+    geom_compat = torch.clamp(0.45 * boundary_compat + 0.35 * interior_compat + 0.20 * edge_compat, 0.0, 1.0)
+
+    geom_score = (
+        0.45 * dino_conf
+        + 0.20 * q_edge
+        + 0.20 * t_geom
+        + 0.15 * geom_compat
+    )
+    geom_score = torch.nan_to_num(geom_score, nan=0.0, posinf=0.0, neginf=0.0)
+
+    quantile = float(getattr(opts, "geom_filter_min_score_quantile", 0.25))
+    if 0.0 < quantile < 1.0 and geom_score.numel() > min_corr:
+        score_thr = torch.quantile(geom_score, quantile)
+        candidate_idx = torch.nonzero(geom_score >= score_thr).flatten()
+    else:
+        candidate_idx = torch.arange(n, dtype=torch.long, device=device)
+    if candidate_idx.numel() < min_corr:
+        candidate_idx = torch.topk(geom_score, k=min(min_corr, n), largest=True).indices
+
+    corresp_scored = _subset_correspondence(corresp, candidate_idx)
+    scored_values = geom_score[candidate_idx]
+    selected_local = _coverage_select_indices(
+        corresp_scored["coord_3d"],
+        scored_values,
+        max_points=getattr(opts, "geom_filter_max_corr", 160),
+        min_points=min_corr,
+        voxel_bins=getattr(opts, "geom_filter_voxel_bins", 6),
+        points_per_voxel=getattr(opts, "geom_filter_points_per_voxel", 3),
+    )
+    filtered = _subset_correspondence(corresp_scored, selected_local)
+    filtered["coord_conf"] = scored_values[selected_local].to(device)
+    filtered["geom_score"] = filtered["coord_conf"]
+    filtered["geom_filter_stats"] = {
+        "before": n,
+        "after_score": int(candidate_idx.numel()),
+        "after_coverage": int(filtered["coord_2d"].shape[0]),
+    }
+    return filtered
+
+
+def _pnp_inlier_correspondence(corresp, inliers):
+    if inliers is None:
+        return corresp
+    idx = np.asarray(inliers).reshape(-1)
+    if idx.size < 6:
+        return corresp
+    return _subset_correspondence(corresp, idx)
+
+
+def _camera_intrinsic_np(camera):
+    fx, fy = camera.f
+    cx, cy = camera.c
+    return np.array(
+        [
+            [float(fx), 0.0, float(cx)],
+            [0.0, float(fy), float(cy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _project_points_m2c(points_3d, R_m2c, t_m2c, camera):
+    pts = points_3d.detach().cpu().numpy() if torch.is_tensor(points_3d) else np.asarray(points_3d)
+    if pts.size == 0:
+        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    R = np.asarray(R_m2c, dtype=np.float64)
+    t = np.asarray(t_m2c, dtype=np.float64).reshape(3)
+    Xc = (R @ pts.T).T + t[None, :]
+    z = Xc[:, 2]
+    K = _camera_intrinsic_np(camera)
+    uvw = (K @ Xc.T).T
+    uv = uvw[:, :2] / np.maximum(uvw[:, 2:3], 1e-8)
+    return uv, z
+
+
+def _reprojection_error_stats(corresp, R_m2c, t_m2c, camera):
+    uv, z = _project_points_m2c(corresp["coord_3d"], R_m2c, t_m2c, camera)
+    q = corresp["coord_2d"].detach().cpu().numpy() if torch.is_tensor(corresp["coord_2d"]) else np.asarray(corresp["coord_2d"])
+    valid = z > 1e-6
+    if not np.any(valid):
+        return {"median": float("inf"), "mean": float("inf"), "max": float("inf"), "valid": 0}
+    err = np.linalg.norm(uv[valid] - q[valid], axis=1)
+    if err.size == 0:
+        return {"median": float("inf"), "mean": float("inf"), "max": float("inf"), "valid": 0}
+    return {
+        "median": float(np.median(err)),
+        "mean": float(np.mean(err)),
+        "max": float(np.max(err)),
+        "valid": int(err.size),
+    }
+
+
+def _coverage_score(points_3d, model_vertices):
+    pts = points_3d.detach().cpu().numpy() if torch.is_tensor(points_3d) else np.asarray(points_3d)
+    verts = model_vertices.detach().cpu().numpy() if torch.is_tensor(model_vertices) else np.asarray(model_vertices)
+    if pts.shape[0] < 4 or verts.size == 0:
+        return 0.0
+    model_extent = np.maximum(verts.max(axis=0) - verts.min(axis=0), 1e-6)
+    pts_extent = np.maximum(pts.max(axis=0) - pts.min(axis=0), 0.0)
+    axis_cover = np.clip(pts_extent / model_extent, 0.0, 1.0)
+
+    bins = 4
+    mins = verts.min(axis=0)
+    vox = np.floor((pts - mins[None, :]) / model_extent[None, :] * bins).astype(np.int32)
+    vox = np.clip(vox, 0, bins - 1)
+    occupied = len({tuple(v) for v in vox})
+    occupied_score = occupied / float(min(pts.shape[0], bins ** 3))
+    return float(np.clip(0.55 * axis_cover.mean() + 0.45 * occupied_score, 0.0, 1.0))
+
+
+def _bbox_iou_xyxy(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    if denom <= 1e-8:
+        return 0.0
+    return float(inter / denom)
+
+
+def _pose_mask_score(R_m2c, t_m2c, camera, mask_modal, model_vertices):
+    verts = model_vertices.detach().cpu().numpy() if torch.is_tensor(model_vertices) else np.asarray(model_vertices)
+    if verts.size == 0:
+        return 0.0
+    if verts.shape[0] > 3000:
+        sample_ids = np.linspace(0, verts.shape[0] - 1, 3000).astype(np.int64)
+        verts = verts[sample_ids]
+
+    mask = (np.asarray(mask_modal) > 0).astype(np.uint8)
+    if mask.max() == 0:
+        return 0.0
+    h, w = mask.shape[:2]
+    uv, z = _project_points_m2c(verts, R_m2c, t_m2c, camera)
+    visible = (
+        (z > 1e-6)
+        & (uv[:, 0] >= 0) & (uv[:, 0] < w)
+        & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    )
+    if not np.any(visible):
+        return 0.0
+
+    uv_vis = uv[visible]
+    xi = np.clip(np.rint(uv_vis[:, 0]).astype(np.int32), 0, w - 1)
+    yi = np.clip(np.rint(uv_vis[:, 1]).astype(np.int32), 0, h - 1)
+    inside_ratio = float(np.mean(mask[yi, xi] > 0))
+
+    proj_bbox = np.array([uv_vis[:, 0].min(), uv_vis[:, 1].min(), uv_vis[:, 0].max(), uv_vis[:, 1].max()], dtype=np.float64)
+    ys, xs = np.nonzero(mask)
+    mask_bbox = np.array([xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float64)
+    bbox_iou = _bbox_iou_xyxy(proj_bbox, mask_bbox)
+    return float(np.clip(0.65 * inside_ratio + 0.35 * bbox_iou, 0.0, 1.0))
+
+
+def _pose_selection_score(num_inliers, reproj_stats, coverage_score, mask_score, pnp_inlier_thresh):
+    inlier_score = 1.0 - np.exp(-float(num_inliers) / 40.0)
+    reproj_median = reproj_stats.get("median", float("inf"))
+    if not np.isfinite(reproj_median):
+        reproj_score = 0.0
+    else:
+        reproj_score = float(np.exp(-reproj_median / max(float(pnp_inlier_thresh), 1e-6)))
+    return float(
+        0.30 * inlier_score
+        + 0.30 * reproj_score
+        + 0.20 * float(np.clip(coverage_score, 0.0, 1.0))
+        + 0.20 * float(np.clip(mask_score, 0.0, 1.0))
+    )
+
+
 class CorrespondenceData(object):
     def __init__(self, frame_name, query_2d_pts, model_3d_pts, model_feat_ids, best_pose = None, camera_c2w = None):
         self.frame_name = frame_name
@@ -278,7 +729,8 @@ def recover_pose_and_points_to_orig(
     q_2d_crop = None
     q_2d_orig = q_2d
     
-    Z_3d = X_3d[:, 2]  # depth for each 2D point
+    X_crop_cam = (R_m2c_crop @ X_3d.T).T + t_m2c_crop.reshape(3)
+    Z_3d = np.maximum(X_crop_cam[:, 2], 1e-6)
     q_2d_orig = warp_points_perspective(
         src_camera=crop_camera,
         dst_camera=orig_camera,
@@ -463,6 +915,21 @@ def extract_correspondences(
                 query_features_proj = query_features
                 feature_map_chw_proj = feature_map_chw
 
+            query_dino_edge_scores = torch.zeros((query_points.shape[0],), dtype=torch.float32, device=device)
+            query_contour_scores = torch.zeros((query_points.shape[0],), dtype=torch.float32, device=device)
+            if getattr(opts, "use_geometry_corresp_filter", True) and query_points.shape[0] > 0:
+                dino_edge_map = _feature_gradient_score_map(feature_map_chw_proj)
+                query_dino_edge_scores = _sample_feature_score_map(
+                    score_hw=dino_edge_map,
+                    points_xy=query_points,
+                    image_size=(image_np_hwc.shape[1], image_np_hwc.shape[0]),
+                )
+                contour_score_map = _distance_to_edge_score(
+                    mask_modal,
+                    getattr(opts, "geom_filter_contour_sigma", 12.0),
+                )
+                query_contour_scores = _sample_np_map(contour_score_map, query_points, device)
+
             # Establish 2D-3D correspondences. 对每个 2D 查询点在物体所有模板中寻找最相似的特征点，记录对应的 2D 点坐标、3D 模型点坐标 以及匹配模板信息
             corresp = []
             if len(query_points) != 0:
@@ -559,10 +1026,25 @@ def extract_correspondences(
             
             # Estimate coarse poses from corespondences.
             coarse_poses = []
+            template_geom_cache = {}
+            model_vertices_for_scoring = repre.vertices
             for corresp_id, corresp_curr in enumerate(corresp): # 遍历之前生成的每组 2D-3D 对应关系 corresp
-                corresp_curr["coord_3d"] = corresp_curr["coord_3d"]
+                if getattr(opts, "use_geometry_corresp_filter", True):
+                    corresp_for_pose = _geometry_filter_correspondence(
+                        corresp=corresp_curr,
+                        query_dino_edge_scores=query_dino_edge_scores,
+                        query_contour_scores=query_contour_scores,
+                        repre=repre,
+                        template_base_dir=template_base_dir,
+                        template_geom_cache=template_geom_cache,
+                        opts=opts,
+                    )
+                else:
+                    corresp_for_pose = corresp_curr
+
+                corresp_for_pose["coord_3d"] = corresp_for_pose["coord_3d"]
                 # We need at least 3 correspondences for P3P.
-                num_corresp = len(corresp_curr["coord_2d"])
+                num_corresp = len(corresp_for_pose["coord_2d"])
                 if num_corresp < 6:
                     logger.info(f"Only {num_corresp} correspondences, skipping.")
                     continue
@@ -573,7 +1055,7 @@ def extract_correspondences(
                     inliers_coarse,
                     quality_coarse,
                 ) = pnp_util.estimate_pose( # 调用 estimate_pose 进行 PnP 求解
-                    corresp=corresp_curr,
+                    corresp=corresp_for_pose,
                     camera_c2w=camera_c2w,
                     pnp_type=opts.pnp_type,
                     pnp_ransac_iter=opts.pnp_ransac_iter,
@@ -583,6 +1065,54 @@ def extract_correspondences(
                 )
 
                 if coarse_pose_success:
+                    final_corresp_for_pose = corresp_for_pose
+                    if getattr(opts, "pnp_use_inlier_corresp", True):
+                        final_corresp_for_pose = _pnp_inlier_correspondence(corresp_for_pose, inliers_coarse)
+                        if len(final_corresp_for_pose["coord_2d"]) >= 6:
+                            (
+                                refined_success,
+                                R_refined,
+                                t_refined,
+                                inliers_refined,
+                                quality_refined,
+                            ) = pnp_util.estimate_pose(
+                                corresp=final_corresp_for_pose,
+                                camera_c2w=camera_c2w,
+                                pnp_type=opts.pnp_type,
+                                pnp_ransac_iter=max(100, opts.pnp_ransac_iter // 4),
+                                pnp_inlier_thresh=opts.pnp_inlier_thresh,
+                                pnp_required_ransac_conf=opts.pnp_required_ransac_conf,
+                                pnp_refine_lm=opts.pnp_refine_lm,
+                            )
+                            if refined_success:
+                                R_m2c_coarse = R_refined
+                                t_m2c_coarse = t_refined
+                                inliers_coarse = inliers_refined
+                                quality_coarse = quality_refined
+                                final_corresp_for_pose = _pnp_inlier_correspondence(final_corresp_for_pose, inliers_refined)
+
+                    reproj_stats = _reprojection_error_stats(
+                        final_corresp_for_pose,
+                        R_m2c_coarse,
+                        t_m2c_coarse,
+                        camera_c2w,
+                    )
+                    coverage = _coverage_score(final_corresp_for_pose["coord_3d"], model_vertices_for_scoring)
+                    mask_score = _pose_mask_score(
+                        R_m2c=R_m2c_coarse,
+                        t_m2c=t_m2c_coarse,
+                        camera=camera_c2w,
+                        mask_modal=mask_modal,
+                        model_vertices=model_vertices_for_scoring,
+                    )
+                    selection_score = _pose_selection_score(
+                        num_inliers=len(final_corresp_for_pose["coord_2d"]),
+                        reproj_stats=reproj_stats,
+                        coverage_score=coverage,
+                        mask_score=mask_score,
+                        pnp_inlier_thresh=opts.pnp_inlier_thresh,
+                    )
+
                     coarse_poses.append(
                         {
                             "type": "coarse",
@@ -591,24 +1121,44 @@ def extract_correspondences(
                             "corresp_id": corresp_id,
                             "quality": quality_coarse,
                             "inliers": inliers_coarse,
+                            "num_corr_before_pnp": int(num_corresp),
+                            "num_corr_after_pnp": int(len(final_corresp_for_pose["coord_2d"])),
+                            "corresp": final_corresp_for_pose,
+                            "reproj_median": reproj_stats["median"],
+                            "reproj_mean": reproj_stats["mean"],
+                            "coverage_score": coverage,
+                            "mask_score": mask_score,
+                            "selection_score": selection_score,
                         }
                     )
+            if not coarse_poses:
+                logger.info("No valid coarse poses after geometry filtering/PnP.")
+                continue
             # Find the best coarse pose.
             best_coarse_quality = None
             best_coarse_pose_id = 0
             for coarse_pose_id, pose in enumerate(coarse_poses):
                 if (
                     best_coarse_quality is None
-                    or pose["quality"] > best_coarse_quality
+                    or pose["selection_score"] > best_coarse_quality
                 ):
                     best_coarse_pose_id = coarse_pose_id
-                    best_coarse_quality = pose["quality"]
+                    best_coarse_quality = pose["selection_score"]
             best_corresp_id = coarse_poses[best_coarse_pose_id]["corresp_id"]
-            corresp_final = corresp[best_corresp_id]
+            corresp_final = coarse_poses[best_coarse_pose_id]["corresp"]
             
             # [新增] 输出最终选定的模板 ID
             final_template_id = corresp_final["template_id"]
-            logger.info(f"Final selected template ID: {final_template_id} (from coarse_pose_id: {best_coarse_pose_id})")
+            logger.info(
+                f"Final selected template ID: {final_template_id} "
+                f"(from coarse_pose_id: {best_coarse_pose_id}, "
+                f"corr {coarse_poses[best_coarse_pose_id]['num_corr_before_pnp']} -> "
+                f"{coarse_poses[best_coarse_pose_id]['num_corr_after_pnp']}, "
+                f"score={coarse_poses[best_coarse_pose_id]['selection_score']:.3f}, "
+                f"repr={coarse_poses[best_coarse_pose_id]['reproj_median']:.2f}px, "
+                f"cov={coarse_poses[best_coarse_pose_id]['coverage_score']:.2f}, "
+                f"mask={coarse_poses[best_coarse_pose_id]['mask_score']:.2f})"
+            )
             
             # 2D 观测点 (N, 2)
             q_2d = corresp_final["coord_2d"].cpu().numpy()

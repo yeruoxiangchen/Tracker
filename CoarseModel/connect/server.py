@@ -615,6 +615,21 @@ def _unity_pose_to_colmap_w2c(pose):
     r_cv_c2w = _nearest_rotation_matrix(r_cv_c2w)
     r_w2c = r_cv_c2w.T
     t_w2c = -r_w2c @ cam_center_w
+
+    # XRCpuImage.Transformation.None gives the CPU image in sensor/image memory
+    # orientation, while ARCamera.transform is in the Unity display camera frame.
+    # PnP is solved in the saved image pixel frame, so the exported sparse camera
+    # frame must be rotated into that same image frame.
+    image_cam_from_pose_cam = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    r_w2c = image_cam_from_pose_cam @ r_w2c
+    t_w2c = image_cam_from_pose_cam @ t_w2c
     return r_w2c, t_w2c
 
 
@@ -758,6 +773,7 @@ def _write_phone_pose_sparse_model(dataset_dir):
         "coordinate_conversion": {
             "world": "diag(1, 1, -1) * unity_world",
             "camera": "unity camera converted to COLMAP x-right y-down z-forward",
+            "cpu_image_camera_from_pose_camera": "Rz(+90deg): [[0,-1,0],[1,0,0],[0,0,1]]",
             "image_transform": "new captures use XRCpuImage.Transformation.None; old MirrorY logs only adjust principal point",
         },
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),

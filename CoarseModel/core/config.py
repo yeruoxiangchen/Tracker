@@ -49,6 +49,15 @@ class InferOpts(NamedTuple):
     match_top_n_templates: int = 5
     match_feat_matching_type: str = "cyclic_buddies"
     match_top_k_buddies: int = 300
+    use_geometry_corresp_filter: bool = True
+    geom_filter_max_corr: int = 160
+    geom_filter_min_corr: int = 24
+    geom_filter_voxel_bins: int = 6
+    geom_filter_points_per_voxel: int = 3
+    geom_filter_contour_sigma: float = 12.0
+    geom_filter_template_edge_sigma: float = 4.0
+    geom_filter_min_score_quantile: float = 0.25
+    pnp_use_inlier_corresp: bool = True
 
     # --- PnP ---
     pnp_type: str = "opencv"
