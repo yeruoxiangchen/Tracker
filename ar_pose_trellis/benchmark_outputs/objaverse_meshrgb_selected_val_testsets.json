@@ -1,0 +1,88 @@
+{
+  "description": "Selected mesh-rgb Objaverse val cases for quick AR-pose TRELLIS / ReconViaGen validation.",
+  "source_data_root": "/data/ar_pose_trellis/objaverse_pose_1000_meshrgb_s2",
+  "split": "val",
+  "selection": "/home/zjr/Tracker/ar_pose_trellis/data_build_outputs/objaverse_pose_1000_meshrgb_s2/review_val_cases/selected_val_cases.json",
+  "datasets": [
+    {
+      "name": "d5b8197f3021436f8483f0da97ce6c1e_seq001",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/d5b8197f3021436f8483f0da97ce6c1e_seq001",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/d5b8197f3021436f8483f0da97ce6c1e_seq001/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/d5b8197f3021436f8483f0da97ce6c1e_seq001/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/d5b8197f3021436f8483f0da97ce6c1e_seq001/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/d5b8197f3021436f8483f0da97ce6c1e_seq001/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/d5b8197f3021436f8483f0da97ce6c1e_seq001/gt/d5b8197f3021436f8483f0da97ce6c1e.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "32227f56b18c4cd190a98b8dd44a36c1_seq000",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/32227f56b18c4cd190a98b8dd44a36c1_seq000",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/32227f56b18c4cd190a98b8dd44a36c1_seq000/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/32227f56b18c4cd190a98b8dd44a36c1_seq000/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/32227f56b18c4cd190a98b8dd44a36c1_seq000/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/32227f56b18c4cd190a98b8dd44a36c1_seq000/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/32227f56b18c4cd190a98b8dd44a36c1_seq000/gt/32227f56b18c4cd190a98b8dd44a36c1.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "135bf741d5fd4ddf8b3311c6b8e4a87c_seq000",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/135bf741d5fd4ddf8b3311c6b8e4a87c_seq000",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/135bf741d5fd4ddf8b3311c6b8e4a87c_seq000/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/135bf741d5fd4ddf8b3311c6b8e4a87c_seq000/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/135bf741d5fd4ddf8b3311c6b8e4a87c_seq000/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/135bf741d5fd4ddf8b3311c6b8e4a87c_seq000/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/135bf741d5fd4ddf8b3311c6b8e4a87c_seq000/gt/135bf741d5fd4ddf8b3311c6b8e4a87c.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "68e919ff9aa84ee7b2afa354e41f34a5_seq001",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/68e919ff9aa84ee7b2afa354e41f34a5_seq001",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/68e919ff9aa84ee7b2afa354e41f34a5_seq001/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/68e919ff9aa84ee7b2afa354e41f34a5_seq001/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/68e919ff9aa84ee7b2afa354e41f34a5_seq001/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/68e919ff9aa84ee7b2afa354e41f34a5_seq001/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/68e919ff9aa84ee7b2afa354e41f34a5_seq001/gt/68e919ff9aa84ee7b2afa354e41f34a5.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "e5481c77ed4e4bceba1d48afad79b99a_seq001",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/e5481c77ed4e4bceba1d48afad79b99a_seq001",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/e5481c77ed4e4bceba1d48afad79b99a_seq001/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/e5481c77ed4e4bceba1d48afad79b99a_seq001/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/e5481c77ed4e4bceba1d48afad79b99a_seq001/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/e5481c77ed4e4bceba1d48afad79b99a_seq001/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/e5481c77ed4e4bceba1d48afad79b99a_seq001/gt/e5481c77ed4e4bceba1d48afad79b99a.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "6e34d9f464ec4f778da97ce5eec22d9c_seq001",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/6e34d9f464ec4f778da97ce5eec22d9c_seq001",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/6e34d9f464ec4f778da97ce5eec22d9c_seq001/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/6e34d9f464ec4f778da97ce5eec22d9c_seq001/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/6e34d9f464ec4f778da97ce5eec22d9c_seq001/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/6e34d9f464ec4f778da97ce5eec22d9c_seq001/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/6e34d9f464ec4f778da97ce5eec22d9c_seq001/gt/6e34d9f464ec4f778da97ce5eec22d9c.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "972319d75cc84f349567ce9dc6930f4b_seq000",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/972319d75cc84f349567ce9dc6930f4b_seq000",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/972319d75cc84f349567ce9dc6930f4b_seq000/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/972319d75cc84f349567ce9dc6930f4b_seq000/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/972319d75cc84f349567ce9dc6930f4b_seq000/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/972319d75cc84f349567ce9dc6930f4b_seq000/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/972319d75cc84f349567ce9dc6930f4b_seq000/gt/972319d75cc84f349567ce9dc6930f4b.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    },
+    {
+      "name": "f999dd375bce43a0bd1bcfe218a550a7_seq001",
+      "dataset_dir": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/f999dd375bce43a0bd1bcfe218a550a7_seq001",
+      "manifest": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/f999dd375bce43a0bd1bcfe218a550a7_seq001/arpose_manifest.json",
+      "image_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/f999dd375bce43a0bd1bcfe218a550a7_seq001/images",
+      "mask_root": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/f999dd375bce43a0bd1bcfe218a550a7_seq001/masks",
+      "reference_coords": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/f999dd375bce43a0bd1bcfe218a550a7_seq001/gt/target_coords.npy",
+      "reference_mesh": "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_cases/f999dd375bce43a0bd1bcfe218a550a7_seq001/gt/f999dd375bce43a0bd1bcfe218a550a7.glb",
+      "note": "Objaverse held-out synthetic case exported from render_mode=mesh_rgb."
+    }
+  ]
+}
