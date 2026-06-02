@@ -299,6 +299,8 @@ class TrellisARPoseTo3DPipeline:
         visual_hull_prior_weight: float = 0.0,
         visual_hull_mask_threshold: float = 0.5,
         visual_hull_min_visible_views: int = 1,
+        coords_override: Optional[torch.Tensor] = None,
+        coords_override_stats: Optional[dict] = None,
     ):
         sparse_structure_sampler_params = sparse_structure_sampler_params or {}
         slat_sampler_params = slat_sampler_params or {}
@@ -314,41 +316,58 @@ class TrellisARPoseTo3DPipeline:
         extrinsics = extrinsics.to(self.device).float()
 
         torch.manual_seed(seed)
-        ss_cond = self.encode_ss_condition(
-            images,
-            intrinsics,
-            extrinsics,
-            masks=masks,
-            extrinsics_are_c2w=extrinsics_are_c2w,
-            camera_forward_sign=camera_forward_sign,
-            reference_relative_pose=reference_relative_pose,
-        )
-        logit_prior = None
-        logit_prior_stats = None
-        if float(visual_hull_prior_weight) != 0.0:
-            logit_prior, logit_prior_stats = visual_hull_logit_bias(
-                masks if masks is not None else torch.ones(
-                    (images.shape[0], 1, images.shape[-2], images.shape[-1]),
-                    device=images.device,
-                    dtype=images.dtype,
-                ),
+        if coords_override is not None:
+            coords = coords_override.to(self.device)
+            if coords.ndim != 2 or coords.shape[1] not in (3, 4):
+                raise ValueError(f"coords_override should be [N,3] or [N,4], got {tuple(coords.shape)}")
+            coords = coords.long()
+            if coords.shape[1] == 3:
+                batch = torch.zeros((coords.shape[0], 1), device=coords.device, dtype=torch.long)
+                coords = torch.cat([batch, coords], dim=1)
+            coords = coords.int()
+            self.last_sparse_stats = {
+                "coords_source": "override",
+                "num_coords": int(coords.shape[0]),
+            }
+            if coords_override_stats:
+                self.last_sparse_stats.update(coords_override_stats)
+            print(f"[ARPosePipeline] sparse coords={coords.shape[0]} source=override")
+        else:
+            ss_cond = self.encode_ss_condition(
+                images,
                 intrinsics,
                 extrinsics,
+                masks=masks,
                 extrinsics_are_c2w=extrinsics_are_c2w,
-                resolution=self.sparse_logit_resolution,
-                mask_threshold=visual_hull_mask_threshold,
-                min_visible_views=visual_hull_min_visible_views,
-                weight=visual_hull_prior_weight,
+                camera_forward_sign=camera_forward_sign,
+                reference_relative_pose=reference_relative_pose,
             )
-        coords = self.sample_sparse_structure(
-            ss_cond,
-            num_samples,
-            sparse_structure_sampler_params,
-            threshold=sparse_threshold,
-            min_coords=min_sparse_coords,
-            logit_prior=logit_prior,
-            logit_prior_stats=logit_prior_stats,
-        )
+            logit_prior = None
+            logit_prior_stats = None
+            if float(visual_hull_prior_weight) != 0.0:
+                logit_prior, logit_prior_stats = visual_hull_logit_bias(
+                    masks if masks is not None else torch.ones(
+                        (images.shape[0], 1, images.shape[-2], images.shape[-1]),
+                        device=images.device,
+                        dtype=images.dtype,
+                    ),
+                    intrinsics,
+                    extrinsics,
+                    extrinsics_are_c2w=extrinsics_are_c2w,
+                    resolution=self.sparse_logit_resolution,
+                    mask_threshold=visual_hull_mask_threshold,
+                    min_visible_views=visual_hull_min_visible_views,
+                    weight=visual_hull_prior_weight,
+                )
+            coords = self.sample_sparse_structure(
+                ss_cond,
+                num_samples,
+                sparse_structure_sampler_params,
+                threshold=sparse_threshold,
+                min_coords=min_sparse_coords,
+                logit_prior=logit_prior,
+                logit_prior_stats=logit_prior_stats,
+            )
 
         image_cond = self.base.encode_image(images)
         slat_cond = {"cond": image_cond, "neg_cond": torch.zeros_like(image_cond[:1])}

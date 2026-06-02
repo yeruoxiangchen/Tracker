@@ -134,7 +134,7 @@ def main() -> None:
         output_dir = Path(args.output_dir)
     else:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(__file__).resolve().parent / "smoke_runs" / f"ss_pose_{stamp}"
+        output_dir = Path(__file__).resolve().parent / "outputs" / "smoke_runs" / f"ss_pose_{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "vis").mkdir(exist_ok=True)
 

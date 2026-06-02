@@ -1,17 +1,15 @@
 # Generated training/evaluation outputs
+outputs/
+checkpoints/
+
+# Large/generated benchmark artifacts
+benchmark_outputs/
 runs/
 test_outputs/
 data_build_outputs/
 build_outputs/
 smoke_outputs/
 smoke_runs/
-
-# Large/generated benchmark artifacts
-benchmark_outputs/*
-!benchmark_outputs/*.json
-!benchmark_outputs/*简报.md
-!benchmark_outputs/AR位姿射线条件消融测试/
-!benchmark_outputs/AR位姿射线条件消融测试/**
 
 # Python/cache
 __pycache__/

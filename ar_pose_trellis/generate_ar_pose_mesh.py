@@ -25,7 +25,7 @@ sys.path.insert(0, str(RECONVIAGEN_ROOT))
 sys.path.insert(0, str(VGGT_WHEEL_ROOT))
 
 from ar_pose_trellis.pipeline import TrellisARPoseTo3DPipeline
-from ar_pose_trellis.visual_hull import visual_hull_logit_bias
+from ar_pose_trellis.visual_hull import visual_hull_coords, visual_hull_logit_bias
 from trellis.utils import postprocessing_utils, render_utils
 
 
@@ -124,7 +124,68 @@ def parse_args():
     parser.add_argument("--visual_hull_prior_weight", type=float, default=0.0)
     parser.add_argument("--visual_hull_mask_threshold", type=float, default=0.5)
     parser.add_argument("--visual_hull_min_visible_views", type=int, default=1)
+    parser.add_argument(
+        "--coords_source",
+        choices=["network", "visual_hull"],
+        default="network",
+        help="Use learned sparse structure network or direct visual-hull surface coords.",
+    )
+    parser.add_argument("--visual_hull_min_support_views", type=int, default=2)
+    parser.add_argument("--visual_hull_min_support_ratio", type=float, default=0.6)
+    parser.add_argument("--visual_hull_keep_solid", action="store_true")
+    parser.add_argument(
+        "--visual_hull_max_coords",
+        type=int,
+        default=8192,
+        help="Deterministically subsample visual-hull coords to this count. Use 0 to keep all coords.",
+    )
     return parser.parse_args()
+
+
+def compute_visual_hull_override(
+    pipeline: TrellisARPoseTo3DPipeline,
+    images_pre: torch.Tensor,
+    masks_pre: Optional[torch.Tensor],
+    intrinsics_pre: torch.Tensor,
+    extrinsics: torch.Tensor,
+    extr_type: str,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict]:
+    mask_tensor = masks_pre
+    if mask_tensor is None:
+        mask_tensor = torch.ones(
+            (images_pre.shape[0], 1, images_pre.shape[-2], images_pre.shape[-1]),
+            device=images_pre.device,
+            dtype=images_pre.dtype,
+        )
+    coords, stats = visual_hull_coords(
+        mask_tensor,
+        intrinsics_pre,
+        extrinsics.to(pipeline.device).float(),
+        extrinsics_are_c2w=extr_type == "c2w",
+        resolution=pipeline.sparse_logit_resolution,
+        mask_threshold=args.visual_hull_mask_threshold,
+        min_visible_views=args.visual_hull_min_visible_views,
+        min_support_views=args.visual_hull_min_support_views,
+        min_support_ratio=args.visual_hull_min_support_ratio,
+        surface_only=not args.visual_hull_keep_solid,
+    )
+    if args.visual_hull_max_coords > 0 and coords.shape[0] > args.visual_hull_max_coords:
+        generator = torch.Generator(device=coords.device)
+        generator.manual_seed(int(args.seed))
+        keep = torch.randperm(coords.shape[0], generator=generator, device=coords.device)[: args.visual_hull_max_coords]
+        coords = coords[keep]
+    stats_dict = stats.to_dict()
+    stats_dict["visual_hull_raw_num_coords"] = int(stats_dict["num_coords"])
+    stats_dict["num_coords"] = int(coords.shape[0])
+    stats_dict["coords_source"] = "visual_hull"
+    stats_dict["visual_hull_max_coords"] = int(args.visual_hull_max_coords)
+    if coords.shape[0] == 0:
+        raise ValueError(
+            "visual hull produced 0 coords; relax --visual_hull_min_support_views "
+            "or --visual_hull_min_support_ratio, or check masks/camera poses."
+        )
+    return coords, stats_dict
 
 
 def main():
@@ -155,6 +216,28 @@ def main():
             crop_foreground=not args.no_crop,
             no_background=True,
         )
+        if args.coords_source == "visual_hull":
+            coords, stats = compute_visual_hull_override(
+                pipeline,
+                images_pre,
+                masks_pre,
+                intrinsics_pre,
+                extrinsics,
+                extr_type,
+                args,
+            )
+            coords_batched = torch.cat(
+                [
+                    torch.zeros((coords.shape[0], 1), dtype=torch.int32, device=coords.device),
+                    coords.to(torch.int32),
+                ],
+                dim=1,
+            )
+            torch.save(coords_batched.detach().cpu(), os.path.join(args.output_dir, "coords.pt"))
+            with open(os.path.join(args.output_dir, "sparse_stats.json"), "w") as f:
+                json.dump(stats, f, indent=2)
+            print(f"[ARPoseGenerate] visual hull sparse diagnostics done: {args.output_dir}")
+            return
         torch.manual_seed(args.seed)
         ss_cond = pipeline.encode_ss_condition(
             images_pre,
@@ -197,6 +280,26 @@ def main():
         print(f"[ARPoseGenerate] sparse diagnostics done: {args.output_dir}")
         return
 
+    coords_override = None
+    coords_override_stats = None
+    if args.coords_source == "visual_hull":
+        images_pre, masks_pre, intrinsics_pre = pipeline.prepare_inputs(
+            images,
+            intrinsics=intrinsics,
+            masks=masks,
+            crop_foreground=not args.no_crop,
+            no_background=True,
+        )
+        coords_override, coords_override_stats = compute_visual_hull_override(
+            pipeline,
+            images_pre,
+            masks_pre,
+            intrinsics_pre,
+            extrinsics,
+            extr_type,
+            args,
+        )
+
     outputs, coords = pipeline.run(
         images,
         intrinsics=intrinsics,
@@ -215,6 +318,8 @@ def main():
         visual_hull_prior_weight=args.visual_hull_prior_weight,
         visual_hull_mask_threshold=args.visual_hull_mask_threshold,
         visual_hull_min_visible_views=args.visual_hull_min_visible_views,
+        coords_override=coords_override,
+        coords_override_stats=coords_override_stats,
     )
 
     torch.save(coords.detach().cpu(), os.path.join(args.output_dir, "coords.pt"))

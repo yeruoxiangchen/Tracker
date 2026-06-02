@@ -20,8 +20,8 @@ cd /home/zjr/Tracker
   --split val \
   --max_cases 4 \
   --max_views 8 \
-  --output_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_holdout_cases \
-  --testsets_out /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_holdout_testsets.json
+  --output_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_holdout_cases \
+  --testsets_out /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_holdout_testsets.json
 ```
 
 ## 2. Run AR-Pose TRELLIS
@@ -35,11 +35,11 @@ ATTN_BACKEND=flash_attn \
 SPCONV_ALGO=native \
 MPLCONFIGDIR=/tmp/matplotlib \
 NUMBA_CACHE_DIR=/tmp/numba_cache \
-/home/zjr/anaconda3/envs/reconviagen/bin/python \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python \
   ar_pose_trellis/benchmark/run_arpose_batch.py \
-  --testsets /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_holdout_testsets.json \
-  --checkpoint /home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_objaverse_1000_e8_v4_finish/last.ckpt \
-  --output_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/arpose_holdout \
+  --testsets /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_holdout_testsets.json \
+  --checkpoint /home/zjr/Tracker/ar_pose_trellis/checkpoints/sparse_image_pose_meshrgb_s2_e4.ckpt \
+  --output_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/arpose_holdout \
   --max_frames 8 \
   --ss_steps 12 \
   --slat_steps 12 \
@@ -50,7 +50,7 @@ For the real `GOOD_MESH_TEST` case, change `--testsets` and `--output_root`:
 
 ```bash
 --testsets ar_pose_trellis/benchmark/testsets.json \
---output_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/arpose_real
+--output_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/arpose_good_mesh_test
 ```
 
 ## 3. Run ReconViaGen Directly
@@ -64,28 +64,28 @@ ATTN_BACKEND=flash_attn \
 SPCONV_ALGO=native \
 MPLCONFIGDIR=/tmp/matplotlib \
 NUMBA_CACHE_DIR=/tmp/numba_cache \
-/home/zjr/anaconda3/envs/reconviagen/bin/python \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python \
   ar_pose_trellis/benchmark/run_reconviagen_batch.py \
-  --testsets /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_holdout_testsets.json \
-  --output_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/reconviagen_holdout \
+  --testsets /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_holdout_testsets.json \
+  --output_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/reconviagen_holdout \
   --max_frames 8 \
   --seeds 0 \
   --skip_video
 ```
 
-For `GOOD_MESH_TEST`, use `ar_pose_trellis/benchmark/testsets.json` and a separate output root such as `benchmark_outputs/reconviagen_real`.
+For `GOOD_MESH_TEST`, use `ar_pose_trellis/benchmark/testsets.json` and a separate output root such as `outputs/benchmarks/reconviagen_good_mesh_test`.
 
 ## 4. Evaluate Meshes
 
 ```bash
 cd /home/zjr/Tracker
 
-/home/zjr/anaconda3/envs/reconviagen/bin/python \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python \
   ar_pose_trellis/benchmark/evaluate_meshes.py \
-  --testsets /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_holdout_testsets.json \
-  --arpose_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/arpose_holdout \
-  --reconviagen_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/reconviagen_holdout \
-  --output_dir /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/eval_holdout \
+  --testsets /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_holdout_testsets.json \
+  --arpose_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/arpose_holdout \
+  --reconviagen_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/reconviagen_holdout \
+  --output_dir /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/eval_holdout \
   --sample_points 4000
 ```
 

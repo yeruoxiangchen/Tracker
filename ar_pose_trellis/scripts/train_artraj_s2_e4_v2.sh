@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd /home/zjr/Tracker
 
-RUN_DIR=/home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_artraj_1000_s2_e4_v2
+RUN_DIR=/home/zjr/Tracker/ar_pose_trellis/outputs/training_runs/ss_arpose_artraj_1000_s2_e4_v2
 NUM_WORKERS=${NUM_WORKERS:-0}
 
 mkdir -p "$RUN_DIR"

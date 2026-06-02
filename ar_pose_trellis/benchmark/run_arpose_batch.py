@@ -30,8 +30,8 @@ def run_command(cmd: list[str], dry_run: bool) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--testsets", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark" / "testsets.json"))
-    parser.add_argument("--output_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / "arpose"))
-    parser.add_argument("--manifest_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / "manifests"))
+    parser.add_argument("--output_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / "arpose"))
+    parser.add_argument("--manifest_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / "manifests"))
     parser.add_argument("--python", default=DEFAULT_PYTHON)
     parser.add_argument("--weights", default="microsoft/TRELLIS-image-large")
     parser.add_argument("--checkpoint", required=True)

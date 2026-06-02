@@ -12,7 +12,7 @@ cd /home/zjr/Tracker
   ar_pose_trellis/dataset_tools/build_objaverse_pose_data.py \
   --objaverse_manifest /data/Objaverse/manifest_0_5000.json \
   --output_dir /data/ar_pose_trellis/objaverse_pose_smoke \
-  --code_output_dir /home/zjr/Tracker/ar_pose_trellis/smoke_outputs/data_build \
+  --code_output_dir /home/zjr/Tracker/ar_pose_trellis/outputs/data_previews/objaverse_pose_smoke \
   --max_objects 3 \
   --num_views 4 \
   --image_size 128 \
@@ -26,7 +26,7 @@ Outputs:
 ```text
 /data/ar_pose_trellis/objaverse_pose_smoke/{manifest,train,val}.json
 /data/ar_pose_trellis/objaverse_pose_smoke/samples/*/*.npz
-/home/zjr/Tracker/ar_pose_trellis/smoke_outputs/data_build/vis/*.jpg
+/home/zjr/Tracker/ar_pose_trellis/outputs/data_previews/objaverse_pose_smoke/vis/*.jpg
 ```
 
 The current builder is a CPU software point-splat renderer. It is intended for
@@ -42,7 +42,7 @@ cd /home/zjr/Tracker
   ar_pose_trellis/train_ss_ar_pose_smoke.py \
   --data_root /data/ar_pose_trellis/objaverse_pose_smoke \
   --split train \
-  --output_dir /home/zjr/Tracker/ar_pose_trellis/smoke_runs/objaverse_pose_smoke_cpu \
+  --output_dir /home/zjr/Tracker/ar_pose_trellis/outputs/smoke_runs/objaverse_pose_smoke_cpu \
   --num_views 4 \
   --batch_size 1 \
   --steps 5 \
@@ -55,9 +55,9 @@ cd /home/zjr/Tracker
 Outputs:
 
 ```text
-/home/zjr/Tracker/ar_pose_trellis/smoke_runs/objaverse_pose_smoke_cpu/ckpt_last.pt
-/home/zjr/Tracker/ar_pose_trellis/smoke_runs/objaverse_pose_smoke_cpu/train_log.csv
-/home/zjr/Tracker/ar_pose_trellis/smoke_runs/objaverse_pose_smoke_cpu/vis/*.jpg
+/home/zjr/Tracker/ar_pose_trellis/outputs/smoke_runs/objaverse_pose_smoke_cpu/ckpt_last.pt
+/home/zjr/Tracker/ar_pose_trellis/outputs/smoke_runs/objaverse_pose_smoke_cpu/train_log.csv
+/home/zjr/Tracker/ar_pose_trellis/outputs/smoke_runs/objaverse_pose_smoke_cpu/vis/*.jpg
 ```
 
 This CPU smoke trains `ARDinoRayCond` with a tiny target head. It validates data
@@ -78,7 +78,7 @@ ATTN_BACKEND=flash_attn \
   --data_root /data/ar_pose_trellis/objaverse_pose_smoke \
   --split train \
   --weights /home/zjr/.cache/huggingface/hub/models--Stable-X--trellis-vggt-v0-2/snapshots/647659a5ad5fbf67e22793e7b5e2cee4b30c5d13 \
-  --save_dir /home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_objaverse \
+  --save_dir /home/zjr/Tracker/ar_pose_trellis/outputs/training_runs/ss_arpose_objaverse \
   --num_views 4 \
   --batch_size 1 \
   --max_epochs 1 \

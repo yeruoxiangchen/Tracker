@@ -18,10 +18,10 @@ TRACKER_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PYTHON = "/home/zjr/anaconda3/envs/reconviagen/bin/python"
 DEFAULT_DATA_ROOT = "/data/ar_pose_trellis/objaverse_pose_1000_meshrgb_s2"
 DEFAULT_TESTSETS = (
-    "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_testsets.json"
+    "/home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_meshrgb_val_testsets.json"
 )
-DEFAULT_RUN_ROOT = "/home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments"
-DEFAULT_OUTPUT_ROOT = "/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments"
+DEFAULT_RUN_ROOT = "/home/zjr/Tracker/ar_pose_trellis/outputs/training_runs/pose_condition_experiments"
+DEFAULT_OUTPUT_ROOT = "/home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/pose_condition_experiments"
 
 
 def parse_csv(text: str, cast=str) -> list:

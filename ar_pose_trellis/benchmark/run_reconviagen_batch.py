@@ -29,10 +29,10 @@ def run_command(cmd: list[str], dry_run: bool) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--testsets", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark" / "testsets.json"))
-    parser.add_argument("--output_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / "reconviagen"))
+    parser.add_argument("--output_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / "reconviagen"))
     parser.add_argument("--python", default=DEFAULT_PYTHON)
     parser.add_argument("--resolution", type=int, default=518)
-    parser.add_argument("--manifest_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / "manifests"))
+    parser.add_argument("--manifest_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / "manifests"))
     parser.add_argument("--seeds", default="0")
     parser.add_argument("--mesh_simplify", type=float, default=None)
     parser.add_argument("--max_frames", type=int, default=8)

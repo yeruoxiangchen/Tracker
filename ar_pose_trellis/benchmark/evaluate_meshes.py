@@ -350,9 +350,9 @@ def evaluate_dataset(item: dict, args: argparse.Namespace, out_dir: Path) -> dic
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--testsets", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark" / "testsets.json"))
-    parser.add_argument("--arpose_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / "arpose"))
+    parser.add_argument("--arpose_root", default=str(TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / "arpose"))
     parser.add_argument("--reconviagen_root", default=None, help="Optional controlled ReconViaGen output root. Defaults to dataset/reconviagen_output.")
-    parser.add_argument("--output_dir", default=str(TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / "eval"))
+    parser.add_argument("--output_dir", default=str(TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / "eval"))
     parser.add_argument("--sample_points", type=int, default=6000)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()

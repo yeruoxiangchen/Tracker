@@ -1,0 +1,191 @@
+total_tasks: 48
+failures: 0
+
+[skipped] train_image_pose (train)
+  reason: using provided checkpoint: /home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_meshrgb_1000_s2_e4/last.ckpt
+
+[ok] train_image_only (train)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/train_image_only.log
+
+[ok] train_pose_only (train)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/train_pose_only.log
+
+[ok] eval_image_pose_raw (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_raw.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/raw/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_vh_w5 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_vh_w5.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/vh_w5/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_vh_w10 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_vh_w10.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/vh_w10/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_vh_w20 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_vh_w20.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/vh_w20/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_vh_w40 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_vh_w40.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/vh_w40/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_vh_w80 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_vh_w80.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/vh_w80/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_noise_r5_t0.02 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_noise_r5_t0.02.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/noise_r5_t0.02/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_noise_r15_t0.05 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_noise_r15_t0.05.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/noise_r15_t0.05/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_noise_r30_t0.1 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_noise_r30_t0.1.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/noise_r30_t0.1/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_noise_r60_t0.2 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_noise_r60_t0.2.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/noise_r60_t0.2/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_views_2 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_views_2.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/views_2/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_views_4 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_views_4.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/views_4/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_views_6 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_views_6.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/views_6/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_views_8 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_views_8.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/views_8/sparse_pose_ablation_report.json
+
+[ok] eval_image_pose_views_12 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_pose_views_12.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_pose/views_12/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_raw (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_raw.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/raw/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_vh_w5 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_vh_w5.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/vh_w5/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_vh_w10 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_vh_w10.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/vh_w10/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_vh_w20 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_vh_w20.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/vh_w20/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_vh_w40 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_vh_w40.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/vh_w40/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_vh_w80 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_vh_w80.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/vh_w80/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_noise_r5_t0.02 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_noise_r5_t0.02.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/noise_r5_t0.02/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_noise_r15_t0.05 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_noise_r15_t0.05.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/noise_r15_t0.05/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_noise_r30_t0.1 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_noise_r30_t0.1.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/noise_r30_t0.1/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_noise_r60_t0.2 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_noise_r60_t0.2.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/noise_r60_t0.2/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_views_2 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_views_2.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/views_2/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_views_4 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_views_4.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/views_4/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_views_6 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_views_6.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/views_6/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_views_8 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_views_8.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/views_8/sparse_pose_ablation_report.json
+
+[ok] eval_image_only_views_12 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_image_only_views_12.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/image_only/views_12/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_raw (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_raw.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/raw/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_vh_w5 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_vh_w5.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/vh_w5/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_vh_w10 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_vh_w10.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/vh_w10/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_vh_w20 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_vh_w20.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/vh_w20/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_vh_w40 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_vh_w40.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/vh_w40/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_vh_w80 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_vh_w80.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/vh_w80/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_noise_r5_t0.02 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_noise_r5_t0.02.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/noise_r5_t0.02/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_noise_r15_t0.05 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_noise_r15_t0.05.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/noise_r15_t0.05/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_noise_r30_t0.1 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_noise_r30_t0.1.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/noise_r30_t0.1/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_noise_r60_t0.2 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_noise_r60_t0.2.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/noise_r60_t0.2/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_views_2 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_views_2.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/views_2/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_views_4 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_views_4.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/views_4/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_views_6 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_views_6.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/views_6/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_views_8 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_views_8.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/views_8/sparse_pose_ablation_report.json
+
+[ok] eval_pose_only_views_12 (eval)
+  log: /home/zjr/Tracker/ar_pose_trellis/runs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/logs/eval_pose_only_views_12.log
+  report: /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/pose_condition_experiments/pose_condition_reuse_image_pose_003_gpu1/pose_only/views_12/sparse_pose_ablation_report.json

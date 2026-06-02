@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--testsets", required=True, help="Benchmark testsets JSON.")
     parser.add_argument("--checkpoint", default=None, help="AR-pose TRELLIS checkpoint. Required unless --skip_arpose.")
-    parser.add_argument("--output_root", default="", help="Comparison output root. Defaults to benchmark_outputs/compare_<timestamp>.")
+    parser.add_argument("--output_root", default="", help="Comparison output root. Defaults to outputs/benchmarks/compare_<timestamp>.")
     parser.add_argument("--python", default=DEFAULT_PYTHON)
     parser.add_argument("--weights", default="microsoft/TRELLIS-image-large")
 
@@ -81,7 +81,7 @@ def main() -> None:
         output_root = Path(args.output_root)
     else:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = TRACKER_ROOT / "ar_pose_trellis" / "benchmark_outputs" / f"compare_{stamp}"
+        output_root = TRACKER_ROOT / "ar_pose_trellis" / "outputs" / "benchmarks" / f"compare_{stamp}"
     arpose_root = output_root / "arpose"
     recon_root = output_root / "reconviagen"
     eval_root = output_root / "eval"

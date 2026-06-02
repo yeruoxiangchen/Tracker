@@ -145,6 +145,145 @@ context = image_context + pose_scale * pose_context
 
 一句话总结：当前实验没有证明 learned AR pose ray condition 本身有效，但证明了 AR pose + mask 的显式投影几何先验有效；后续创新点应从“可解释的几何 prior 接入 sparse structure 生成”继续推进。
 
+## 补充结论：AR Pose Ray 与 Visual Hull 的边界
+
+后续在 `GOOD_MESH_TEST` 上又测试了两类更直接的几何接入方式：
+
+1. 将 visual hull 作为 logits prior 加到 sparse structure logits 上。
+2. 直接用 `mask + AR pose` 生成 visual hull surface coords，跳过当前 learned sparse network，再把 coords 送入 TRELLIS SLAT flow。
+
+直接 visual hull coords 测试输出路径：
+
+```text
+/home/zjr/Tracker/ar_pose_trellis/outputs/good_mesh_tests/direct_visual_hull_coords_sweep
+```
+
+该测试可以跑通，说明 `visual_hull coords -> SLAT` 这条工程路径是可行的；但输出 mesh 仍然明显破碎、片状、薄壳化，没有得到稳定的粗 mesh。也就是说，问题不只是当前 sparse network 学得不稳定。
+
+当前更准确的结论是：
+
+1. AR pose ray condition 有相机位姿和射线信息，但它只是 learned token condition，没有直接绑定到每个 3D voxel / sparse coords 的局部图像证据上。
+2. visual hull 可以提供显式几何候选区域，但它只有 silhouette 包络约束，不能提供凹陷、背面、局部表面和纹理信息。
+3. 直接把 visual hull coords 交给原始 TRELLIS SLAT flow 不够，因为 SLAT 没有针对这种 AR visual hull coords 分布训练，也没有在每个 coords 上看到对应的多视图图像特征。
+4. 因此，AR pose 和 visual hull 不是没用，而是当前接入方式太弱；后续应该把它们转成 per-voxel / per-sparse-coord 的多视图投影图像特征，而不是只作为全局 pose token 或简单 coords 约束。
+
+下一步更合理的方向是 Pixal3D 风格的投影条件：
+
+```text
+visual hull / AR pose 给候选 sparse coords
++
+将每个 coords 投影到多视图图像
++
+采样 DINO/RGB/mask 特征
++
+把 per-coord projected features 接入 SLAT 或 sparse/SLAT adapter
+```
+
+这比继续只调 `pose_scale`、visual hull 权重或 sparse threshold 更有意义。
+
+## 后续 Pixal3D 改造的代码落点
+
+不建议直接在 `Pixal3D/` 源码里改主流程。`Pixal3D/` 应该保留为参考实现，主要用来借鉴它的 3D grid/image feature projection、project attention 和 sparse projected feature 的接入方式。
+
+后续改造应放在：
+
+```text
+/home/zjr/Tracker/ar_pose_trellis
+```
+
+理由：
+
+1. 当前目标是服务 `/home/zjr/Tracker/CoarseModel/connect/server.py` 接收的手机 AR 图像、mask、相机位姿，并生成一个 coarse mesh；这个工程入口已经在 `ar_pose_trellis`。
+2. 现有训练、测试、GOOD_MESH_TEST、benchmark、visual hull prior、direct visual hull coords 都已经在 `ar_pose_trellis` 下，继续放这里便于对比实验。
+3. `Pixal3D` 的默认相机/物体规范坐标假设和当前 AR 输入不完全一致，直接改 Pixal3D 会把参考代码和实验代码混在一起，后续难维护。
+4. 更合适的做法是在 `ar_pose_trellis` 下新建 Pixal3D-style 模块，例如：
+
+```text
+ar_pose_trellis/projected_condition.py
+ar_pose_trellis/pixal3d_style_pipeline.py
+ar_pose_trellis/train_projected_slat.py
+ar_pose_trellis/scripts/run_good_mesh_projected_condition.sh
+```
+
+也就是说：`Pixal3D/` 作为参考，不直接改；核心实验和后续可接入 server 的代码继续放在 `ar_pose_trellis/`。
+
+## 为什么当前 AR Pose Ray 约束较弱
+
+当前 AR Pose Ray condition 确实已经接入 sparse structure flow，但它的约束形式偏弱。原因不是相机位姿没有价值，而是当前接入方式只提供了“相机射线描述”，没有把几何关系转成每个 3D 位置上的图像证据。
+
+当前 AR Pose Ray condition 做的是：
+
+```text
+每个图像 patch 的 ray direction / camera origin / right-up-forward / mask_patch
+-> MLP
+-> 与 DINO patch feature 相加
+-> cross-attention 聚合成 condition tokens
+-> 输入 sparse structure flow
+```
+
+它告诉模型的是：
+
+```text
+这些图像 patch 来自这些相机射线
+```
+
+但它没有直接告诉模型：
+
+```text
+某个 sparse coord / voxel 投影到哪几张图的哪些 patch
+这些 patch 是否在 mask 内
+这些 patch 的 DINO/RGB/mask 特征是什么
+这些多视图 patch 是否在看同一个 3D 点
+这个 3D 点的局部几何和纹理应该是什么
+```
+
+因此它是 soft condition。模型可以利用它，也可以在训练中主要依赖 DINO 图像先验而弱化甚至忽略 pose/ray token。本次 `correct / identity / shuffle / noise` 差距较小，就说明当前网络对 pose 的敏感性不足。
+
+## 为什么 ReconViaGen 的 VGGT Tokens 更强
+
+ReconViaGen 中的 VGGT `aggregated_tokens_list` 不是普通相机位姿 token，也不是简单的 ray encoding。它来自已经训练好的 VGGT aggregator，本身就包含多视图几何推理后的中间表示。
+
+VGGT aggregated tokens 通常隐含了：
+
+```text
+多视图图像匹配
+相机相对关系
+深度线索
+point map / 点云线索
+track / correspondence 线索
+跨视图一致性
+局部图像纹理和语义
+```
+
+ReconViaGen 还同时把 VGGT tokens 接入两个阶段：
+
+```text
+VGGT tokens + DINO image cond -> sparse structure condition
+VGGT tokens + DINO image cond -> SLAT condition
+```
+
+也就是说，VGGT 不只影响 coarse coords，也影响 coords 上的 SLAT latent 生成。当前 `ar_pose_trellis` 的 AR Pose Ray 主要影响 sparse structure，而 SLAT 仍然基本沿用 TRELLIS 原始 image condition，所以即使 sparse coords 被 pose 或 visual hull 稍微约束，SLAT 阶段仍然缺少几何对齐的局部图像证据。
+
+两者的本质区别可以概括为：
+
+| 方法 | 输入信息 | 约束强度 |
+|---|---|---|
+| AR Pose Ray | 相机矩阵、ray direction、mask patch 比例 | 几何参数级，软约束 |
+| Visual Hull | mask + pose 投影得到候选 voxel | silhouette 包络级，中等约束 |
+| VGGT Tokens | 多视图图像经过几何预训练模型聚合后的 dense tokens | 图像匹配 + 隐式几何级，强约束 |
+
+因此，当前实验不能说明 AR pose 没价值，只能说明“把 AR pose 写成 ray token 后直接喂给 sparse flow”不够。若希望 AR pose 接近 VGGT 的约束效果，需要把它变成 per-voxel / per-sparse-coord 的投影图像特征：
+
+```text
+sparse coords / visual hull coords
+-> 用 AR pose 投影到多视图图像
+-> 采样 DINO/RGB/mask feature
+-> 聚合成 per-coord projected feature
+-> 接入 sparse flow 和 SLAT flow
+```
+
+这也是后续转向 Pixal3D-style projected condition 的主要原因。
+
 ---
 
 以下保留原始 `稀疏位姿消融测试简报.md` 内容，作为历史测试记录。
@@ -161,10 +300,10 @@ context = image_context + pose_scale * pose_context
 
 - 数据集：Objaverse 合成 meshrgb 数据
 - 数据目录：`/data/ar_pose_trellis/objaverse_pose_1000_meshrgb_s2`
-- 测试集清单：`/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_testsets.json`
+- 测试集清单：`/home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_meshrgb_val_testsets.json`
 - 测试样本数：8 个 validation case
 - 每个 case 测 4 组 pose ablation，共 32 条结果
-- checkpoint：`/home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_meshrgb_1000_s2_e4/last.ckpt`
+- checkpoint：`/home/zjr/Tracker/ar_pose_trellis/checkpoints/sparse_image_pose_meshrgb_s2_e4.ckpt`
 
 ## 四组输入含义
 
@@ -187,7 +326,7 @@ context = image_context + pose_scale * pose_context
 
 报告路径：
 
-`/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/sparse_pose_ablation_meshrgb_e4_raw/sparse_pose_ablation_report.json`
+`/home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/sparse_pose_ablation_raw/sparse_pose_ablation_report.json`
 
 | mode | pred coords | IoU | F2 | Chamfer |
 |---|---:|---:|---:|---:|
@@ -202,7 +341,7 @@ context = image_context + pose_scale * pose_context
 
 报告路径：
 
-`/home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/sparse_pose_ablation_meshrgb_e4_vhprior_w40_inprocess/sparse_pose_ablation_report.json`
+`/home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/sparse_pose_ablation_visual_hull_w40/sparse_pose_ablation_report.json`
 
 | mode | pred coords | IoU | F2 | Chamfer |
 |---|---:|---:|---:|---:|
@@ -235,9 +374,9 @@ MPLCONFIGDIR=/tmp/matplotlib \
 NUMBA_CACHE_DIR=/tmp/numba_cache \
 /home/zjr/anaconda3/envs/reconviagen/bin/python \
   ar_pose_trellis/benchmark/evaluate_sparse_pose_ablation.py \
-  --testsets /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_testsets.json \
-  --checkpoint /home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_meshrgb_1000_s2_e4/last.ckpt \
-  --output_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/sparse_pose_ablation_meshrgb_e4_raw \
+  --testsets /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_meshrgb_val_testsets.json \
+  --checkpoint /home/zjr/Tracker/ar_pose_trellis/checkpoints/sparse_image_pose_meshrgb_s2_e4.ckpt \
+  --output_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/sparse_pose_ablation_raw \
   --max_frames 8 \
   --ss_steps 12 \
   --ss_min_coords 0 \
@@ -257,9 +396,9 @@ MPLCONFIGDIR=/tmp/matplotlib \
 NUMBA_CACHE_DIR=/tmp/numba_cache \
 /home/zjr/anaconda3/envs/reconviagen/bin/python \
   ar_pose_trellis/benchmark/evaluate_sparse_pose_ablation.py \
-  --testsets /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/objaverse_meshrgb_selected_val_testsets.json \
-  --checkpoint /home/zjr/Tracker/ar_pose_trellis/runs/ss_arpose_meshrgb_1000_s2_e4/last.ckpt \
-  --output_root /home/zjr/Tracker/ar_pose_trellis/benchmark_outputs/sparse_pose_ablation_meshrgb_e4_vhprior_w40_inprocess \
+  --testsets /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/objaverse_meshrgb_val_testsets.json \
+  --checkpoint /home/zjr/Tracker/ar_pose_trellis/checkpoints/sparse_image_pose_meshrgb_s2_e4.ckpt \
+  --output_root /home/zjr/Tracker/ar_pose_trellis/outputs/benchmarks/sparse_pose_ablation_visual_hull_w40 \
   --max_frames 8 \
   --ss_steps 12 \
   --ss_min_coords 0 \

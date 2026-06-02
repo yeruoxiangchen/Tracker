@@ -516,7 +516,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--objaverse_manifest", default="/data/Objaverse/manifest_0_5000.json")
     parser.add_argument("--output_dir", default="/data/ar_pose_trellis/objaverse_pose_smoke")
-    parser.add_argument("--code_output_dir", default="/home/zjr/Tracker/ar_pose_trellis/smoke_outputs/data_build")
+    parser.add_argument("--code_output_dir", default="/home/zjr/Tracker/ar_pose_trellis/outputs/data_previews/smoke_data_build")
     parser.add_argument("--max_objects", type=int, default=10)
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
