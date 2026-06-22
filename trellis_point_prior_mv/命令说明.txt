@@ -1,0 +1,2114 @@
+目录：
+/home/zjr/Tracker/trellis_point_prior_mv
+
+目标：
+这是 Points-to-3D + 多视图 pose 思路的第一阶段原型。它不改 ar_pose_trellis / pixal3d_multiview / ReconViaGen 原代码。
+
+核心流程：
+1. 使用现有 Pixal V9 多视图合成数据和已预计算 TRELLIS sparse latent。
+2. 从完整 target_coords 抽取 64^3 occupancy 的表面 voxels。
+3. 用多视图 pose + mask 筛出被多视角支持的 object surface voxels。
+   当前默认启用 front-depth z-buffer，只保留每个 view 每个像素附近最前面的 surface voxel。
+   当前默认禁止 support fallback；如果投影/坐标系/mask support 失败，prior 会为空并在 report 中标记 support_failed。
+4. 退化成 AR-SLAM-like sparse point prior：
+   - 1/2/4/8 个视角；
+   - 50/100/300/800/1500 点；
+   - dropout；
+   - voxel jitter；
+   - 少量 random outlier。
+5. 训练 TRELLIS sparse structure flow 的 LoRA + SparsePointPriorCond。
+6. 测试 correct / empty / shuffle / random / jitter prior 的 fixed-topk sparse IoU/recall/rank。
+
+当前不是最终完整 Points-to-3D：
+这里先把 partial latent/mask/confidence 映射成 flow condition tokens，不直接改 flow 的 x_t inpainting clamp。
+如果这一版能在 fixed-topk eval 中体现 correct prior 排名优势，再做第二阶段 visible latent clamp / boundary refinement。
+
+
+一、Smoke：构建小数据、训练 20 steps、评测 0-7
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_smoke \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage1.sh
+
+结果查看：
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_smoke/data/train/build_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_smoke/data/val/build_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_smoke/eval/report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_smoke/eval/report.csv
+
+
+二、只构建数据，不训练
+
+cd /home/zjr/Tracker
+
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_smoke_buildonly \
+RUN_BUILD=1 \
+RUN_TRAIN=0 \
+RUN_EVAL=0 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage1.sh
+
+输出：
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_smoke_buildonly/data/train/manifest.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_smoke_buildonly/data/val/manifest.json
+
+
+三、正式一点的 s200
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_s200 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage1.sh
+
+结果查看：
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_s200/eval/report.json
+
+
+四、复用已构建数据，只重新训练
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_s200 \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+MAX_STEPS=200 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage1.sh
+
+
+五、只评测已有 checkpoint
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_s200 \
+RUN_BUILD=0 \
+RUN_TRAIN=0 \
+RUN_EVAL=1 \
+EVAL_INDICES=0-31 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage1.sh
+
+
+六、手动构建数据集
+
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/build_point_prior_dataset.py \
+  --source_manifest /data/pixal3d_multiview/objaverse_sparse_mv_artraj_pbr_5000_v9_select8/train.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/manual_train_prior \
+  --indices 0-511 \
+  --max_frames 8 \
+  --grid_transform pixal3d_rotation \
+  --num_prior_views_choices 1,2,4,8 \
+  --point_count_choices 50,100,300,800,1500 \
+  --min_support 1.0 \
+  --min_support_ratio 0.45 \
+  --dropout_min 0.0 \
+  --dropout_max 0.65 \
+  --coord_jitter 1 \
+  --outlier_ratio 0.03 \
+  --front_depth_epsilon 0.02
+
+
+七、手动训练
+
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/train_sparse_inpaint.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/manual_train_prior/manifest.json \
+  --weights microsoft/TRELLIS-image-large \
+  --save_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/manual_train_ckpt \
+  --batch_size 1 \
+  --num_workers 2 \
+  --max_epochs 100 \
+  --max_steps 200 \
+  --lr 1e-4 \
+  --cfg_drop_prob 0.1 \
+  --ckpt_every_n_steps 100
+
+
+八、手动评测
+
+cd /home/zjr/Tracker
+
+CKPT=$(find /home/zjr/Tracker/trellis_point_prior_mv/outputs/manual_train_ckpt -maxdepth 1 -name "*.ckpt" -printf "%T@ %p\n" | sort -nr | head -1 | cut -d' ' -f2-)
+test -f "$CKPT" || { echo "No checkpoint found"; exit 1; }
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_sparse_inpaint.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/manual_val_prior/manifest.json \
+  --checkpoint "$CKPT" \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/manual_eval \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0-31 \
+  --prior_modes correct,empty,shuffle,random,jitter \
+  --fixed_topk 4096,8192,target_unique \
+  --steps 12 \
+  --guidance_strength 1.0
+
+
+九、判断标准
+
+重点看 eval/report.json：
+summary.correct_rank.top1_rate
+summary.correct_rank.rank_mean
+summary.correct.iou_mean
+summary.correct.target_recall_mean
+
+如果 correct prior 在 fixed top-k 下不能稳定优于 empty/shuffle/random/jitter，说明这一版“condition token 型 point prior”还不够，应进入第二阶段：
+1. 把 observed latent 直接 clamp 到 x_t / x0 采样路径；
+2. 加 mask-aware inpainting loss；
+3. 训练时加入 boundary refinement；
+4. 如果数据中能得到真实深度，再把当前 silhouette-support partial prior 替换为真实 visible surface depth prior。
+
+如果 correct prior 有明显 rank 优势，再接 mesh 解码和真实 AR/COLMAP point cloud 输入。
+
+
+十、当前修正后的重要诊断字段
+
+build_report.json / build_report.csv 里重点看：
+
+support_failed：
+1 表示该样本通过 pose+mask+front-depth 没筛出任何 supported surface。默认不会 fallback，这类样本 prior_point_count 会是 0。
+
+fallback_used：
+默认应为 0。只有显式设置 ALLOW_SUPPORT_FALLBACK=1 或 --allow_support_fallback 才可能为 1。
+
+supported_surface_count：
+这是 fallback 前的真实 supported surface 数，不再是 fallback 后的 sampling pool 数。
+
+sampling_pool_count：
+实际用于采样 prior 的 surface pool。默认等于 supported_surface_count；只有打开 fallback 时才可能不同。
+
+eval 公平性：
+同一个 sample 的 correct/empty/shuffle/random/jitter 现在使用同一份 sparse sampler 初始 noise，差异来自 prior condition，不再来自随机 noise。
+
+confidence：
+prior_conf 会写入 npz、进入训练和评测 condition。random outlier 的低 confidence 不会被重置成 1。
+
+如果你想临时回退旧行为：
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_smoke_with_fallback \
+ALLOW_SUPPORT_FALLBACK=1 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage1.sh
+
+不建议默认这么做，它会隐藏 projection/filtering 失败。
+
+
+十一、Stage 2：Points-to-3D 式 sparse structure inpainting 原型
+
+背景：
+前面的 oracle smoke 已经说明，单纯把 point prior encode 成普通 condition token 不够。即使 prior 是 8 视角、1500 点、无 dropout、无 outlier，correct 也不能稳定胜过 shuffle/jitter。
+
+Stage 2 的代码不覆盖 Stage 1，新增入口：
+
+训练：
+/home/zjr/Tracker/trellis_point_prior_mv/train_sparse_inpaint_stage2.py
+
+评测：
+/home/zjr/Tracker/trellis_point_prior_mv/eval_sparse_inpaint_stage2.py
+
+一键脚本：
+/home/zjr/Tracker/trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+Stage 2 做了什么：
+1. 仍然使用 build_point_prior_dataset.py 构建 prior。
+2. 将 prior voxelize 后编码成 partial latent / known latent mask / confidence。
+3. 训练时构造 mixed inpainting target：
+   - known 区域 target = known partial latent；
+   - unknown 区域 target = full target sparse latent。
+   关键点：known 区域不再用 full target_x0。
+4. 训练时 x_t 由 mixed target 加噪得到，因此 known latent 真的进入 x_t。
+5. 训练时在 known latent 区域增加 flow / predicted x0 一致性权重。
+6. 评测采样时做 timestep-correct known latent clamp：
+   - 每个 denoising step 后，用同一份 known noise 将 known latent 加噪到当前 t_prev；
+   - 再把该 noised known latent 注回 sample。
+7. 评测 final logits 可选支持 known point reinjection：
+   - 对输入 point prior 对应的 64^3 logits 加 boost，使 known points 不再被 top-k 完全丢掉。
+   严格 inpainting 主实验默认关闭这个功能。
+8. eval/report.json 会额外统计：
+   - prior_recall：生成 sparse 覆盖输入 prior 点的比例；
+   - prior_precision：生成 sparse 中有多少比例落在输入 prior 点上。
+
+重要参数：
+
+KNOWN_FLOW_LOSS_WEIGHT：
+known latent 区域 flow MSE 的额外权重，默认 2.0。
+
+KNOWN_X0_LOSS_WEIGHT：
+known latent 区域 predicted x0 一致性 loss 权重，默认 1.0。
+
+KNOWN_USE_CONFIDENCE：
+是否把 confidence 用到 inpainting target / timestep clamp 的 known 区域权重里，默认 0。
+默认 0 时：
+- condition 仍使用 confidence；
+- inpainting target 的 known 区域只由 latent_mask 决定；
+- known target = raw known partial latent，不再被 confidence 缩小。
+设置为 1 时：
+- known_weight = latent_mask * confidence；
+- 更适合真实 AR/SLAM prior 中点云噪声较高的情况。
+第一轮 strict oracle 必须保持 0，否则 oracle 点云会被 density confidence 软化。
+
+KNOWN_LATENT_CLAMP_STRENGTH：
+采样阶段每步 latent reinjection 强度，默认 1.0。
+0 表示不做 latent clamp，只保留训练侧 known loss。
+1 表示 known latent 区域强制替换为 partial latent。
+
+KNOWN_LOGIT_BOOST：
+最终 decoder logits 上对 prior coords 的 boost，默认 0.0。
+0 表示不做 final logits reinjection。
+
+CLAMP_INITIAL_NOISE：
+是否在初始 noise 阶段也注入 noised known latent。默认 1。
+
+
+十二、Stage 2 smoke：先跑最关键的 oracle prior 版本
+
+这个命令对应当前最需要验证的问题：
+如果 point prior 作为 known sparse structure，而不是普通 condition，correct 是否能稳定压过 shuffle/jitter。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_oracle_smoke \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=1.0 \
+KNOWN_USE_CONFIDENCE=0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+CLAMP_INITIAL_NOISE=1 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_smoke/data/train/build_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_smoke/data/val/build_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_smoke/eval/report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_smoke/eval/report.csv
+
+重点看：
+
+summary.correct_rank.top1_rate
+summary.correct.iou_mean
+summary.correct.target_recall_mean
+summary.correct.prior_recall_mean
+summary.shuffle.iou_mean
+summary.jitter.iou_mean
+
+判断：
+1. correct 的 prior_recall 应该明显上升。
+2. correct IoU / target_recall 应该至少稳定超过 random/empty。
+3. 最关键是 correct 是否超过 shuffle/jitter。
+4. 如果 correct 仍然输给 shuffle/jitter，说明 final known reinjection 只是在强制覆盖输入点，并没有解决样本级补全问题。
+
+
+十三、Stage 2 ablation：打开 final logits boost，看是不是后处理点插入
+
+主实验默认关闭 final logits boost。这个命令用于判断“强行把 known points 插进 top-k”能带来多少额外提升。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_oracle_logitboost_smoke \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=1.0 \
+KNOWN_USE_CONFIDENCE=0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=4.0 \
+CLAMP_INITIAL_NOISE=1 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_logitboost_smoke/eval/report.json
+
+判断：
+如果只在 logit boost 下 prior_recall / correct rank 提升，说明收益更像后处理点插入。
+如果主实验不加 boost 也能提升，说明 flow 采样路径本身开始服从 known structure。
+
+
+十四、Stage 2 ablation：关闭 latent clamp，只看训练侧 known loss + final logits boost
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_oracle_logitonly_smoke \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=1.0 \
+KNOWN_USE_CONFIDENCE=0 \
+KNOWN_LATENT_CLAMP_STRENGTH=0.0 \
+KNOWN_LOGIT_BOOST=4.0 \
+CLAMP_INITIAL_NOISE=0 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_logitonly_smoke/eval/report.json
+
+判断：
+如果 logit-only 能让 correct 胜过 shuffle，说明输入点本身与 target overlap 足够强，至少后处理 known insertion 有价值。
+如果 logit-only 下 shuffle 也很强，说明不同样本 prior 的 target overlap 或形状先验仍然混淆严重，需要 wrong-prior ranking 或更严格的 known/unknown 分区。
+
+
+十五、Stage 2 s200：只有 smoke 有正信号后再跑
+
+不建议直接先跑 s200。建议只有在 smoke 中看到 correct rank 明显改善后再跑：
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_oracle_s200 \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=1.0 \
+KNOWN_USE_CONFIDENCE=0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+CLAMP_INITIAL_NOISE=1 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_oracle_s200/eval/report.json
+
+
+十六、Stage 2 结果判断标准
+
+第一层：known point 是否真的进入输出。
+看 summary.correct.prior_recall_mean。
+如果 prior_recall 仍然很低，说明 known latent/logit reinjection 没接好。
+
+第二层：correct 是否压过 random/empty。
+如果不能压过 random/empty，说明点云本身没有被有效使用。
+
+第三层：correct 是否压过 shuffle/jitter。
+这是最关键的样本级几何绑定指标。
+如果 correct 仍然输给 shuffle/jitter，说明当前只是在做点云覆盖或物体先验增强，没有学到“当前点云对应当前物体”的补全。
+
+第四层：latent-only 和 logit-only 的差别。
+如果只有 logit-only 有提升，说明它更像后处理点插入。
+如果 latent-only 也有提升，说明 flow 采样路径开始受 known structure 约束。
+
+第五层：是否进入 wrong-prior ranking。
+如果 Stage 2 oracle smoke 能让 correct 明显优于 empty/random，但仍压不住 shuffle/jitter，下一步才加 wrong-prior ranking：
+1. 同一个 target；
+2. 同一个 t/noise；
+3. correct prior loss 应低于 shuffle/random prior；
+4. ranking loss 同时看 known consistency 和 unknown completion。
+
+
+十七、Stage 2 真实 AR/SLAM 噪声 prior 版本再打开 confidence
+
+strict oracle 不建议打开 confidence，因为当前 confidence 来自点密度统计，不等于 known cell 是否真实可信。
+等 strict oracle 跑通后，如果换成真实 AR/SLAM 稀疏点云，可以考虑：
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_confidence_smoke \
+POINT_COUNT_CHOICES=300,800,1500 \
+NUM_PRIOR_VIEWS_CHOICES=4,8 \
+DROPOUT_MAX=0.25 \
+OUTLIER_RATIO=0.03 \
+COORD_JITTER=1 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=1.0 \
+KNOWN_USE_CONFIDENCE=1 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+CLAMP_INITIAL_NOISE=1 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+这个版本用于模拟真实点云噪声，不应用来判断 oracle 上限。
+
+
+十八、Stage 2 补 known / unknown 分区指标
+
+本轮已在：
+
+trellis_point_prior_mv/eval_sparse_inpaint_stage2.py
+
+中新增分区指标。定义方式如下：
+
+1. known region：
+   prior sparse points 映射到 16^3 TRELLIS sparse latent cell 后，这些 cell 覆盖到的 64^3 target/pred 坐标。
+   这和 Stage 2 当前 hard latent clamp 的真实作用区域一致。
+
+2. unknown region：
+   target/pred 中不落在 known latent cell 的部分。
+
+3. exact_unknown：
+   直接按 64^3 exact prior point 做 target - prior / pred - prior 的补充诊断。
+   这个指标比 known/unknown 更严格，但不完全等价于 latent clamp 作用区域。
+
+新增重点字段：
+
+- known_iou
+- known_target_recall
+- unknown_iou
+- unknown_target_recall
+- exact_unknown_iou
+- exact_unknown_target_recall
+- known_prior_recall
+- prior_target_overlap_ratio
+- wrong_prior_leak_rate
+- wrong_prior_leak_pred_fraction
+- summary.correct_rank_unknown_iou
+- summary.correct_rank_unknown_target_recall
+- summary.paired_delta
+
+推荐先不重训，直接用已有 noisy_s200 checkpoint 重跑 eval：
+
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_sparse_inpaint_stage2.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/data/val/manifest.json \
+  --checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/checkpoints/last.ckpt \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/eval_unknown_metrics \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0-31 \
+  --prior_modes correct,empty,shuffle,random,jitter \
+  --fixed_topk 4096,8192,target_unique \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --lora_rank 64 \
+  --lora_alpha 128 \
+  --clamp_initial_noise
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/eval_unknown_metrics/report.json
+
+快速抽取重点指标：
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; p='/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/eval_unknown_metrics/report.json'; d=json.load(open(p)); s=d['summary']; print('correct unknown_iou=', s['correct']['unknown_iou_mean']); print('correct unknown_recall=', s['correct']['unknown_target_recall_mean']); print('unknown rank=', s['correct_rank_unknown_iou']); print('target_unique/shuffle unknown delta=', s['paired_delta']['target_unique/shuffle']['unknown_iou'])"
+
+如果需要重新训练并自动产出新版 eval 指标，沿用 Stage 2 noisy s200：
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_noisy_s200_unknownmetrics \
+POINT_COUNT_CHOICES=300,800,1500 \
+NUM_PRIOR_VIEWS_CHOICES=4,8 \
+DROPOUT_MAX=0.25 \
+OUTLIER_RATIO=0.03 \
+COORD_JITTER=1 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=1.0 \
+KNOWN_USE_CONFIDENCE=0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+CLAMP_INITIAL_NOISE=1 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+
+训练结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200_unknownmetrics/eval/report.json
+
+判断标准：
+
+1. 如果 correct 的 unknown_iou / unknown_target_recall 仍明显高于 shuffle/random/jitter，说明 point prior 不只是保 known 点，也在帮助补 unknown。
+2. 如果 correct 只在 known_iou / known_prior_recall 上高，而 unknown_iou 不高，说明收益主要来自 hard known clamp，后续 mesh 未必能明显变好。
+3. 如果 wrong_prior_leak_rate 很高，并且 shuffle/random 的 unknown_iou 也不低，说明模型被错误 prior 污染，下一步应做 wrong-prior ranking 或降低 noisy known target 的 X0 权重。
+4. 如果 empty 的 unknown_iou 接近 correct，说明当前 prior 没有给 unknown completion 带来有效增益，继续加点云 condition 意义不大。
+
+
+十九、Stage 2 公平 observed split 指标
+
+上一节的 `unknown_*` 是 condition split：
+
+- correct mode 用 correct prior 切 known/unknown；
+- shuffle mode 用 shuffle prior 切 known/unknown；
+- random mode 用 random prior 切 known/unknown；
+- jitter mode 用 jitter prior 切 known/unknown。
+
+这适合分析“当前输入 prior 自己造成了什么影响”，但不适合直接比较：
+
+- correct.unknown_iou vs shuffle.unknown_iou；
+- correct_rank_unknown_iou；
+- paired_delta 的 unknown_iou。
+
+因此已新增一套公平 common observed split：
+
+- `obs_known_*`：所有 mode 都使用 correct prior 映射到 16^3 latent cell 后覆盖的 64^3 区域；
+- `obs_unknown_*`：所有 mode 都使用同一个 correct-prior observed known region 的补集。
+
+这样 `obs_unknown_iou` / `obs_unknown_target_recall` 可以直接比较 correct、shuffle、random、jitter。
+
+推荐重跑 eval：
+
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_sparse_inpaint_stage2.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/data/val/manifest.json \
+  --checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/checkpoints/last.ckpt \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/eval_obs_unknown_metrics \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0-31 \
+  --prior_modes correct,empty,shuffle,random,jitter \
+  --fixed_topk 4096,8192,target_unique \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --lora_rank 64 \
+  --lora_alpha 128 \
+  --clamp_initial_noise
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/eval_obs_unknown_metrics/report.json
+
+快速抽取公平指标：
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; p='/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_noisy_s200/eval_obs_unknown_metrics/report.json'; d=json.load(open(p)); s=d['summary']; print('correct obs_unknown_iou=', s['correct']['obs_unknown_iou_mean']); print('correct obs_unknown_recall=', s['correct']['obs_unknown_target_recall_mean']); print('obs unknown rank=', s['correct_rank_obs_unknown_iou']); print('target_unique/shuffle obs_unknown delta=', s['paired_delta']['target_unique/shuffle']['obs_unknown_iou']); print('target_unique/empty obs_unknown delta=', s['paired_delta']['target_unique/empty']['obs_unknown_iou'])"
+
+解释顺序：
+
+1. 先看全局 `iou` 和 `correct_rank`，判断 prior 是否整体有效；
+2. 再看 `obs_unknown_iou` / `obs_unknown_target_recall`，判断 correct prior 是否真的帮助补 observed 之外的区域；
+3. 最后看旧的 condition split `unknown_*`，判断每个输入 prior 自己的 known clamp 是否污染或约束了输出。
+
+
+二十、Frozen stock slat/mesh downstream 评测
+
+目的：
+
+验证不同 sparse coords 能否被 stock TRELLIS slat/mesh downstream 接住。这个实验不训练新的 slat flow，因此只能回答：
+
+不同 sparse 输入在原版 slat/mesh checkpoint 下是否能改善最终 mesh。
+
+它不能证明 point-prior 路线的最终上限；如果 target sparse 都接不住，说明主要问题是 stock downstream compatibility。
+
+新增脚本：
+
+trellis_point_prior_mv/eval_mesh_frozen_downstream.py
+
+支持的 sparse 输入：
+
+- `stock_sparse`：原版 TRELLIS sparse flow 生成的 sparse；
+- `target_sparse`：GT target sparse，即 `ss_latents/*/target_coords`；
+- `prior_sparse`：当前 point-prior manifest 中的 correct prior sparse points；
+- `stage2_correct`：Stage 2 point-prior sparse flow 输出，需要 `--stage2_checkpoint`。
+
+默认使用 `microsoft/TRELLIS-image-large`，因为当前 point-prior sparse flow 就是在这个 TRELLIS 原版 sparse flow 基础上训练的。脚本会从 point-prior manifest 回溯 `source_manifest/source_index`，读取 PixalV9 的多视角 RGB/mask，做前景 crop 后作为 stock slat condition。
+
+第一步：最小 smoke，只测 GT target sparse / prior sparse / stock sparse。
+
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_mesh_frozen_downstream.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/data/val/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_stock_target_prior \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0 \
+  --modes stock_sparse,target_sparse,prior_sparse \
+  --max_frames 8 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --mesh_eval_samples 8000
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_stock_target_prior/report.json
+
+生成文件：
+
+- `*/stock_sparse/mesh.obj`
+- `*/target_sparse/mesh.obj`
+- `*/prior_sparse/mesh.obj`
+- `*/sparse_coords.npz`
+- `*/metrics.json`
+
+第二步：加入 Stage 2 strict/oracle sparse flow 输出。
+
+注意：这个模式会额外加载 LoRA sparse flow 副本，显存更高。建议先只跑单样本。
+
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_mesh_frozen_downstream.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/data/val/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_with_stage2 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0 \
+  --modes stock_sparse,target_sparse,prior_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/checkpoints/last.ckpt \
+  --stage2_topk target_unique \
+  --max_frames 8 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 8000
+
+结果查看：
+
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_with_stage2/report.json
+
+第三步：如果 smoke 正常，再扩展到 0-3。
+
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_mesh_frozen_downstream.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/data/val/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_3_stock_target_prior \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0-3 \
+  --modes stock_sparse,target_sparse,prior_sparse \
+  --max_frames 8 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --mesh_eval_samples 8000
+
+如果 target sparse 太大导致 OOM，可以临时加：
+
+--max_coords 12000
+
+但这会破坏完整 GT target sparse 上限测试，只能作为显存诊断。
+
+重点判断：
+
+1. 如果 `target_sparse -> stock slat/mesh` 明显优于 `stock_sparse`，说明 stock downstream 能接住更好的 sparse，继续做 point-prior/pose sparse 有意义。
+2. 如果 `target_sparse` 都不优于 `stock_sparse`，说明瓶颈是 stock slat/mesh downstream compatibility，需要训练 slat/shape flow adapter。
+3. 如果 `target_sparse` 好、`stage2_correct` 不好，说明 point-prior sparse 质量还不够。
+4. 如果 `prior_sparse` 因点太少生成差，这是正常的，它只是 observed point subset，不是完整 sparse。
+
+
+二十一、Stage2 mesh frozen downstream 相对 top-k / cap sweep
+
+目的：
+
+前面固定 `4096 / 8192 / 12000 / target_unique` 的想法只适合单样本。多样本时各样本 `target_unique` 差异很大，固定 top-k 会把“小物体过满”和“大物体欠采样”混在一起。因此新增相对 top-k 规格：
+
+- `target_unique`：使用该样本 GT sparse 数量，只作为 oracle 上限；
+- `r0.50_cap8192`：`round(0.50 * target_unique)`，但最多 8192；
+- `r0.75_cap12000`：`round(0.75 * target_unique)`，但最多 12000；
+- `r1.00_cap12000`：`target_unique`，但最多 12000；
+- `abs8192` 或 `8192`：固定 8192，保留兼容。
+
+脚本参数：
+
+```text
+--stage2_topk_specs r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,r1.00_cap12000,target_unique
+```
+
+如果给了多个 spec，`stage2_correct` 会自动展开成多个 mode，例如：
+
+```text
+stage2_correct_r0_35_cap4096
+stage2_correct_r0_50_cap8192
+stage2_correct_r0_75_cap12000
+stage2_correct_r1_00_cap12000
+stage2_correct_target_unique
+```
+
+同一个样本只采样一次 Stage2 logits，再从同一份 logits 里取不同 top-k，避免不同随机噪声影响 sweep。
+
+这一步不需要重训，直接复用：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/checkpoints/last.ckpt
+```
+
+推荐优先使用脚本入口：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 MODE=smoke bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+GPU=1 MODE=val8 bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+可覆盖参数示例：
+
+```bash
+GPU=1 \
+MODE=val8 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,r1.00_cap12000,target_unique \
+MESH_EVAL_SAMPLES=4000 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+1. 单样本 sample 0 smoke：
+
+```bash
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_mesh_frozen_downstream.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/data/val/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_stage2_relcap_sweep \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0 \
+  --modes stock_sparse,target_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/checkpoints/last.ckpt \
+  --stage2_topk_specs r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,r1.00_cap12000,target_unique \
+  --max_frames 8 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 4000
+```
+
+查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_stage2_relcap_sweep/report.json
+```
+
+2. 0-7 多样本相对/cap sweep：
+
+```bash
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_mesh_frozen_downstream.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/data/val/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_7_stage2_relcap_sweep \
+  --weights microsoft/TRELLIS-image-large \
+  --indices 0-7 \
+  --modes stock_sparse,target_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200/checkpoints/last.ckpt \
+  --stage2_topk_specs r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,r1.00_cap12000,target_unique \
+  --max_frames 8 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 4000
+```
+
+快速查看均值：
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; p='/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_7_stage2_relcap_sweep/report.json'; d=json.load(open(p)); keys=['coord_count','stage2_topk_ratio_to_target','sparse_iou','sparse_pred_precision','sparse_target_recall','chamfer_l2_mean','target_to_mesh_mean','mesh_to_target_mean','extent_ratio'];\nfor mode, s in d['summary']['by_mode'].items():\n print(mode, {k: round(s.get(k+'_mean', -1), 5) for k in keys if k+'_mean' in s})"
+```
+
+判断顺序：
+
+1. 先看 `target_sparse` 是否仍然稳定优于 `stock_sparse`，确认 downstream 上限；
+2. 在各个 `stage2_correct_*` 之间比较 `chamfer_l2_mean`，找到总体最优；
+3. 用 `mesh_to_target_mean` 和 `extent_ratio` 排除过满解；
+4. 最终优先选择 `target_to_mesh` 仍明显优于 stock、同时 `mesh_to_target` 和 `extent_ratio` 不明显恶化的 spec。
+
+
+二十二、Stage2 anti-overfill 训练与测试
+
+目的：
+
+前面相对 top-k sweep 证明：降低 top-k 可以减少复杂度，但不能根治过满，说明 Stage2 logits 的空间分布本身偏扩张。因此本轮修改训练目标，而不是继续只调 top-k。
+
+新增训练项：
+
+```text
+anti_overfill_loss = mean softplus(decoder(pred_x0) + margin) on voxels outside GT target sparse
+```
+
+含义：
+
+- 用 frozen TRELLIS sparse decoder 把 Stage2 预测的 `pred_x0` 解成 occupancy logits；
+- 在 GT target sparse 之外的位置惩罚正 occupancy；
+- 目标是提高 precision、压制 overfill；
+- 默认 `ANTI_OVERFILL_LOSS_WEIGHT=0.0`，旧实验不受影响。
+
+新增采样参数：
+
+```text
+KNOWN_CLAMP_START_T
+```
+
+默认 `1.0`，等价旧行为。设为 `0.5` 时，只在后半程 diffusion reinjection known latent，用来测试早期 hard clamp 是否推高 overfill。
+
+0. 不重训：先测 late clamp
+
+这一步只测试采样策略，不训练。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+RUN_NAME=strict_val0_7_stage2_relcap_lateclamp05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_strictmask_s200 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/strict_val0_7_stage2_relcap_lateclamp05/report.json
+```
+
+1. Anti-overfill smoke 训练
+
+先跑 20 step，确认 loss 不爆、mesh 指标方向正确。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_smoke \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+ANTI_OVERFILL_MARGIN=0.0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+Stage2 sparse eval：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_smoke/eval/report.json
+```
+
+Smoke mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=antioverfill_smoke_mesh_relcap \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_smoke_mesh_relcap/report.json
+```
+
+2. Anti-overfill s200 训练
+
+如果 smoke 没有爆，并且 `r0.50_cap8192` 的 `mesh_to_target_mean / extent_ratio` 有改善，再跑 s200。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_s200 \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+ANTI_OVERFILL_MARGIN=0.0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+s200 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+RUN_NAME=antioverfill_s200_mesh_relcap_val8 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_s200 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_s200_mesh_relcap_val8/report.json
+```
+
+3. 快速结果抽取
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; p='/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_s200_mesh_relcap_val8/report.json'; d=json.load(open(p)); keys=['coord_count','stage2_topk_ratio_to_target','sparse_iou','sparse_pred_precision','sparse_target_recall','chamfer_l2_mean','target_to_mesh_mean','mesh_to_target_mean','extent_ratio'];\nfor mode, s in d['summary']['by_mode'].items():\n print(mode, {k: round(s.get(k+'_mean', -1), 5) for k in keys if k+'_mean' in s})"
+```
+
+重点比较：
+
+1. `r0.50_cap8192` 的 `mesh_to_target_mean` 是否低于 strictmask s200 的 `0.0717`；
+2. `r0.50_cap8192` 的 `extent_ratio` 是否低于 strictmask s200 的 `0.8799`；
+3. `target_to_mesh_mean` 是否不要明显劣化，参考 strictmask s200 的 `0.0475`；
+4. `sparse_pred_precision` 是否提高，参考 strictmask s200 的 `0.2963`；
+5. `target_sparse` 是否仍稳定作为上限。
+
+如果 anti-overfill 提高 precision 但 coverage 大幅下降，可以把：
+
+```text
+ANTI_OVERFILL_LOSS_WEIGHT=0.01
+KNOWN_X0_LOSS_WEIGHT=0.75
+```
+
+作为下一组。
+
+## 二十三、Anti-overfill 权重 sweep 自动化
+
+上一轮 `ANTI_OVERFILL_LOSS_WEIGHT=0.02` 的 s200 结果显示：
+
+```text
+r0.50_cap8192:
+  sparse_iou              0.13182
+  sparse_pred_precision   0.35999
+  sparse_target_recall    0.17219
+  chamfer_l2_mean         0.01206
+  target_to_mesh_mean     0.04909
+  mesh_to_target_mean     0.05268
+  extent_ratio            0.67676
+```
+
+对比 strictmask s200 的 `r0.50_cap8192`：
+
+```text
+sparse_iou              0.10561
+sparse_pred_precision   0.29629
+sparse_target_recall    0.14131
+chamfer_l2_mean         0.01688
+target_to_mesh_mean     0.04751
+mesh_to_target_mean     0.07173
+extent_ratio            0.87992
+```
+
+结论是：anti-overfill 确实压住了过填充，`mesh_to_target_mean` 和 `extent_ratio` 明显改善，但 `target_to_mesh_mean` 略有代价。因此下一步不应该直接加训练步数，而应该先扫 `ANTI_OVERFILL_LOSS_WEIGHT`，找 precision / coverage 的平衡点。
+
+### 1. Smoke sweep
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+SWEEP_NAME=pointprior_pixal_v9_stage2_antioverfill_weight_sweep_smoke \
+SWEEP_WEIGHTS=0.005,0.01,0.02,0.04 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,target_unique \
+bash trellis_point_prior_mv/scripts/run_stage2_antioverfill_weight_sweep.sh
+```
+
+每个权重都会生成一组训练、sparse eval 和 frozen downstream mesh eval。主要结果路径：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_smoke_w0p005_mesh_relcap/report.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_smoke_w0p01_mesh_relcap/report.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_smoke_w0p02_mesh_relcap/report.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_smoke_w0p04_mesh_relcap/report.json
+```
+
+### 2. s200 sweep
+
+Smoke 确认没有明显崩坏后再跑 s200。优先只保留 smoke 中最好的 1-2 个权重；如果要全扫：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+SWEEP_NAME=pointprior_pixal_v9_stage2_antioverfill_weight_sweep_s200 \
+SWEEP_WEIGHTS=0.005,0.01,0.02,0.04 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_stage2_antioverfill_weight_sweep.sh
+```
+
+如果 data manifest 已经构建过，只想重跑某几个权重：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+RUN_MESH_EVAL=1 \
+SWEEP_NAME=pointprior_pixal_v9_stage2_antioverfill_weight_sweep_s200 \
+SWEEP_WEIGHTS=0.01,0.02 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_stage2_antioverfill_weight_sweep.sh
+```
+
+### 3. 汇总多个 report
+
+```bash
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/summarize_mesh_frozen_reports.py \
+  trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_s200_w0p005_mesh_relcap/report.json \
+  trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_s200_w0p01_mesh_relcap/report.json \
+  trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_s200_w0p02_mesh_relcap/report.json \
+  trellis_point_prior_mv/outputs/mesh_frozen_downstream/pointprior_pixal_v9_stage2_antioverfill_weight_sweep_s200_w0p04_mesh_relcap/report.json \
+  --modes stage2_correct_r0_35_cap4096,stage2_correct_r0_50_cap8192,stage2_correct_r0_75_cap12000,stage2_correct_target_unique,target_sparse \
+  --keys sparse_iou,sparse_pred_precision,sparse_target_recall,chamfer_l2_mean,target_to_mesh_mean,mesh_to_target_mean,extent_ratio,vertex_count
+```
+
+筛选标准按优先级：
+
+1. `r0.50_cap8192` 的 `mesh_to_target_mean` 和 `extent_ratio` 继续低于 strictmask；
+2. `target_to_mesh_mean` 不要比 strictmask 明显变差，最好接近 `0.0475`；
+3. `sparse_pred_precision` 提高时，`sparse_target_recall` 不要掉太多；
+4. `target_sparse` 仍作为下游 slat/mesh 的上限参照，不参与模型优劣判断。
+
+## 二十四、Hard-negative ranking smoke
+
+Anti-overfill 只约束“不要在 observed/prior 外过填充”，没有直接要求 correct prior 比 shuffle/random prior 更好。下一步可以小权重加入 hard-negative ranking，但先只做 smoke，不直接长训。
+
+当前 ranking 不是单一 `outside_correct < outside_wrong`。训练里同时包含：
+
+```text
+observed margin: correct condition 在 correct observed support 上应强于 wrong condition
+wrong-support empty: wrong prior 落在 GT 外的 support 应被压为空
+target-support occupied: correct prior 落在 GT 内的 support 应被拉实
+outside calibration: 只保留弱项，负样本 outside 分支 detach，避免主动训练 wrong condition 变坏
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_smoke \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+ANTI_OVERFILL_MARGIN=0.0 \
+RANKING_LOSS_WEIGHT=0.05 \
+RANKING_MARGIN=0.05 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+RANKING_OUTSIDE_WEIGHT=0.25 \
+RANKING_OBSERVED_WEIGHT=1.0 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.5 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+对应 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=antioverfill_rank_smoke_mesh_relcap \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+如果 ranking smoke 让 correct sparse/mesh 指标提升，同时 shuffle/random 没有同步提升，再考虑 s200。否则说明当前 ranking loss 只是在改变 logit calibration，不值得继续加。
+
+通过标准：
+
+```text
+1. r0.50_cap8192 的 sparse IoU / precision 不低于 anti-overfill 0.02 smoke；
+2. mesh_to_target_mean 和 extent_ratio 不反弹；
+3. obs-known 指标提升，obs-unknown 不明显下降；
+4. shuffle/random 不同步变强。
+```
+
+如果 smoke 通过，再跑 ranking s200：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_s200 \
+POINT_COUNT_CHOICES=1500 \
+NUM_PRIOR_VIEWS_CHOICES=8 \
+DROPOUT_MIN=0.0 \
+DROPOUT_MAX=0.0 \
+OUTLIER_RATIO=0.0 \
+COORD_JITTER=0 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+ANTI_OVERFILL_MARGIN=0.0 \
+RANKING_LOSS_WEIGHT=0.05 \
+RANKING_MARGIN=0.05 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+RANKING_OUTSIDE_WEIGHT=0.25 \
+RANKING_OBSERVED_WEIGHT=1.0 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.5 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_LOGIT_BOOST=0.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+s200 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+RUN_NAME=antioverfill_rank_s200_mesh_relcap_val8 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_s200 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+## 二十五、Ranking smoke 结果后的推荐命令
+
+已运行的两组 ranking smoke 结论：
+
+```text
+rank_w001_support: 有效，提升 correct sparse IoU / precision / recall，未破坏 correct top1
+rank_x0p5: 失败，correct sparse 指标明显下降，不能继续 s200
+```
+
+因此下一步只推进 `rank_w001_support`。
+
+### 1. rank_w001_support mesh eval
+
+先补 frozen downstream mesh eval，确认 sparse 提升不会让 mesh 变差：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=antioverfill_rank_w001_support_smoke_mesh_relcap \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果路径：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_rank_w001_support_smoke_mesh_relcap/report.json
+```
+
+重点看 `r0.50_cap8192`：
+
+```text
+sparse_iou / sparse_pred_precision 是否高于 anti-overfill 0.02 smoke；
+target_to_mesh_mean 不要明显上升；
+mesh_to_target_mean 和 extent_ratio 不要反弹。
+```
+
+### 2. rank_w001_support s200
+
+如果上面的 mesh eval 没有反弹，再跑 s200：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.01 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=1.0 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+s200 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+RUN_NAME=antioverfill_rank_w001_support_s200_mesh_relcap_val8 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 3. 暂不推荐的配置
+
+暂时不要继续：
+
+```text
+RANKING_LOSS_WEIGHT=0.05
+RANKING_TARGET_SUPPORT_WEIGHT=0.5
+```
+
+这组已经在 smoke 中把 correct sparse 压坏。如果后续还想试 target-support positive，应从更小权重开始：
+
+```text
+RANKING_TARGET_SUPPORT_WEIGHT=0.05 或 0.1
+RANKING_LOSS_WEIGHT=0.01
+```
+
+## 二十六、rank_w001_support s200 后续评测
+
+当前 best checkpoint：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200/checkpoints/last.ckpt
+```
+
+当前默认 top-k：
+
+```text
+r0.50_cap8192
+```
+
+候选 top-k：
+
+```text
+r0.35_cap4096,r0.50_cap8192,r0.75_cap12000
+```
+
+### 1. val16 mesh eval
+
+先扩大到 `0-15`：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=antioverfill_rank_w001_support_s200_val16_mesh_relcap \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_rank_w001_support_s200_val16_mesh_relcap/report.json
+```
+
+### 2. val32 mesh eval
+
+如果 `val16` 稳定，再跑 `0-31`。为节省时间，只保留两个主要 top-k：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+INDICES=0-31 \
+RUN_NAME=antioverfill_rank_w001_support_s200_val32_mesh_r05_r075 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192,r0.75_cap12000 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_rank_w001_support_s200_val32_mesh_r05_r075/report.json
+```
+
+### 3. 判断标准
+
+`r0.50_cap8192` 仍是默认工程点：
+
+```text
+Chamfer L2        尽量 <= 0.010
+target->mesh      维持在 0.049 左右
+mesh->target      不回到 0.0527 以上
+extent ratio      0.67-0.70 可接受
+sparse precision  高于 anti-overfill s200
+```
+
+如果 `r0.75_cap12000` 在 `target->mesh` 上明显更好，但 `mesh->target / extent` 没有明显反弹，可以作为覆盖优先候选；否则默认继续用 `r0.50_cap8192`。
+
+## 二十七、第二 seed 复验
+
+已接入：
+
+```text
+BUILD_SEED
+TRAIN_SEED
+```
+
+为了只检查训练随机性，建议固定 point-prior 数据构建 seed，只改训练 seed：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200_seed123 \
+BUILD_SEED=42 \
+TRAIN_SEED=123 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.01 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=1.0 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+seed123 val32 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+INDICES=0-31 \
+RUN_NAME=antioverfill_rank_w001_support_s200_seed123_val32_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w001_support_s200_seed123 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+## 二十八、Ranking 稳定性 smoke
+
+seed123 复验显示当前 ranking 配置方向有效，但 seed 敏感：
+
+```text
+seed42:  sparse/mesh 明显强
+seed123: 仍优于 anti-overfill 的 Chamfer 和 mesh->target，但 extent 明显反弹
+```
+
+因此下一步不要直接 full-scale，先做更弱 ranking 的稳定性 smoke。
+
+### 1. ranking loss 0.005 + wrong support 0.5
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_smoke \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+对应 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=antioverfill_rank_w0005_ws05_smoke_val16_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 2. ranking loss 0.005 + wrong support 0.75
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws075_smoke \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.75 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+对应 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=1 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=antioverfill_rank_w0005_ws075_smoke_val16_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws075_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 3. 通过标准
+
+和当前 best / seed123 对比：
+
+```text
+1. sparse IoU / precision 不低于 anti-overfill s200；
+2. Chamfer 接近或优于 seed123；
+3. mesh->target 明显优于 anti-overfill；
+4. extent ratio 不应接近 seed123 的 0.86，最好回到 0.72-0.78；
+5. smoke 通过后，再补 seed123 s200，不要直接 full-scale。
+```
+
+## 二十九、w0.005/ws0.5 s200 后续诊断
+
+`w0.005/ws0.5 seed123 s200` 相比 `w0.01/ws1.0 seed123` 更稳，但仍有明显 extent 外扩：
+
+```text
+w0.005/ws0.5 seed123 val32:
+  Chamfer      0.0123
+  target->mesh 0.0524
+  mesh->target 0.0505
+  extent       0.8385
+```
+
+它比 anti-overfill 的 Chamfer / mesh->target 好，但 extent 比 anti-overfill 更差。因此下一步先判断是不是训练后期漂移。
+
+### 1. step100 mesh eval
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-31 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed123_step100_val32_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed123 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed123/checkpoints/ss-pointprior-stage2-epoch=00-step=100.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+判断：
+
+```text
+如果 step100 extent 明显低于 0.8385，优先考虑早停；
+如果 step100 也外扩，则需要加 anti-overfill 或 rerank。
+```
+
+### 2. anti-overfill 0.03 + weak ranking smoke
+
+只做 smoke，不直接 s200：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill003_rank_w0005_ws05_smoke \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.03 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=antioverfill003_rank_w0005_ws05_smoke_val16_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill003_rank_w0005_ws05_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+## 三十、w0.005/ws0.5 与 anti003 补测后的下一步
+
+### 1. 主线候选补 val64
+
+当前 `anti-overfill=0.03` 的 s200 sparse 已经退化，因此下一步主线仍然看：
+
+```text
+ANTI_OVERFILL_LOSS_WEIGHT=0.02
+RANKING_LOSS_WEIGHT=0.005
+RANKING_WRONG_SUPPORT_WEIGHT=0.5
+TRAIN_SEED=123
+```
+
+补 `val64`：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed123_val64_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed123 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+重点看：
+
+```text
+1. Chamfer win rate 是否仍接近 50+/64；
+2. mesh->target 是否仍明显优于纯 anti-overfill；
+3. extent 是否继续偏高；
+4. worst cases 是否集中在少数样本。
+```
+
+### 2. 只用于确认的 anti003 s200 mesh eval
+
+本轮没有在预期目录下找到 `anti-overfill=0.03 s200` 的 mesh report。该训练目录存在 `last.ckpt` 和 `last-v1.ckpt` 两套 checkpoint，如果确实要确认 mesh，必须显式指定 checkpoint。
+
+建议用最新 `last-v1.ckpt`：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-31 \
+RUN_NAME=antioverfill003_rank_w0005_ws05_s200_seed123_v1_val32_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill003_rank_w0005_ws05_s200_seed123 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill003_rank_w0005_ws05_s200_seed123/checkpoints/last-v1.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+这条不是主线，因为 `anti003 s200` 的 sparse eval 已经明显落后；它只用于确认 mesh 是否也同步退化。
+
+## 三十一、补齐 w0.005/ws0.5 seed42 s200
+
+`w0.005/ws0.5 seed123 val64` 已确认明显优于 stock，但没有超过 `w0.01/ws1.0 seed42`。下一步要补齐同一弱 ranking 配置的 `TRAIN_SEED=42`，判断弱 ranking 本身是否更稳。
+
+### 1. 训练
+
+```bash
+cd /home/zjr/Tracker
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GPU=4 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+### 2. val64 mesh eval
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed42_val64_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 3. 判断标准
+
+```text
+如果 seed42 weak ranking 的 extent 接近 0.72-0.78，且 Chamfer/mesh->target 不差于 w0.01/ws1.0 seed42，则可以作为下一阶段主线；
+如果仍接近 seed123 的 extent=0.83，则说明弱 ranking 只是降低了部分 seed123 退化，不能解决外扩；
+如果 sparse 明显低于 w0.01/ws1.0 seed42，但 mesh 接近，则应进入候选 rerank，而不是继续调单个 loss。
+```
+
+## 三十二、当前 best 的 top-k sweep 与 val128
+
+`w0.005/ws0.5 seed42 s200` 已成为当前 best。下一步先验证它是否依赖单一 `r0.50_cap8192`，再扩大到 val128。
+
+### 1. val64 top-k sweep
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed42_val64_mesh_topk \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+判断：
+
+```text
+r0.50 和 r0.75 都稳定：说明 logits ranking 真实改善；
+只有 r0.50 好：后续固定 top-k 或 rerank；
+target_unique 好但 fixed top-k 差：说明点数校准仍然是主要问题。
+```
+
+### 2. val128 主验证
+
+注意：`MODE=s200` 训练时默认只构建了 `data/val` 的 `0-63`，所以直接用 `INDICES=0-127` 会报：
+
+```text
+IndexError: indices out of range for dataset size 64
+```
+
+需要先单独构建 `data/val128`，再把 mesh eval 的 `MANIFEST` 指向这个新 manifest。这样不会覆盖已有 val64 结果，也不需要重训。
+
+先构建 val128 prior：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42
+VAL128_DIR="$RUN_ROOT/data/val128"
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/build_point_prior_dataset.py \
+  --source_manifest /data/pixal3d_multiview/objaverse_sparse_mv_artraj_pbr_5000_v9_select8/val.json \
+  --output_dir "$VAL128_DIR" \
+  --indices 0-127 \
+  --max_frames 8 \
+  --grid_transform pixal3d_rotation \
+  --num_prior_views_choices 8 \
+  --point_count_choices 1500 \
+  --min_support 1.0 \
+  --min_support_ratio 0.45 \
+  --dropout_min 0.0 \
+  --dropout_max 0.0 \
+  --coord_jitter 0 \
+  --outlier_ratio 0.0 \
+  --front_depth_epsilon 0.02 \
+  --seed 42
+```
+
+确认样本数：
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+p = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/data/val128/manifest.json')
+d = json.loads(p.read_text())
+print(len(d['samples']))
+PY
+```
+
+然后跑 val128 mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-127 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed42_val128_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/data/val128/manifest.json \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+通过标准：
+
+```text
+Chamfer < 0.011
+mesh->target < 0.045
+extent < 0.75
+sparse IoU > 0.16
+```
+
+如果 val128 通过，这组 checkpoint 可以作为后续 AR pipeline 的默认 sparse checkpoint，并进入 candidate rerank 实现。
+
+## 三十三、val128 通过后的下一步
+
+`w0.005/ws0.5 seed42 s200` 的 `val128 r0.50_cap8192` 已通过：
+
+```text
+Chamfer      0.0090
+mesh->target 0.0346
+extent       0.7015
+sparse IoU   0.1719
+```
+
+下一步优先跑 top-k sweep，而不是继续调 loss。
+
+### 当前 best val64 top-k sweep
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed42_val64_mesh_topk \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+如果 val64 top-k sweep 稳定，再跑 val128 top-k sweep：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-127 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed42_val128_mesh_topk \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/data/val128/manifest.json \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,target_unique \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+判断：
+
+```text
+r0.50/r0.75 都好：当前 checkpoint 可作为默认 sparse checkpoint；
+r0.50 明显最好：AR pipeline 固定 r0.50，并用 candidate rerank 处理尾部失败；
+target_unique 明显最好：说明点数校准仍重要，需要在推理时估计 target top-k。
+```
+
+## 三十四、top-k sweep 通过后的默认策略
+
+当前 best checkpoint：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt
+```
+
+top-k sweep 后建议：
+
+```text
+单候选默认: r0.75_cap12000
+快速/保守:   r0.50_cap8192
+rerank候选:  r0.50_cap8192,r0.75_cap12000,target_unique
+```
+
+单候选默认 mesh eval 示例：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-127 \
+RUN_NAME=antioverfill_rank_w0005_ws05_s200_seed42_val128_mesh_r075 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/data/val128/manifest.json \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.75_cap12000 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+多候选 rerank 评测时使用：
+
+```bash
+TOPK_SPECS=r0.50_cap8192,r0.75_cap12000,target_unique
+```
+
+后续系统集成建议：
+
+```text
+1. TRELLIS sparse 先生成 r0.50/r0.75/target_unique 三个候选；
+2. frozen slat/mesh 分别出 mesh；
+3. 使用 AR/SLAM point-to-mesh、render mask IoU、extent sanity 排序；
+4. 最优 mesh 进入 ReconViaGen/CoarseModel 后续流程。
+```
