@@ -4224,3 +4224,437 @@ target_unique
 ```
 
 否则不能保证合成 prior 上的收益完全迁移到手机采集流程。
+
+## 2026-06-23 真实 SLAM-like prior 初步测试
+
+### 本轮运行状态
+
+用户运行了两组真实数据测试：
+
+1. `real_slam_prior_four_triangulated_mesh_eval`：计划对四个真实/半真实数据集做 `stock_sparse, prior_sparse, stage2_correct` mesh 对比。
+2. `real_slam_prior_triangulated_four_strictmask_countcheck`：只做 strict mask 特征点三角化点数检查。
+
+当前在默认输出根目录：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/real_slam_prior
+```
+
+没有找到 `real_slam_prior_four_triangulated_mesh_eval` 目录，也没有对应 `mesh_eval/report.json`。因此目前不能把“四数据集 mesh eval”当作已完成结果来下结论；能分析的是 strict-mask countcheck，以及前面已有的 `GOOD_MESH_TEST` 单样本 mesh smoke。
+
+### strict mask countcheck 结果
+
+结果文件：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_triangulated_four_strictmask_countcheck/slam_like_points_report.json
+```
+
+| dataset | raw triangulated | support filtered | final points | support mean | support median |
+|---|---:|---:|---:|---:|---:|
+| GOOD_MESH_TEST | 836 | 835 | 764 | 13.25 | 14 |
+| reconviagen_20260520_021556 | 52 | 52 | 49 | 4.79 | 5 |
+| reconviagen_20260617_073549 | 16 | 16 | 16 | 6.75 | 6 |
+| reconviagen_20260617_075506 | 109 | 109 | 101 | 3.83 | 3 |
+
+对比 relaxed countcheck：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_triangulated_four_countcheck_relaxed/slam_like_points_report.json
+```
+
+| dataset | relaxed final | strict-mask final | 判断 |
+|---|---:|---:|---|
+| GOOD_MESH_TEST | 865 | 764 | strict 点数略少，但仍很充足，且 support 更干净 |
+| reconviagen_20260520_021556 | 71 | 49 | strict 接近 `MIN_PRIOR_POINTS=40` 下限，可用但较弱 |
+| reconviagen_20260617_073549 | 50 | 16 | strict 明显不足，说明该序列 mask 内可三角化纹理很弱 |
+| reconviagen_20260617_075506 | 94 | 101 | strict 不差，说明该序列 mask 内特征质量可以 |
+
+结论：strict-mask 不是不可行；它在 `GOOD_MESH_TEST` 和 `075506` 上甚至更像干净物体点云。但真实数据的点数差异非常大，`073549` 这种样本只靠 mask 内特征点会过稀疏。后续系统里不能只用一个策略，应保留：
+
+```text
+strict-mask 作为高置信默认；
+relaxed 全图匹配 + mask/pose 后筛作为弱纹理 fallback。
+```
+
+### GOOD_MESH_TEST 单样本 mesh smoke
+
+已有结果：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_goodmesh_triangulated_mesh_smoke/mesh_eval/report.json
+```
+
+该测试只包含 `GOOD_MESH_TEST` 一个样本，`max_frames=8`，真实 COLMAP/SLAM-like prior 经过 `prior_bbox` 归一化后得到 `prior_point_count=116`。
+
+| mode | coord count | vertex count | extent ratio | ref norm Chamfer L2 | 结论 |
+|---|---:|---:|---:|---:|---|
+| stock_sparse | 23819 | 771765 | 0.9998 | 0.1125 | 原版 sparse 明显过填充，接近整 cube |
+| prior_sparse | 116 | 520 | 0.4011 | 0.0759 | 只用 prior 太稀疏，得到的是局部/骨架式 mesh |
+| stage2_correct | 12000 | 222624 | 0.9398 | 0.0168 | 明显优于 stock 和 prior_sparse，能把 sparse prior 扩展成较完整结构 |
+
+这一点很关键：真实 SLAM-like 点只有 116 个时，`stage2_correct` 并不是简单复制 prior，而是把点先验扩展成完整得多的 sparse structure，并且参考 mesh Chamfer 明显更低。
+
+### 当前判断
+
+1. 真实 SLAM-like prior 路线仍然值得继续。`GOOD_MESH_TEST` 单样本已经显示：点先验可以把 stock TRELLIS 的过填充问题显著压下去。
+2. 不能只看单样本成功。四数据集 mesh report 当前缺失，必须补跑后才能判断是否能泛化到 `reconviagen_2026*` 这些更接近手机采集的数据。
+3. strict-mask 与 relaxed 不是二选一。strict-mask 更干净，但在弱纹理样本上会点数不足；relaxed 更容易凑够点，但背景/边缘误点风险更高。
+4. `NORMALIZATION_SOURCE=prior_bbox` 是严格真实设定，但会放大局部点云尺度风险。如果 SLAM 点只覆盖物体局部，prior_bbox 会把局部撑满 canonical cube，mesh 可能被误导。
+
+### 下一步建议
+
+第一优先级：补跑真正的四数据集 mesh eval。当前没有找到：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_four_triangulated_mesh_eval/mesh_eval/report.json
+```
+
+建议用新的 run name 重新跑，避免与旧目录混淆，并先把 `MESH_EVAL_SAMPLES` 降到 2000 控制显存和耗时。
+
+第二优先级：四数据集 mesh eval 后，对每个样本检查：
+
+```text
+stock_sparse 是否过填充
+prior_sparse 是否过稀疏
+stage2_correct 是否同时降低 ref_norm_chamfer_l2_mean 和 prior_chamfer_l2_mean
+projection_mask_hit_over_inside_mean 是否足够高
+prior_point_count 是否低于 40-50 的可靠阈值
+```
+
+第三优先级：补 strict-mask mesh eval，但不要强行 `MIN_PRIOR_POINTS=40` 覆盖所有四个样本。因为 `073549` strict-mask 只有 16 点，如果强行 min40 会失败。可分两组：
+
+```text
+strict-mask reliable: 排除 073549，MIN_PRIOR_POINTS=40
+strict-mask weak-prior smoke: 包含 073549，MIN_PRIOR_POINTS=10/15
+```
+
+如果 strict-mask reliable 组也能让 `stage2_correct` 优于 `stock_sparse`，说明真实 AR/SLAM prior 对系统集成有实际价值。
+
+## 2026-06-23 四数据集真实 SLAM-like prior mesh eval
+
+### 运行配置
+
+本轮重新运行：
+
+```text
+RUN_NAME=real_slam_prior_four_triangulated_mesh_eval_v2
+RUN_TRIANGULATE=1
+RUN_BUILD=1
+RUN_EVAL=1
+PRIOR_SOURCE=colmap_points
+SPARSE_SUBDIR=sparse_slam_eval_four_v2/0
+NORMALIZATION_SOURCE=prior_bbox
+MIN_PRIOR_POINTS=40
+MAX_FRAMES=18
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1
+TRI_MIN_PAIR_MATCHES=8
+TRI_MIN_OUTPUT_POINTS=40
+MODES=stock_sparse,prior_sparse,stage2_correct
+TOPK_SPECS=12000
+MESH_EVAL_SAMPLES=2000
+```
+
+结果路径：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_four_triangulated_mesh_eval_v2/mesh_eval/report.json
+```
+
+### SLAM-like prior 构建质量
+
+| dataset | final triangulated | prior coords | support mean | mask-hit inside mean | normalization scale |
+|---|---:|---:|---:|---:|---:|
+| GOOD_MESH_TEST | 865 | 559 | 10.37 | 0.539 | 0.998 |
+| reconviagen_20260520_021556 | 71 | 66 | 3.65 | 0.291 | 2.094 |
+| reconviagen_20260617_073549 | 50 | 45 | 4.42 | 0.247 | 0.692 |
+| reconviagen_20260617_075506 | 94 | 62 | 3.84 | 0.278 | 2.674 |
+
+这说明本轮不是 oracle prior：除 `GOOD_MESH_TEST` 外，三个 `reconviagen_2026*` 数据集的 prior 都很稀疏，mask-hit inside 只有约 `0.25-0.29`，而且 `prior_bbox` normalization scale 差异很大。这更接近真实 SLAM/AR 点云会遇到的问题：点少、局部、尺度不稳定、mask 内命中率不高。
+
+### Mesh 指标对比
+
+| dataset | mode | prior pts | coords | vertices | extent ratio | ref Chamfer | ref A->B | ref B->A |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| GOOD_MESH_TEST | stock_sparse | 559 | 23819 | 752897 | 0.999 | 0.1162 | 0.2572 | 0.1779 |
+| GOOD_MESH_TEST | prior_sparse | 559 | 559 | 3802 | 0.477 | 0.1121 | 0.1510 | 0.2638 |
+| GOOD_MESH_TEST | stage2_correct | 559 | 12000 | 283986 | 0.908 | 0.0163 | 0.0969 | 0.0512 |
+| reconviagen_20260520_021556 | stock_sparse | 66 | 4204 | 99326 | 0.827 | 0.0363 | 0.1252 | 0.0968 |
+| reconviagen_20260520_021556 | prior_sparse | 66 | 66 | 288 | 0.622 | 0.1588 | 0.1903 | 0.3113 |
+| reconviagen_20260520_021556 | stage2_correct | 66 | 12000 | 216034 | 0.926 | 0.0219 | 0.1152 | 0.0488 |
+| reconviagen_20260617_073549 | stock_sparse | 45 | 15809 | 299386 | 0.817 | 0.0345 | 0.1099 | 0.1085 |
+| reconviagen_20260617_073549 | prior_sparse | 45 | 45 | 452 | 0.449 | 0.0741 | 0.0620 | 0.2374 |
+| reconviagen_20260617_073549 | stage2_correct | 45 | 12000 | 233930 | 0.892 | 0.0218 | 0.1096 | 0.0591 |
+| reconviagen_20260617_075506 | stock_sparse | 62 | 4802 | 117039 | 0.089 | 0.0751 | 0.0896 | 0.2132 |
+| reconviagen_20260617_075506 | prior_sparse | 62 | 62 | 1708 | 0.566 | 0.0703 | 0.1033 | 0.2096 |
+| reconviagen_20260617_075506 | stage2_correct | 62 | 12000 | 165470 | 0.952 | 0.0205 | 0.1032 | 0.0582 |
+
+### 结果解读
+
+`stage2_correct` 在 4/4 样本上取得最低 `ref_norm_chamfer_l2_mean`：
+
+| dataset | stock Chamfer | prior Chamfer | stage2 Chamfer | stage2 vs stock |
+|---|---:|---:|---:|---:|
+| GOOD_MESH_TEST | 0.1162 | 0.1121 | 0.0163 | -0.0999 |
+| reconviagen_20260520_021556 | 0.0363 | 0.1588 | 0.0219 | -0.0144 |
+| reconviagen_20260617_073549 | 0.0345 | 0.0741 | 0.0218 | -0.0127 |
+| reconviagen_20260617_075506 | 0.0751 | 0.0703 | 0.0205 | -0.0546 |
+
+这比单样本 smoke 更有说服力：即使 prior 只有 `45-66` 个 voxel 点，Stage2 仍能在 reference mesh 指标上稳定优于 stock sparse 和直接 prior sparse。
+
+`prior_sparse` 本身不能直接用作 mesh：
+
+```text
+prior_sparse 顶点数通常只有几百到几千；
+ref B->A 很差，表示 reference surface 大量区域没有被覆盖；
+它更像局部点云/骨架，不是完整 mesh。
+```
+
+`stage2_correct` 的主要收益是补全 coverage：
+
+```text
+ref B->A 明显下降：
+GOOD_MESH_TEST: 0.1779 -> 0.0512
+20260520:       0.0968 -> 0.0488
+073549:         0.1085 -> 0.0591
+075506:         0.2132 -> 0.0582
+```
+
+这说明 point-prior Stage2 在真实 SLAM-like prior 上不是只贴近输入点，而是把稀疏点扩展成更完整的 sparse structure。
+
+### 风险和限制
+
+1. 这组 reference mesh 来自数据集 `models/*_norm.obj`，其中 `reconviagen_2026*` 本身可能是 ReconViaGen 生成/整理出的 mesh，不等价于真实扫描 GT。因此指标可以比较相对趋势，但不能当绝对几何真值。
+2. `TOPK_SPECS=12000` 是固定绝对 top-k。它在这 4 个样本上表现好，但 mesh 顶点仍偏多，后续需要 real prior top-k sweep。
+3. prior 的 `mask_hit_inside_mean` 偏低，说明 relaxed 全图匹配会混入不少边界/背景风险。当前结果证明 Stage2 对这种噪声有一定鲁棒性，但不能跳过 strict-mask ablation。
+4. `prior_bbox` normalization 仍有尺度风险。尤其 `20260520/075506` scale 超过 2，说明 prior bbox 与 reference canonical 尺度并不稳定。
+
+### 当前结论
+
+这一轮结果支持继续推进真实 AR/SLAM prior 接入。更具体地说：
+
+```text
+真实 SLAM-like sparse prior 对 stock TRELLIS sparse/mesh 有可测收益；
+Stage2 可以把很稀疏的 object points 扩展成更完整 mesh；
+该方向不再只是 PixalV9 synthetic prior 上的现象。
+```
+
+但这还不是可以直接上线的最终结论。现在证明的是“方向有效”，下一步要证明“系统可控”：
+
+```text
+top-k 是否可稳定选择；
+strict/relaxed prior 如何自动切换；
+尺度异常 prior 如何拒绝或重归一化；
+真实手机 AR session 中是否也能得到类似点数和 mask-hit 质量。
+```
+
+### 下一步建议
+
+第一优先级：对同一四数据集做 real prior top-k sweep：
+
+```text
+TOPK_SPECS=6000,8192,12000,16000
+MODES=stock_sparse,stage2_correct
+```
+
+观察：
+
+```text
+ref_norm_chamfer_l2_mean
+ref_norm_a_to_b_mean
+ref_norm_b_to_a_mean
+vertex_count
+extent_ratio
+```
+
+目标是确认 `12000` 是否真是当前真实 prior 的合理默认，而不是偶然偏大。
+
+第二优先级：补 strict-mask reliable mesh eval：
+
+```text
+排除 reconviagen_20260617_073549
+MIN_PRIOR_POINTS=40
+TRI_FEATURE_MASK_MODE=mask
+TRI_ALLOW_PAIR_OUTSIDE_MASK=0
+```
+
+如果 strict-mask reliable 组也能保持 `stage2_correct > stock_sparse`，说明高置信 object-SLAM prior 本身足够有价值。
+
+第三优先级：开始做真实手机 session 接入 smoke。当前这 4 个数据集仍是离线 COLMAP/固定数据目录测试，和 Unity AR SLAM 返回的在线 sparse map 仍有差异。
+
+## 2026-06-23 四数据集真实 SLAM-like prior top-k sweep
+
+### 运行配置
+
+本轮在同一 manifest 上只重跑 mesh eval：
+
+```text
+RUN_NAME=real_slam_prior_four_triangulated_mesh_topk_v1
+MANIFEST=real_slam_prior_four_triangulated_mesh_eval_v2/manifest/manifest.json
+MODES=stock_sparse,stage2_correct
+TOPK_SPECS=6000,8192,12000,16000
+MESH_EVAL_SAMPLES=2000
+```
+
+结果路径：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_four_triangulated_mesh_topk_v1/mesh_eval/report.json
+```
+
+### 平均指标
+
+| mode | ref Chamfer mean | ref Chamfer median | ref A->B mean | ref B->A mean | prior Chamfer mean | vertices mean | extent ratio mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 0.0655 | 0.0552 | 0.1443 | 0.1492 | 0.1018 | 317228 | 0.683 |
+| stage2_6000 | 0.0286 | 0.0240 | 0.1150 | 0.0781 | 0.0460 | 64853 | 0.945 |
+| stage2_8192 | 0.0274 | 0.0238 | 0.1190 | 0.0653 | 0.0557 | 113146 | 0.958 |
+| stage2_12000 | 0.0248 | 0.0235 | 0.1170 | 0.0542 | 0.0616 | 210543 | 0.962 |
+| stage2_16000 | 0.0236 | 0.0219 | 0.1146 | 0.0510 | 0.0603 | 310144 | 0.958 |
+
+### 分样本结论
+
+| dataset | stock Chamfer | 6000 | 8192 | 12000 | 16000 | Chamfer 最佳 |
+|---|---:|---:|---:|---:|---:|---|
+| GOOD_MESH_TEST | 0.1173 | 0.0206 | 0.0198 | 0.0186 | 0.0182 | 16000 |
+| reconviagen_20260520_021556 | 0.0343 | 0.0462 | 0.0420 | 0.0340 | 0.0333 | 16000 |
+| reconviagen_20260617_073549 | 0.0342 | 0.0202 | 0.0200 | 0.0183 | 0.0172 | 16000 |
+| reconviagen_20260617_075506 | 0.0762 | 0.0274 | 0.0277 | 0.0284 | 0.0255 | 16000 |
+
+`16000` 在 4/4 样本上都是 Chamfer 最低，同时 `ref B->A` 也最低，说明更大的 top-k 在真实 SLAM-like prior 上主要改善 coverage。
+
+但是顶点数代价明显：
+
+```text
+6000:   约  6.5 万 vertices
+8192:   约 11.3 万 vertices
+12000:  约 21.1 万 vertices
+16000:  约 31.0 万 vertices
+```
+
+`16000` 相比 `12000`：
+
+```text
+ref Chamfer: 0.0248 -> 0.0236，改善约 0.0013
+ref B->A:    0.0542 -> 0.0510，改善约 0.0032
+vertices:    21.1 万 -> 31.0 万，增加约 47%
+```
+
+因此 `16000` 是当前四样本上最好的 quality 候选，但不一定是系统默认值。
+
+### 重要现象
+
+1. `6000/8192` 在弱 prior 样本上会欠覆盖。  
+   `reconviagen_20260520_021556` 中，`6000/8192` 的 Chamfer 反而比 stock 更差，只有 `12000/16000` 才略好于 stock。
+
+2. `12000/16000` 能稳定压低 reference-to-mesh 距离。  
+   这说明真实 prior 的 Stage2 不是只贴近 SLAM 点，而是需要足够 top-k 才能把物体补全。
+
+3. `prior Chamfer` 不是唯一选择标准。  
+   `6000` 的 prior Chamfer 最低，但 reference coverage 较弱；这符合预期，因为点云 prior 本身是稀疏局部观测，过度贴近 prior 会牺牲完整性。
+
+4. `stock_sparse` 不稳定。  
+   `075506` 的 stock extent ratio 只有 `0.0898`，明显几何尺度异常；Stage2 top-k 候选都把 extent 修回 `0.97-0.99` 附近。
+
+### 当前默认建议
+
+当前不建议把 `16000` 直接作为唯一默认。更合理的是：
+
+```text
+fast/default: 12000
+quality candidate: 16000
+low-cost candidate: 8192 或 6000
+```
+
+如果只能出一个 mesh 给 CoarseModel：
+
+```text
+优先用 12000
+```
+
+理由：`12000` 相比 `16000` Chamfer 只差很小，但顶点数少约三分之一，更适合后续 CoarseModel 位姿估计和工程运行。
+
+如果允许候选选择：
+
+```text
+候选集用 6000,12000,16000
+```
+
+其中：
+
+```text
+6000: 低顶点、贴近 prior，用于防止过填充
+12000: 当前默认折中
+16000: coverage 最强，用于弱 prior/欠覆盖样本
+```
+
+### 下一步建议
+
+第一优先级：做 candidate rerank，而不是继续盲目改 Stage2 loss。
+
+候选：
+
+```text
+stage2_6000
+stage2_12000
+stage2_16000
+```
+
+rerank 指标：
+
+```text
+1. render mask IoU / silhouette consistency
+2. AR/SLAM prior point-to-mesh distance
+3. mesh extent sanity
+4. vertex/face complexity penalty
+```
+
+目标是自动区分：
+
+```text
+需要 16000 补 coverage 的样本；
+6000/12000 已足够、16000 只是增加复杂度的样本。
+```
+
+第二优先级：补 strict-mask reliable mesh eval。  
+本轮 relaxed prior 已经证明方向有效，但 relaxed 全图匹配可能混入背景/边缘点。下一轮应该排除 strict-mask 只有 16 点的 `073549`，先测 3 个 reliable 样本。
+
+推荐命令：
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST:/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260520_021556:/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_075506 \
+GPU=4 \
+RUN_NAME=real_slam_prior_three_strictmask_mesh_eval_v1 \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=1 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_strictmask_mesh_v1/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=40 \
+MAX_FRAMES=18 \
+TRI_FEATURE_MASK_MODE=mask \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=40 \
+TRI_MIN_SUPPORT_VIEWS=2 \
+TRI_MIN_SUPPORT_RATIO=0.10 \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=6000,12000,16000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+第三优先级：真实手机 AR session smoke。  
+离线 COLMAP 数据已经说明方法可行，下一步必须验证 Unity/ARKit/ARCore 返回的在线 sparse point map 是否能达到类似：
+
+```text
+prior coords >= 40-60
+support median >= 3
+projection_any_mask_hit_ratio 接近 1
+mask_hit_inside_mean 不低于 0.25-0.30
+```
+
+如果真实手机 session 达不到这些阈值，就优先改前端采集/点云筛选；如果能达到，再接 candidate rerank 到系统 pipeline。

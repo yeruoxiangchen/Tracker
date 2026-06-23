@@ -2112,3 +2112,543 @@ TOPK_SPECS=r0.50_cap8192,r0.75_cap12000,target_unique
 3. 使用 AR/SLAM point-to-mesh、render mask IoU、extent sanity 排序；
 4. 最优 mesh 进入 ReconViaGen/CoarseModel 后续流程。
 ```
+
+## 三十五、真实 CoarseModel 数据的 SLAM / model-prior 打通测试
+
+新增代码：
+
+```text
+trellis_point_prior_mv/build_real_slam_prior_manifest.py
+trellis_point_prior_mv/run_real_slam_prior_mesh.py
+trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+当前 `GOOD_MESH_TEST` 和几个 `reconviagen_2026...` 数据集虽然有 `sparse/0/cameras.txt/images.txt/points3D.txt`，但 `points3D.txt` 目前是 0 点。因此真实 SLAM/COLMAP prior 严格测试应该使用：
+
+```text
+PRIOR_SOURCE=colmap_points
+```
+
+如果点数不足，脚本会直接失败。不要用静默 fallback 伪装成真实 SLAM prior。
+
+如果只是打通模型链路，可以显式使用：
+
+```text
+PRIOR_SOURCE=model_surface
+NORMALIZATION_SOURCE=model_bbox
+```
+
+这表示：
+
+```text
+models/*_norm.obj -> sample surface points -> reference model bbox normalize -> 64^3 prior coords
+```
+
+这不是最终真实 AR/SLAM prior，但可以先测试：
+
+```text
+真实 RGB/mask 数据目录
+真实 CoarseModel/ReConViaGen 几何模型
+当前 best Stage2 checkpoint
+stock slat/mesh downstream
+```
+
+构建 manifest 会同时写入投影诊断字段：
+
+```text
+projection_any_mask_hit_ratio
+projection_in_image_ratio_mean
+projection_mask_hit_over_inside_mean
+projection_support_mean
+normalization_source
+fallback_used
+fallback_reason
+```
+
+这些字段用于检查 prior 坐标和图像/mask 是否大致一致。注意：如果使用 `model_surface`，而模型坐标和 COLMAP 相机坐标不在同一坐标系，投影诊断可能低，不能直接当成 SLAM prior 成功依据。
+
+### 1. 只构建 model-surface smoke manifest / prior
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_goodmesh_recon2026_build \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=model_surface \
+NORMALIZATION_SOURCE=model_bbox \
+MAX_FRAMES=18 \
+POINT_COUNT=1500 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_goodmesh_recon2026_build/manifest/build_report.json
+```
+
+当前预期会看到：
+
+```text
+prior_source=model_surface
+normalization_source=model_bbox
+fallback_used=0
+prior_point_count ~= 1300-1400
+```
+
+### 2. 单数据集 model-surface smoke
+
+先只跑 `GOOD_MESH_TEST`，避免一次占太多显存：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=real_slam_prior_goodmesh_smoke \
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST \
+PRIOR_SOURCE=model_surface \
+NORMALIZATION_SOURCE=model_bbox \
+MAX_FRAMES=8 \
+TOPK_SPECS=12000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_goodmesh_smoke/mesh_eval/report.json
+```
+
+### 3. 四个数据集 model-surface smoke
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=real_slam_prior_goodmesh_recon2026_eval \
+PRIOR_SOURCE=model_surface \
+NORMALIZATION_SOURCE=model_bbox \
+MAX_FRAMES=18 \
+TOPK_SPECS=12000 \
+MESH_EVAL_SAMPLES=6000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+默认数据集：
+
+```text
+CoarseModel/datasets/GOOD_MESH_TEST
+CoarseModel/datasets/reconviagen_20260520_021556
+CoarseModel/datasets/reconviagen_20260617_073549
+CoarseModel/datasets/reconviagen_20260617_075506
+```
+
+### 4. 多候选测试
+
+如果单候选 `12000` 跑通，再跑多候选：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=real_slam_prior_goodmesh_recon2026_topk_candidates \
+PRIOR_SOURCE=model_surface \
+NORMALIZATION_SOURCE=model_bbox \
+MAX_FRAMES=18 \
+TOPK_SPECS=8192,12000,target_unique \
+MESH_EVAL_SAMPLES=6000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+说明：
+
+```text
+8192        ~= r0.50_cap8192 的保守候选
+12000       ~= r0.75_cap12000 的默认候选
+target_unique 这里会按 target_unique_estimate=16000 解析，约等于 16000 点候选
+```
+
+### 5. 严格真实 COLMAP/AR sparse points 命令
+
+当 `sparse/0/points3D.txt` 不再是 0 点时，使用：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=real_colmap_slam_prior_goodmesh_recon2026_eval \
+PRIOR_SOURCE=colmap_points \
+NORMALIZATION_SOURCE=model_bbox \
+MIN_PRIOR_POINTS=200 \
+MAX_FRAMES=18 \
+TOPK_SPECS=12000 \
+MESH_EVAL_SAMPLES=6000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+如果 `colmap_points` 筛不出足够点，脚本会直接报错；这比静默 fallback 更适合真实 SLAM prior 验证。
+
+如果不确定 reference model 和 COLMAP/AR 点云是否在同一坐标系，可以先跑：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_colmap_slam_prior_build_strict_check \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=colmap_points \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=50 \
+MAX_FRAMES=18 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+然后查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/real_slam_prior/real_colmap_slam_prior_build_strict_check/manifest/build_report.json
+```
+
+重点看：
+
+```text
+support_filtered_count
+projection_any_mask_hit_ratio
+projection_mask_hit_over_inside_mean
+normalization_scale
+```
+
+如果 `prior_bbox` 投影命中合理但 `model_bbox` 不合理，说明 COLMAP/AR 点云和 reference model 坐标没有对齐，不能直接用 model bbox normalize。
+
+### 6. 显式 fallback smoke
+
+只有为了 smoke 方便才使用：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_auto_fallback_smoke \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=auto \
+ALLOW_MODEL_FALLBACK=1 \
+NORMALIZATION_SOURCE=model_bbox \
+MAX_FRAMES=18 \
+POINT_COUNT=1500 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+报告中必须看到：
+
+```text
+fallback_used=1
+fallback_reason=COLMAP/SLAM supported points ...
+```
+
+这只能说明链路可跑，不应当作为真实 SLAM prior 结果。
+
+## 三十六、从 AR/phone pose 离线生成 SLAM-like sparse points
+
+新增代码：
+
+```text
+trellis_point_prior_mv/triangulate_slam_like_points.py
+```
+
+用途：
+
+```text
+已有 RGB/mask/phone pose sparse/0
+-> OpenCV SIFT 特征匹配
+-> 固定相机位姿三角化 sparse points
+-> 多视图 mask 投影过滤物体点
+-> 写入 dataset/sparse_slam*/0/points3D.txt
+-> 用 PRIOR_SOURCE=colmap_points 接入 real_slam_prior pipeline
+```
+
+这不是手机 ARKit/ARCore 原生 point cloud，但比 `model_surface` 更接近真实系统输入：点来自图像匹配和 pose 几何，不来自 GT mesh。
+
+### 1. 单数据集三角化 smoke
+
+```bash
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/triangulate_slam_like_points.py \
+  --datasets /home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST \
+  --input_sparse_subdir sparse/0 \
+  --output_sparse_subdir sparse_slam_smoke/0 \
+  --max_frames 8 \
+  --max_features 4096 \
+  --feature_mask_mode none \
+  --matcher exhaustive \
+  --min_pair_matches 8 \
+  --min_support_views 2 \
+  --min_support_ratio 0.10 \
+  --min_output_points 1 \
+  --overwrite \
+  --output_report /home/zjr/Tracker/trellis_point_prior_mv/outputs/real_slam_prior/triangulate_goodmesh_smoke_report.json
+```
+
+当前 `GOOD_MESH_TEST` 8 帧 smoke 实测：
+
+```text
+raw=87
+support=87
+final=80
+```
+
+然后接 strict build：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_goodmesh_triangulated_buildcheck \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_smoke/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=50 \
+MAX_FRAMES=8 \
+POINT_COUNT=1500 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+当前实测：
+
+```text
+prior_source=colmap_points
+fallback=0
+prior=80
+proj_mask_any=1.000
+```
+
+### 2. 四个 CoarseModel 数据集生成 SLAM-like sparse points
+
+推荐先使用“整图匹配，三角化后用 mask/pose 过滤”的策略，更接近真实 SLAM 先建环境点、后筛物体点：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_triangulated_four_countcheck_relaxed \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=0 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_relaxed_countcheck/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MAX_FRAMES=18 \
+TRI_MIN_OUTPUT_POINTS=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_SUPPORT_VIEWS=2 \
+TRI_MIN_SUPPORT_RATIO=0.10 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+当前四个数据集实测点数：
+
+```text
+GOOD_MESH_TEST                  final=865
+reconviagen_20260520_021556     final=71
+reconviagen_20260617_073549     final=50
+reconviagen_20260617_075506     final=94
+```
+
+说明：
+
+```text
+1. GOOD_MESH_TEST 可以产生比较像样的 SLAM-like object prior；
+2. reconviagen_2026 这批弱很多，说明真实 AR/SLAM prior 很可能稀疏、不均匀；
+3. 这正是后续训练/评测需要覆盖的数据分布，不能只用 model surface oracle。
+```
+
+### 3. 四个数据集 strict build
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_triangulated_four_strict_build_relaxed \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_relaxed_countcheck/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=40 \
+MAX_FRAMES=18 \
+POINT_COUNT=1500 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+当前实测：
+
+```text
+GOOD_MESH_TEST                  source_points=865 prior=559 proj_mask_any=0.996
+reconviagen_20260520_021556     source_points=71  prior=66  proj_mask_any=0.970
+reconviagen_20260617_073549     source_points=50  prior=45  proj_mask_any=1.000
+reconviagen_20260617_075506     source_points=94  prior=62  proj_mask_any=0.984
+```
+
+注意：
+
+```text
+reconviagen_20260617_073549 量化后只有 45 个 prior voxel，属于边界可用。
+如果 MIN_PRIOR_POINTS=50，当前代码会在 voxelized prior coords 检查处失败。
+这类样本适合测试鲁棒性，但不适合单独证明 point-prior 方案有效。
+```
+
+### 4. 直接跑 mesh eval 的命令
+
+先用单数据集 smoke，避免占显存：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=real_slam_prior_goodmesh_triangulated_mesh_smoke \
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=1 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_eval/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=50 \
+MAX_FRAMES=8 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=50 \
+MODES=stock_sparse,prior_sparse,stage2_correct \
+TOPK_SPECS=12000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_goodmesh_triangulated_mesh_smoke/mesh_eval/report.json
+```
+
+如果单样本正常，再跑四个数据集：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=real_slam_prior_four_triangulated_mesh_eval \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=1 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_eval/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=40 \
+MAX_FRAMES=18 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=40 \
+MODES=stock_sparse,prior_sparse,stage2_correct \
+TOPK_SPECS=12000 \
+MESH_EVAL_SAMPLES=4000 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+### 5. strict mask 特征点 ablation
+
+`TRI_ALLOW_PAIR_OUTSIDE_MASK=1` 更像真实 SLAM：先整图建点，再用 mask/pose 筛物体点。为了判断背景/边缘误点风险，需要补一组严格 mask ablation：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_triangulated_four_strictmask_countcheck \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=0 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_strictmask_countcheck/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MAX_FRAMES=18 \
+TRI_FEATURE_MASK_MODE=mask \
+TRI_MIN_OUTPUT_POINTS=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_SUPPORT_VIEWS=2 \
+TRI_MIN_SUPPORT_RATIO=0.10 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+当前 strict-mask 计数参考：
+
+```text
+GOOD_MESH_TEST                  final=513
+reconviagen_20260520_021556     final=13
+reconviagen_20260617_073549     final=11
+reconviagen_20260617_075506     final=76
+```
+
+观察：
+
+```text
+1. final_point_count 是否仍然足够；
+2. voxelized prior coords 是否明显少于 relaxed；
+3. projection_any_mask_hit_ratio 是否更高；
+4. mesh eval 中 stage2_correct 是否比 stock_sparse 更稳。
+```
+
+如果只想对 strict-mask 也强行 build 四个数据集，可以降低阈值：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=real_slam_prior_triangulated_four_strictmask_build_min10 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+PRIOR_SOURCE=colmap_points \
+SPARSE_SUBDIR=sparse_slam_strictmask_countcheck/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+NORMALIZATION_SOURCE=prior_bbox \
+MIN_PRIOR_POINTS=10 \
+MAX_FRAMES=18 \
+POINT_COUNT=1500 \
+bash trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+```
+
+但正式结果不建议用这么低的阈值；它只用于确认 pipeline 能覆盖弱纹理样本。
+
+### 6. 安全保护
+
+`RUN_TRIANGULATE=1` 时严禁 input/output sparse 目录相同。脚本现在会直接退出：
+
+```text
+SPARSE_SUBDIR=sparse/0
+TRI_INPUT_SPARSE_SUBDIR=sparse/0
+```
+
+必须改成：
+
+```text
+SPARSE_SUBDIR=sparse_slam_eval/0
+TRI_INPUT_SPARSE_SUBDIR=sparse/0
+```
+
+### 7. 手机端原生 SLAM point cloud
+
+更真实的下一版应该改 `ARposeTTracker.cs` 上传 ARFoundation point cloud：
+
+```text
+ARPointCloudManager.trackables
+-> positions/confidence/trackableId
+-> 随每帧或每 N 帧上传到 server
+-> server 保存 slam_points_world.csv/npz
+-> 用 mask + pose 投影筛物体点
+```
+
+这会比离线 SIFT 三角化更贴近系统输入。当前离线脚本先用于验证训练/评测链路和数据分布。
