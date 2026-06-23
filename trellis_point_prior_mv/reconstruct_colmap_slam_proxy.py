@@ -60,6 +60,53 @@ def list_images(path: Path) -> list[Path]:
     return sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
 
+def parse_first_colmap_camera(cameras_txt: Path) -> tuple[str, str] | None:
+    if not cameras_txt.exists():
+        return None
+    with cameras_txt.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            model = parts[1].upper()
+            params = [float(x) for x in parts[4:]]
+            if model == "PINHOLE" and len(params) >= 4:
+                fx, fy, cx, cy = params[:4]
+                return "PINHOLE", f"{fx},{fy},{cx},{cy}"
+            if model == "SIMPLE_PINHOLE" and len(params) >= 3:
+                f, cx, cy = params[:3]
+                return "SIMPLE_PINHOLE", f"{f},{cx},{cy}"
+            if model == "SIMPLE_RADIAL" and len(params) >= 4:
+                f, cx, cy, k = params[:4]
+                return "SIMPLE_RADIAL", f"{f},{cx},{cy},{k}"
+            if model == "OPENCV" and len(params) >= 8:
+                fx, fy, cx, cy, k1, k2, p1, p2 = params[:8]
+                return "OPENCV", f"{fx},{fy},{cx},{cy},{k1},{k2},{p1},{p2}"
+    return None
+
+
+def intrinsics_for_dataset(dataset_dir: Path, args: argparse.Namespace) -> tuple[str, str | None, str]:
+    if args.camera_params:
+        return str(args.camera_model), str(args.camera_params), "manual"
+    source = str(args.intrinsics_source)
+    if source in {"auto", "existing_sparse"}:
+        parsed = parse_first_colmap_camera(dataset_dir / str(args.intrinsics_sparse_subdir) / "cameras.txt")
+        if parsed is not None:
+            model, params = parsed
+            return model, params, "existing_sparse"
+        if source == "existing_sparse":
+            raise FileNotFoundError(
+                f"requested intrinsics_source=existing_sparse but no supported camera found at "
+                f"{dataset_dir / str(args.intrinsics_sparse_subdir) / 'cameras.txt'}"
+            )
+    if source == "none" or source == "auto":
+        return str(args.camera_model), None, "colmap_estimated"
+    raise ValueError(f"unsupported intrinsics_source={source}")
+
+
 def select_images(images: list[Path], max_frames: int, mode: str, stride: int, seed: int) -> list[Path]:
     if max_frames <= 0 or len(images) <= max_frames:
         return images
@@ -168,6 +215,7 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace, colmap_bin: str
     database = work_dir / "database.db"
     sparse_out = work_dir / "sparse"
     sparse_out.mkdir(parents=True, exist_ok=True)
+    camera_model, camera_params, intrinsics_source = intrinsics_for_dataset(dataset_dir, args)
 
     feature_cmd = [
         colmap_bin,
@@ -179,12 +227,14 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace, colmap_bin: str
         "--ImageReader.single_camera",
         "1",
         "--ImageReader.camera_model",
-        str(args.camera_model),
+        str(camera_model),
         "--SiftExtraction.max_num_features",
         str(args.max_features),
         "--SiftExtraction.use_gpu",
         str(int(bool(args.use_gpu))),
     ]
+    if camera_params:
+        feature_cmd.extend(["--ImageReader.camera_params", str(camera_params)])
     if bool(args.use_masks) and masks_out is not None:
         feature_cmd.extend(["--ImageReader.mask_path", str(masks_out)])
     run_cmd(feature_cmd)
@@ -226,6 +276,16 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace, colmap_bin: str
         "--Mapper.ba_global_max_num_iterations",
         str(args.ba_global_max_num_iterations),
     ]
+    fix_intrinsics = bool(args.fix_intrinsics and intrinsics_source in {"manual", "existing_sparse"})
+    if fix_intrinsics:
+        mapper_cmd.extend([
+            "--Mapper.ba_refine_focal_length",
+            "0",
+            "--Mapper.ba_refine_principal_point",
+            "0",
+            "--Mapper.ba_refine_extra_params",
+            "0",
+        ])
     run_cmd(mapper_cmd)
     best = convert_best_model(colmap_bin, work_dir, output_sparse, args)
 
@@ -236,6 +296,10 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace, colmap_bin: str
         "frame_select": str(args.frame_select),
         "matcher": str(args.matcher),
         "use_masks": int(bool(args.use_masks and masks_out is not None)),
+        "intrinsics_source": intrinsics_source,
+        "camera_model": str(camera_model),
+        "camera_params": str(camera_params or ""),
+        "fix_intrinsics": int(fix_intrinsics),
         "work_dir": str(work_dir),
         "best_binary_sparse": str(best),
         "output_sparse": str(output_sparse),
@@ -256,11 +320,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--matcher", choices=["sequential", "exhaustive"], default="sequential")
     parser.add_argument("--sequential_overlap", type=int, default=8)
     parser.add_argument("--camera_model", default="SIMPLE_RADIAL")
+    parser.add_argument("--camera_params", default="", help="COLMAP camera_params string, e.g. fx,fy,cx,cy for PINHOLE.")
+    parser.add_argument("--intrinsics_source", choices=["auto", "none", "existing_sparse"], default="auto")
+    parser.add_argument("--intrinsics_sparse_subdir", default="sparse/0")
     parser.add_argument("--max_features", type=int, default=4096)
     parser.add_argument("--mapper_min_num_matches", type=int, default=15)
     parser.add_argument("--ba_global_max_num_iterations", type=int, default=20)
     parser.add_argument("--use_gpu", action="store_true")
     parser.add_argument("--use_masks", action="store_true", help="Use masks during feature extraction. Default uses full RGB for pose robustness.")
+    parser.add_argument("--fix_intrinsics", action="store_true", help="Keep provided/loaded intrinsics fixed in COLMAP mapper.")
     parser.add_argument("--colmap_bin", default="colmap")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--output_report", default=None)

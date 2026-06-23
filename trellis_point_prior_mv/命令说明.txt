@@ -3202,3 +3202,214 @@ TRI_MIN_OUTPUT_POINTS=20 \
 MIN_PRIOR_POINTS=20 \
 bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 ```
+
+---
+
+## 三十九、RGB->COLMAP prior 的 direct / streaming 两分支对照
+
+时间：2026-06-23 UTC
+
+### 1. 为什么要加 direct COLMAP points 对照
+
+上一版 `RUN_RECONSTRUCT_POSE=1` 默认路线是：
+
+```text
+RGB -> COLMAP pose+points
+    -> 用 COLMAP pose 固定相机
+    -> triangulate_slam_like_points.py 重新做 sequential pair triangulation
+    -> mask/pose filter 后得到 object prior
+```
+
+这条更接近未来 AR/SLAM streaming object points，但它不是最直接的 RGB->SLAM prior。
+现在新增显式分支：
+
+```text
+PRIOR_BRANCH=colmap_direct
+```
+
+含义：
+
+```text
+RGB -> COLMAP pose+points
+    -> 直接使用 COLMAP points3D.txt
+    -> build 阶段投影到 mask，筛出 object prior
+```
+
+另一个分支：
+
+```text
+PRIOR_BRANCH=streaming
+```
+
+含义：
+
+```text
+RGB -> COLMAP pose+points
+    -> 使用 COLMAP pose
+    -> 重新执行 streaming pair triangulation
+    -> 得到更接近未来 AR-like 的 object prior
+```
+
+这两个分支回答的问题不同：
+
+```text
+colmap_direct:
+  COLMAP 原生 sparse map points 经过 mask filter 是否已经够用？
+
+streaming:
+  固定 pose 下的 sequential/pair triangulation 是否比 COLMAP 原生点更适合 Stage2？
+```
+
+如果 `colmap_direct` 已经很好，第一版 proxy 可以简化；
+如果 `streaming` 明显更好，说明当前 object-point filtering/triangulation 更适合后续 AR/SLAM 接入。
+
+### 2. 分支 A：直接使用 COLMAP points
+
+这个命令会从 RGB/mask 重新估计 COLMAP pose+points，但不再二次三角化。
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+RUN_NAME=ar_like_colmap_direct_heimei_countcheck_v1 \
+PRIOR_BRANCH=colmap_direct \
+RUN_RECONSTRUCT_POSE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+COLMAP_FRAME_SELECT=random_uniform \
+COLMAP_MAX_FRAMES=64 \
+COLMAP_MATCHER=sequential \
+COLMAP_SEQUENTIAL_OVERLAP=8 \
+COLMAP_MAX_FEATURES=4096 \
+COLMAP_INTRINSICS_SOURCE=auto \
+COLMAP_FIX_INTRINSICS=1 \
+POSE_SPARSE_SUBDIR=sparse_colmap_arproxy_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+等价核心设置：
+
+```text
+RUN_RECONSTRUCT_POSE=1
+PRIOR_BRANCH=colmap_direct
+RUN_TRIANGULATE=0
+SPARSE_SUBDIR=sparse_colmap_arproxy_v1/0
+PRIOR_SOURCE=colmap_points
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_countcheck_v1/manifest/build_report.json
+```
+
+### 3. 分支 B：COLMAP pose + streaming triangulation
+
+这个命令会先从 RGB/mask 重建 COLMAP pose，然后用该 pose 重新生成 object prior points。
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+RUN_NAME=ar_like_streaming_from_colmap_heimei_countcheck_v1 \
+PRIOR_BRANCH=streaming \
+RUN_RECONSTRUCT_POSE=1 \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+COLMAP_FRAME_SELECT=random_uniform \
+COLMAP_MAX_FRAMES=64 \
+COLMAP_MATCHER=sequential \
+COLMAP_SEQUENTIAL_OVERLAP=8 \
+COLMAP_MAX_FEATURES=4096 \
+COLMAP_INTRINSICS_SOURCE=auto \
+COLMAP_FIX_INTRINSICS=1 \
+POSE_SPARSE_SUBDIR=sparse_colmap_arproxy_v1/0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse_colmap_arproxy_v1/0 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_from_colmap_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_from_colmap_heimei_countcheck_v1/slam_like_points_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_from_colmap_heimei_countcheck_v1/manifest/build_report.json
+```
+
+### 4. 使用已有真实内参
+
+如果数据集本身已经有 `sparse/0/cameras.txt`，例如手机 AR 前端上传过真实 `fx/fy/cx/cy`，COLMAP 重建时可以直接读取并固定内参：
+
+```bash
+COLMAP_INTRINSICS_SOURCE=existing_sparse \
+COLMAP_INTRINSICS_SPARSE_SUBDIR=sparse/0 \
+COLMAP_FIX_INTRINSICS=1
+```
+
+也可以手动传入：
+
+```bash
+COLMAP_INTRINSICS_SOURCE=none \
+COLMAP_CAMERA_MODEL=PINHOLE \
+COLMAP_CAMERA_PARAMS=483.609131,484.433000,323.580322,240.224991 \
+COLMAP_FIX_INTRINSICS=1
+```
+
+注意：
+
+```text
+1. 如果没有 manual/existing_sparse 内参，COLMAP_FIX_INTRINSICS=1 不会强行固定默认猜测值；
+2. 手机 AR session 已经有 pose + intrinsics 时，不需要重新用 COLMAP 求 pose；
+3. 这种情况下应使用 RUN_RECONSTRUCT_POSE=0，并把 TRI_INPUT_SPARSE_SUBDIR 指到 server.py 导出的 sparse/0。
+```
+
+手机 AR session 对照命令：
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_073549 \
+RUN_NAME=ar_session_pose_streaming_countcheck_v1 \
+PRIOR_BRANCH=streaming \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse/0 \
+SPARSE_SUBDIR=sparse_arproxy_from_arpose_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 5. 后续 ORB-SLAM / 类 SLAM 接入
+
+COLMAP 适合作离线 proxy，但它不是最终手机端 SLAM。后续应该加一个并行 backend：
+
+```text
+RGB/mask video
+  -> ORB-SLAM3 / OpenVSLAM / VINS-like backend
+  -> 导出 COLMAP text compatible cameras.txt/images.txt/points3D.txt
+  -> 复用当前 colmap_direct / streaming 两个分支
+```
+
+这样 Stage2 训练和 eval 不需要改格式，只需要替换 pose+points 的来源。
