@@ -68,8 +68,16 @@ def load_frame_data(dataset_dir: Path, sparse_dir: Path, args: argparse.Namespac
         if camera is None:
             continue
         frames.append({"name": Path(name).name, "image": image_path, "mask": mask_path, "meta": meta, "camera": camera})
-    if args.max_frames > 0:
-        frames = frames[: int(args.max_frames)]
+    if args.max_frames > 0 and len(frames) > int(args.max_frames):
+        if args.frame_select == "uniform":
+            ids = np.linspace(0, len(frames) - 1, int(args.max_frames))
+            keep = sorted({int(round(x)) for x in ids})
+            frames = [frames[i] for i in keep][: int(args.max_frames)]
+        elif args.frame_select == "stride":
+            stride = max(int(args.frame_stride), 1)
+            frames = frames[::stride][: int(args.max_frames)]
+        else:
+            frames = frames[: int(args.max_frames)]
     if len(frames) < 2:
         raise ValueError(f"need at least two image/mask frames with COLMAP poses: {dataset_dir}")
     return frames
@@ -322,6 +330,135 @@ def write_points3d(path: Path, points: np.ndarray, errors: np.ndarray, colors: n
             f.write(f"{idx} {p[0]:.9f} {p[1]:.9f} {p[2]:.9f} {r} {g} {b} {float(err):.6f}\n")
 
 
+def rotmat_to_qvec(rot: np.ndarray) -> list[float]:
+    r = np.asarray(rot, dtype=np.float64)
+    trace = float(np.trace(r))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (r[2, 1] - r[1, 2]) / s
+        qy = (r[0, 2] - r[2, 0]) / s
+        qz = (r[1, 0] - r[0, 1]) / s
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = math.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2]) * 2.0
+        qw = (r[2, 1] - r[1, 2]) / s
+        qx = 0.25 * s
+        qy = (r[0, 1] + r[1, 0]) / s
+        qz = (r[0, 2] + r[2, 0]) / s
+    elif r[1, 1] > r[2, 2]:
+        s = math.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2]) * 2.0
+        qw = (r[0, 2] - r[2, 0]) / s
+        qx = (r[0, 1] + r[1, 0]) / s
+        qy = 0.25 * s
+        qz = (r[1, 2] + r[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1]) * 2.0
+        qw = (r[1, 0] - r[0, 1]) / s
+        qx = (r[0, 2] + r[2, 0]) / s
+        qy = (r[1, 2] + r[2, 1]) / s
+        qz = 0.25 * s
+    q = np.asarray([qw, qx, qy, qz], dtype=np.float64)
+    q = q / max(float(np.linalg.norm(q)), 1e-12)
+    return [float(x) for x in q.tolist()]
+
+
+def colmap_c2w(meta: dict) -> np.ndarray:
+    r = np.asarray(meta["R"], dtype=np.float64)
+    t = np.asarray(meta["tvec"], dtype=np.float64).reshape(3)
+    c2w = np.eye(4, dtype=np.float64)
+    c2w[:3, :3] = r.T
+    c2w[:3, 3] = -r.T @ t
+    return c2w
+
+
+def colmap_w2c(meta: dict) -> np.ndarray:
+    r = np.asarray(meta["R"], dtype=np.float64)
+    t = np.asarray(meta["tvec"], dtype=np.float64).reshape(3)
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = r
+    w2c[:3, 3] = t
+    return w2c
+
+
+def write_arpose_tracker_proxy(
+    path: Path,
+    *,
+    dataset_dir: Path,
+    output_sparse: Path,
+    frames: list[dict],
+    points: np.ndarray,
+    errors: np.ndarray,
+    colors: np.ndarray,
+    args: argparse.Namespace,
+) -> None:
+    frame_rows = []
+    for idx, frame in enumerate(frames):
+        camera = frame["camera"]
+        meta = frame["meta"]
+        c2w = colmap_c2w(meta)
+        w2c = colmap_w2c(meta)
+        frame_rows.append(
+            {
+                "frame_index": idx,
+                "image_id": int(meta["image_id"]),
+                "image_name": frame["name"],
+                "image_path": str(frame["image"]),
+                "mask_path": str(frame["mask"]),
+                "width": int(camera["width"]),
+                "height": int(camera["height"]),
+                "intrinsics": {
+                    "fx": float(camera["fx"]),
+                    "fy": float(camera["fy"]),
+                    "cx": float(camera["cx"]),
+                    "cy": float(camera["cy"]),
+                    "model": str(camera.get("model", "PINHOLE")),
+                },
+                "world_to_camera_colmap": [float(x) for x in w2c.reshape(-1).tolist()],
+                "camera_to_world": [float(x) for x in c2w.reshape(-1).tolist()],
+                "camera_position_world": [float(x) for x in c2w[:3, 3].tolist()],
+                "camera_rotation_world_xyzw": rotmat_to_qvec(c2w[:3, :3])[1:] + rotmat_to_qvec(c2w[:3, :3])[:1],
+                "tracking_state": "normal",
+            }
+        )
+    point_rows = []
+    for idx, (p, err, rgb) in enumerate(zip(points, errors, colors), start=1):
+        conf = 1.0 / (1.0 + max(float(err), 0.0))
+        point_rows.append(
+            {
+                "id": int(idx),
+                "position_world": [float(x) for x in p.tolist()],
+                "confidence": float(conf),
+                "reprojection_error": float(err),
+                "rgb": [int(x) for x in rgb.tolist()],
+            }
+        )
+    payload = {
+        "schema": "arpose_tracker_slam_proxy_v1",
+        "description": "Offline AR-like streaming SLAM proxy. Coordinate frame follows COLMAP world coordinates.",
+        "dataset_root": str(dataset_dir),
+        "sparse_dir": str(output_sparse),
+        "source": {
+            "type": "opencv_sift_fixed_pose_streaming_proxy",
+            "input_sparse_subdir": str(args.input_sparse_subdir),
+            "output_sparse_subdir": str(args.output_sparse_subdir),
+            "frame_select": str(args.frame_select),
+            "frame_stride": int(args.frame_stride),
+            "matcher": str(args.matcher),
+            "max_pair_gap": int(args.max_pair_gap),
+            "feature_mask_mode": str(args.feature_mask_mode),
+            "require_pair_mask_hit": bool(args.require_pair_mask_hit),
+        },
+        "frames": frame_rows,
+        "points": point_rows,
+        "summary": {
+            "frame_count": len(frame_rows),
+            "point_count": len(point_rows),
+            "mean_reprojection_error": float(np.mean(errors)) if errors.shape[0] else 0.0,
+        },
+    }
+    write_json(path, payload)
+
+
 def process_dataset(dataset_dir: Path, args: argparse.Namespace) -> dict:
     input_sparse = (dataset_dir / args.input_sparse_subdir).resolve()
     output_sparse = (dataset_dir / args.output_sparse_subdir).resolve()
@@ -375,6 +512,16 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace) -> dict:
 
     copy_sparse_pose_files(input_sparse, output_sparse)
     write_points3d(output_sparse / "points3D.txt", points, errors, colors)
+    write_arpose_tracker_proxy(
+        output_sparse / "arpose_tracker_slam_proxy.json",
+        dataset_dir=dataset_dir,
+        output_sparse=output_sparse,
+        frames=frames,
+        points=points,
+        errors=errors,
+        colors=colors,
+        args=args,
+    )
     meta = {
         "source": "opencv_sift_fixed_pose_triangulation",
         "input_sparse": str(input_sparse),
@@ -385,6 +532,7 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace) -> dict:
         "raw_triangulated_count": raw_count,
         "support_filtered_count": supported_count,
         "final_point_count": int(points.shape[0]),
+        "arpose_tracker_proxy": str(output_sparse / "arpose_tracker_slam_proxy.json"),
         **support_stats,
     }
     write_json(output_sparse / "slam_like_points_meta.json", meta)
@@ -397,6 +545,7 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace) -> dict:
         "raw_triangulated_count": raw_count,
         "support_filtered_count": supported_count,
         "final_point_count": int(points.shape[0]),
+        "arpose_tracker_proxy": str(output_sparse / "arpose_tracker_slam_proxy.json"),
         **support_stats,
     }
 
@@ -407,6 +556,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input_sparse_subdir", default="sparse/0")
     parser.add_argument("--output_sparse_subdir", default="sparse_slam/0")
     parser.add_argument("--max_frames", type=int, default=18)
+    parser.add_argument("--frame_select", choices=["first", "uniform", "stride"], default="first")
+    parser.add_argument("--frame_stride", type=int, default=1)
     parser.add_argument("--max_features", type=int, default=4096)
     parser.add_argument("--feature_mask_mode", choices=["none", "mask"], default="none")
     parser.add_argument("--matcher", choices=["exhaustive", "sequential"], default="exhaustive")

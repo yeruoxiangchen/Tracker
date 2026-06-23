@@ -131,7 +131,19 @@ def parse_colmap_points(path: Path) -> np.ndarray:
     return np.asarray(pts, dtype=np.float32)
 
 
-def find_frame_pairs(dataset_dir: Path, max_frames: int) -> list[dict]:
+def select_frames(frames: list[dict], max_frames: int, frame_select: str, frame_stride: int) -> list[dict]:
+    if max_frames <= 0 or len(frames) <= max_frames:
+        return frames
+    if frame_select == "uniform":
+        ids = np.linspace(0, len(frames) - 1, int(max_frames))
+        keep = sorted({int(round(x)) for x in ids})
+        return [frames[i] for i in keep][: int(max_frames)]
+    if frame_select == "stride":
+        return frames[:: max(int(frame_stride), 1)][: int(max_frames)]
+    return frames[: int(max_frames)]
+
+
+def find_frame_pairs(dataset_dir: Path, max_frames: int, frame_select: str = "first", frame_stride: int = 1) -> list[dict]:
     image_dir = dataset_dir / "images"
     if not image_dir.exists():
         image_dir = dataset_dir / "rgb"
@@ -152,9 +164,7 @@ def find_frame_pairs(dataset_dir: Path, max_frames: int) -> list[dict]:
                 "stem": image_path.stem,
             }
         )
-    if max_frames > 0:
-        frames = frames[: int(max_frames)]
-    return frames
+    return select_frames(frames, int(max_frames), frame_select, int(frame_stride))
 
 
 def find_reference_model(dataset_dir: Path) -> Path | None:
@@ -436,7 +446,12 @@ def projection_diagnostics_for_coords(
 
 def build_one(dataset_dir: Path, out_dir: Path, args: argparse.Namespace, out_index: int) -> tuple[dict, dict]:
     uid = dataset_dir.name
-    frames = find_frame_pairs(dataset_dir, max_frames=args.max_frames)
+    frames = find_frame_pairs(
+        dataset_dir,
+        max_frames=args.max_frames,
+        frame_select=args.frame_select,
+        frame_stride=args.frame_stride,
+    )
     if not frames:
         raise ValueError(f"no image/mask pairs found in {dataset_dir}")
     model_path = find_reference_model(dataset_dir)
@@ -586,6 +601,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow_model_fallback", action="store_true")
     parser.add_argument("--normalization_source", choices=["auto", "prior_bbox", "model_bbox"], default="auto")
     parser.add_argument("--max_frames", type=int, default=18)
+    parser.add_argument("--frame_select", choices=["first", "uniform", "stride"], default="first")
+    parser.add_argument("--frame_stride", type=int, default=1)
     parser.add_argument("--point_count", type=int, default=1500)
     parser.add_argument("--min_prior_points", type=int, default=200)
     parser.add_argument("--grid_resolution", type=int, default=64)

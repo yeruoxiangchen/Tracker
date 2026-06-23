@@ -29,10 +29,13 @@ RUN_TRIANGULATE="${RUN_TRIANGULATE:-0}"
 TRI_INPUT_SPARSE_SUBDIR="${TRI_INPUT_SPARSE_SUBDIR:-sparse/0}"
 TRIANGULATE_OVERWRITE="${TRIANGULATE_OVERWRITE:-1}"
 MAX_FRAMES="${MAX_FRAMES:-18}"
+FRAME_SELECT="${FRAME_SELECT:-first}"
+FRAME_STRIDE="${FRAME_STRIDE:-1}"
 POINT_COUNT="${POINT_COUNT:-1500}"
 MIN_PRIOR_POINTS="${MIN_PRIOR_POINTS:-200}"
 TOPK_SPECS="${TOPK_SPECS:-12000}"
 MODES="${MODES:-stage2_correct}"
+INDICES="${INDICES:-all}"
 STAGE2_CHECKPOINT="${STAGE2_CHECKPOINT:-${ROOT}/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt}"
 WEIGHTS="${WEIGHTS:-microsoft/TRELLIS-image-large}"
 SS_STEPS="${SS_STEPS:-12}"
@@ -68,6 +71,8 @@ if [[ "${RUN_TRIANGULATE}" == "1" ]]; then
     --input_sparse_subdir "${TRI_INPUT_SPARSE_SUBDIR}" \
     --output_sparse_subdir "${SPARSE_SUBDIR}" \
     --max_frames "${MAX_FRAMES}" \
+    --frame_select "${FRAME_SELECT}" \
+    --frame_stride "${FRAME_STRIDE}" \
     --max_features "${TRI_MAX_FEATURES:-4096}" \
     --feature_mask_mode "${TRI_FEATURE_MASK_MODE:-none}" \
     --matcher "${TRI_MATCHER:-exhaustive}" \
@@ -98,6 +103,8 @@ if [[ "${RUN_BUILD}" == "1" ]]; then
     --sparse_subdir "${SPARSE_SUBDIR}" \
     --normalization_source "${NORMALIZATION_SOURCE}" \
     --max_frames "${MAX_FRAMES}" \
+    --frame_select "${FRAME_SELECT}" \
+    --frame_stride "${FRAME_STRIDE}" \
     --point_count "${POINT_COUNT}" \
     --min_prior_points "${MIN_PRIOR_POINTS}" \
     --seed 42 \
@@ -119,7 +126,7 @@ if [[ "${RUN_EVAL}" == "1" ]]; then
     --manifest "${MANIFEST}" \
     --output_dir "${EVAL_DIR}" \
     --weights "${WEIGHTS}" \
-    --indices all \
+    --indices "${INDICES}" \
     --modes "${MODES}" \
     --stage2_checkpoint "${STAGE2_CHECKPOINT}" \
     --stage2_topk_specs "${TOPK_SPECS}" \

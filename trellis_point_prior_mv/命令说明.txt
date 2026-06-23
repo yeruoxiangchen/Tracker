@@ -2652,3 +2652,317 @@ ARPointCloudManager.trackables
 ```
 
 这会比离线 SIFT 三角化更贴近系统输入。当前离线脚本先用于验证训练/评测链路和数据分布。
+
+## 三十七、AR-like streaming SLAM proxy 真实数据测试入口
+
+时间：`2026-06-23 05:31:41 UTC`
+
+目标路线：
+
+```text
+真实数据集 RGB/mask/video
+-> 离线 AR-like streaming SLAM proxy
+-> 输出和未来 ARposeTTracker.cs 可对齐的 pose + map points JSON
+-> 构建 Stage2 point prior manifest
+-> 测试 Stage2 sparse + frozen slat/mesh pipeline
+```
+
+新增/修改代码：
+
+```text
+trellis_point_prior_mv/triangulate_slam_like_points.py
+  - 新增 frame_select=first/uniform/stride
+  - 新增 ARpose tracker proxy JSON 输出：
+    sparse_xxx/0/arpose_tracker_slam_proxy.json
+
+trellis_point_prior_mv/build_real_slam_prior_manifest.py
+  - 新增 frame_select/frame_stride，保证 build manifest 与 streaming proxy 使用同一帧选择策略
+
+trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh
+  - 新增 FRAME_SELECT/FRAME_STRIDE/INDICES
+
+trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+  - 内部真实数据集 streaming proxy 一键入口
+
+trellis_point_prior_mv/prepare_omniobject3d_subset.py
+trellis_point_prior_mv/scripts/prepare_omniobject3d_subset.sh
+  - OmniObject3D 小子集转换为 CoarseModel-style 数据目录
+```
+
+### 1. 已验证的最小 smoke
+
+只用 `GOOD_MESH_TEST`，8 帧，顺序窗口，不跑 GPU mesh eval：
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST \
+RUN_NAME=ar_like_streaming_goodmesh_smoke \
+RUN_EVAL=0 \
+MAX_FRAMES=8 \
+FRAME_SELECT=uniform \
+TRI_MAX_PAIR_GAP=2 \
+TRI_MAX_FEATURES=1024 \
+MIN_PRIOR_POINTS=10 \
+TRI_MIN_OUTPUT_POINTS=10 \
+SPARSE_SUBDIR=sparse_arproxy_smoke/0 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+本地 smoke 结果：
+
+```text
+frames=8
+raw triangulated=382
+support filtered=34
+final points=33
+prior coords=33
+projection_any_mask_hit_ratio=1.0
+projection_mask_hit_over_inside_mean=0.754
+```
+
+ARpose proxy 输出：
+
+```text
+/home/zjr/Tracker/CoarseModel/datasets/GOOD_MESH_TEST/sparse_arproxy_smoke/0/arpose_tracker_slam_proxy.json
+```
+
+### 2. 内部 7 个真实/半真实数据集 streaming countcheck
+
+默认包含：
+
+```text
+CoarseModel/datasets/GOOD_MESH_TEST
+CoarseModel/datasets/reconviagen_20260520_021556
+CoarseModel/datasets/reconviagen_20260617_073549
+CoarseModel/datasets/reconviagen_20260617_075506
+CoarseModel/datasets/heimei
+CoarseModel/datasets/maliao
+CoarseModel/datasets/snoopy
+```
+
+先只构建 streaming SLAM proxy 和 manifest，不跑 mesh：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=ar_like_streaming_internal7_countcheck_v1 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=uniform \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_MAX_FEATURES=2048 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_v1/0 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/slam_like_points_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/manifest/build_report.json
+```
+
+### 3. 内部 7 数据集 mesh eval smoke
+
+如果 countcheck 点数达标，再跑 mesh eval。为了控制显存/时间，可先只跑前 3 个样本：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_internal7_mesh_smoke_v1 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/manifest/manifest.json \
+INDICES=0-2 \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=6000,12000,16000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+完整 7 数据集：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_internal7_mesh_eval_v1 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=6000,12000,16000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 4. OmniObject3D 小子集准备
+
+先按 OmniObject3D 官方方式把数据下载/解压到 `/data/OmniObject3D`。该脚本不写死下载 URL，因为数据发布和授权方式可能变化；它负责把已下载数据转成当前 pipeline 可用结构。
+
+```bash
+cd /home/zjr/Tracker
+
+OMNI_SOURCE_ROOT=/data/OmniObject3D \
+OMNI_OUTPUT_ROOT=/data/trellis_point_prior_mv/omniobject3d_subset \
+MAX_OBJECTS=20 \
+MAX_FRAMES=32 \
+MIN_FRAMES=8 \
+OVERWRITE=1 \
+bash trellis_point_prior_mv/scripts/prepare_omniobject3d_subset.sh
+```
+
+输出：
+
+```text
+/data/trellis_point_prior_mv/omniobject3d_subset/dataset_manifest.json
+/data/trellis_point_prior_mv/omniobject3d_subset/*/images
+/data/trellis_point_prior_mv/omniobject3d_subset/*/masks
+/data/trellis_point_prior_mv/omniobject3d_subset/*/models
+/data/trellis_point_prior_mv/omniobject3d_subset/*/sparse/0
+```
+
+少量 demo 帧会复制到：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/demo_assets/omniobject3d_subset
+```
+
+如果 OmniObject3D 子集没有 mask，仅做路径 smoke 可临时加：
+
+```bash
+ALLOW_FULL_MASKS=1
+```
+
+但正式评估不要用 full mask。
+
+### 5. OmniObject3D 子集 streaming proxy countcheck
+
+从转换 manifest 里取数据集路径，构建 streaming SLAM proxy：
+
+```bash
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OMNI_DATASETS=$($PY - <<'PY'
+import json
+from pathlib import Path
+p = Path('/data/trellis_point_prior_mv/omniobject3d_subset/dataset_manifest.json')
+d = json.loads(p.read_text())
+print(':'.join(d['datasets']))
+PY
+)
+
+DATASETS="$OMNI_DATASETS" \
+RUN_NAME=ar_like_streaming_omni20_countcheck_v1 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=uniform \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_MAX_FEATURES=2048 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_v1/0 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 6. OmniObject3D 子集 mesh eval
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_omni20_mesh_eval_v1 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_omni20_countcheck_v1/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=6000,12000,16000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 7. 当前 sparse flow 训练命令
+
+当前可以长训的是 Stage2 sparse flow；真实 streaming proxy 这轮主要用于评估和校准。训练仍先用 PixalV9/Objaverse 构建的有 target sparse 的数据。
+
+建议下一组长训：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=s1000 \
+RUN_NAME=pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s1000_seed42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+TRAIN_SEED=42 \
+MAX_STEPS=1000 \
+SAVE_EVERY=250 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+训练后优先用真实 streaming proxy 评估：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_internal7_s1000_mesh_eval_v1 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/manifest/manifest.json \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s1000_seed42/checkpoints/last.ckpt \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=6000,12000,16000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 8. 当前判断标准
+
+进入完整长训前，至少需要看到：
+
+```text
+内部 7 数据集 streaming countcheck:
+  prior_point_count >= 20-40 的样本占多数
+  projection_any_mask_hit_ratio 接近 1
+  projection_mask_hit_over_inside_mean >= 0.25-0.30
+
+内部 7 数据集 mesh eval:
+  stage2_correct 在多数样本上优于 stock_sparse
+  12000/16000 不出现明显过填充灾难
+  6000 可作为低复杂度候选但不能作为唯一默认
+
+OmniObject3D 小子集:
+  与内部真实数据 trend 一致
+  不依赖 full mask smoke
+```
