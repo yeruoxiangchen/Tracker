@@ -131,7 +131,63 @@ def parse_colmap_points(path: Path) -> np.ndarray:
     return np.asarray(pts, dtype=np.float32)
 
 
-def select_frames(frames: list[dict], max_frames: int, frame_select: str, frame_stride: int) -> list[dict]:
+def camera_center_from_meta(meta: dict) -> np.ndarray:
+    return -np.asarray(meta["R"], dtype=np.float64).T @ np.asarray(meta["tvec"], dtype=np.float64).reshape(3)
+
+
+def pose_diverse_frame_indices(frames: list[dict], metas: dict[str, dict], count: int, seed: int, randomized: bool) -> list[int]:
+    if count <= 0 or len(frames) <= count:
+        return list(range(len(frames)))
+    centers = []
+    valid_ids = []
+    for idx, frame in enumerate(frames):
+        meta = metas.get(frame["name"]) or metas.get(Path(frame["name"]).name)
+        if meta is None:
+            continue
+        centers.append(camera_center_from_meta(meta))
+        valid_ids.append(idx)
+    if len(valid_ids) < count:
+        return list(range(min(count, len(frames))))
+    centers_np = np.stack(centers, axis=0).astype(np.float64)
+    center = np.median(centers_np, axis=0, keepdims=True)
+    rel = centers_np - center
+    norm = np.linalg.norm(rel, axis=1, keepdims=True)
+    if float(norm.max()) < 1e-8:
+        rel = np.arange(len(valid_ids), dtype=np.float64).reshape(-1, 1)
+        norm = np.maximum(np.linalg.norm(rel, axis=1, keepdims=True), 1.0)
+    feat = rel / np.maximum(norm, 1e-8)
+    rng = np.random.default_rng(int(seed))
+    first_local = int(rng.integers(0, len(valid_ids))) if randomized else 0
+    selected_local = [first_local]
+    min_dist = np.sum((feat - feat[first_local]) ** 2, axis=1)
+    min_dist[first_local] = -1.0
+    while len(selected_local) < count:
+        if randomized:
+            order = np.argsort(-min_dist)
+            topn = max(1, min(len(order), max(3, int(math.ceil(count * 0.5)))))
+            pool = order[:topn]
+            weights = np.maximum(min_dist[pool], 0.0)
+            weights = weights / weights.sum() if float(weights.sum()) > 0 else None
+            nxt = int(rng.choice(pool, p=weights))
+        else:
+            nxt = int(np.argmax(min_dist))
+        if nxt in selected_local or min_dist[nxt] < 0:
+            break
+        selected_local.append(nxt)
+        dist = np.sum((feat - feat[nxt]) ** 2, axis=1)
+        min_dist = np.minimum(min_dist, dist)
+        min_dist[selected_local] = -1.0
+    return sorted(valid_ids[i] for i in selected_local)
+
+
+def select_frames(
+    frames: list[dict],
+    max_frames: int,
+    frame_select: str,
+    frame_stride: int,
+    frame_select_seed: int,
+    metas: dict[str, dict] | None = None,
+) -> list[dict]:
     if max_frames <= 0 or len(frames) <= max_frames:
         return frames
     if frame_select == "uniform":
@@ -140,10 +196,42 @@ def select_frames(frames: list[dict], max_frames: int, frame_select: str, frame_
         return [frames[i] for i in keep][: int(max_frames)]
     if frame_select == "stride":
         return frames[:: max(int(frame_stride), 1)][: int(max_frames)]
+    if frame_select == "random":
+        rng = np.random.default_rng(int(frame_select_seed))
+        keep = sorted(rng.choice(len(frames), size=int(max_frames), replace=False).astype(int).tolist())
+        return [frames[i] for i in keep]
+    if frame_select == "random_uniform":
+        rng = np.random.default_rng(int(frame_select_seed))
+        edges = np.linspace(0, len(frames), int(max_frames) + 1)
+        keep = []
+        for start, end in zip(edges[:-1], edges[1:]):
+            lo = int(math.floor(start))
+            hi = max(lo + 1, int(math.ceil(end)))
+            hi = min(hi, len(frames))
+            keep.append(int(rng.integers(lo, hi)))
+        keep = sorted(set(keep))
+        if len(keep) < int(max_frames):
+            rest = [i for i in range(len(frames)) if i not in keep]
+            extra = rng.choice(rest, size=min(int(max_frames) - len(keep), len(rest)), replace=False).astype(int).tolist()
+            keep = sorted(keep + extra)
+        return [frames[i] for i in keep[: int(max_frames)]]
+    if frame_select == "pose_farthest" and metas is not None:
+        keep = pose_diverse_frame_indices(frames, metas, int(max_frames), int(frame_select_seed), randomized=False)
+        return [frames[i] for i in keep][: int(max_frames)]
+    if frame_select == "pose_random_farthest" and metas is not None:
+        keep = pose_diverse_frame_indices(frames, metas, int(max_frames), int(frame_select_seed), randomized=True)
+        return [frames[i] for i in keep][: int(max_frames)]
     return frames[: int(max_frames)]
 
 
-def find_frame_pairs(dataset_dir: Path, max_frames: int, frame_select: str = "first", frame_stride: int = 1) -> list[dict]:
+def find_frame_pairs(
+    dataset_dir: Path,
+    max_frames: int,
+    frame_select: str = "first",
+    frame_stride: int = 1,
+    frame_select_seed: int = 42,
+    sparse_subdir: str = "sparse/0",
+) -> list[dict]:
     image_dir = dataset_dir / "images"
     if not image_dir.exists():
         image_dir = dataset_dir / "rgb"
@@ -164,7 +252,8 @@ def find_frame_pairs(dataset_dir: Path, max_frames: int, frame_select: str = "fi
                 "stem": image_path.stem,
             }
         )
-    return select_frames(frames, int(max_frames), frame_select, int(frame_stride))
+    metas = parse_colmap_images(dataset_dir / sparse_subdir / "images.txt") if str(frame_select).startswith("pose_") else None
+    return select_frames(frames, int(max_frames), frame_select, int(frame_stride), int(frame_select_seed), metas)
 
 
 def find_reference_model(dataset_dir: Path) -> Path | None:
@@ -451,6 +540,8 @@ def build_one(dataset_dir: Path, out_dir: Path, args: argparse.Namespace, out_in
         max_frames=args.max_frames,
         frame_select=args.frame_select,
         frame_stride=args.frame_stride,
+        frame_select_seed=args.frame_select_seed,
+        sparse_subdir=args.sparse_subdir,
     )
     if not frames:
         raise ValueError(f"no image/mask pairs found in {dataset_dir}")
@@ -601,8 +692,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow_model_fallback", action="store_true")
     parser.add_argument("--normalization_source", choices=["auto", "prior_bbox", "model_bbox"], default="auto")
     parser.add_argument("--max_frames", type=int, default=18)
-    parser.add_argument("--frame_select", choices=["first", "uniform", "stride"], default="first")
+    parser.add_argument(
+        "--frame_select",
+        choices=["first", "uniform", "stride", "random", "random_uniform", "pose_farthest", "pose_random_farthest"],
+        default="first",
+    )
     parser.add_argument("--frame_stride", type=int, default=1)
+    parser.add_argument("--frame_select_seed", type=int, default=42)
     parser.add_argument("--point_count", type=int, default=1500)
     parser.add_argument("--min_prior_points", type=int, default=200)
     parser.add_argument("--grid_resolution", type=int, default=64)

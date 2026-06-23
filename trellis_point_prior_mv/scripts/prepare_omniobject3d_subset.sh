@@ -15,6 +15,7 @@ CATEGORIES="${CATEGORIES:-}"
 SCAN_DEPTH="${SCAN_DEPTH:-4}"
 ALLOW_FULL_MASKS="${ALLOW_FULL_MASKS:-0}"
 ALLOW_MISSING_POSE="${ALLOW_MISSING_POSE:-0}"
+POSE_POLICY="${POSE_POLICY:-none}"
 OVERWRITE="${OVERWRITE:-1}"
 
 if [[ ! -d "${OMNI_SOURCE_ROOT}" ]]; then
@@ -43,6 +44,7 @@ fi
   --min_frames "${MIN_FRAMES}" \
   --scan_depth "${SCAN_DEPTH}" \
   --categories "${CATEGORIES}" \
+  --pose_policy "${POSE_POLICY}" \
   "${EXTRA_ARGS[@]}"
 
 echo "[prepare_omniobject3d_subset] manifest=${OMNI_OUTPUT_ROOT}/dataset_manifest.json"

@@ -308,7 +308,7 @@ def build_subset(args: argparse.Namespace) -> None:
         transforms = find_transforms(obj_dir)
         if image_dir is None or model is None:
             continue
-        if sparse is None and transforms is None and not args.allow_missing_pose:
+        if args.pose_policy != "none" and sparse is None and transforms is None and not args.allow_missing_pose:
             continue
         images = select_uniform(list_images(image_dir), int(args.max_frames))
         if len(images) < int(args.min_frames):
@@ -327,18 +327,21 @@ def build_subset(args: argparse.Namespace) -> None:
             made_full = copy_or_make_mask(mask_dir, image, out_masks / f"{image.stem}.png", bool(args.allow_full_masks))
             full_mask_count += int(made_full)
         model_out = copy_model(model, out_models, uid, bool(args.convert_model_to_obj))
-        out_sparse = out_dir / "sparse" / "0"
         pose_source = "missing"
-        if sparse is not None:
+        out_sparse = out_dir / "sparse" / "0"
+        if args.pose_policy == "copy_if_available" and sparse is not None:
             copy_sparse(sparse, out_sparse)
             pose_source = "colmap_sparse"
-        elif transforms is not None:
+        elif args.pose_policy in {"copy_if_available", "transforms_if_available"} and transforms is not None:
             if not write_colmap_from_transforms(transforms, images, out_sparse):
                 raise ValueError(f"failed to convert transforms to COLMAP for {obj_dir}")
             pose_source = "transforms_json"
         elif args.allow_missing_pose:
             out_sparse.mkdir(parents=True, exist_ok=True)
             write_empty_points3d(out_sparse / "points3D.txt")
+            pose_source = "empty"
+        else:
+            pose_source = "none"
 
         if demo_root is not None and len(selected_dirs) < int(args.demo_objects):
             demo_dir = demo_root / uid
@@ -401,6 +404,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--categories", default="")
     parser.add_argument("--allow_full_masks", action="store_true", help="Create full-image masks if OmniObject3D masks are unavailable. Use only for smoke.")
     parser.add_argument("--allow_missing_pose", action="store_true", help="Keep objects without sparse/0 or transforms.json. They cannot run SLAM prior eval until poses are added.")
+    parser.add_argument(
+        "--pose_policy",
+        choices=["none", "copy_if_available", "transforms_if_available"],
+        default="none",
+        help="Default 'none' keeps OmniObject3D as RGB/mask/model only; use offline COLMAP/SLAM to estimate pose+points later.",
+    )
     parser.add_argument("--convert_model_to_obj", action="store_true", default=True)
     parser.add_argument("--no_convert_model_to_obj", dest="convert_model_to_obj", action="store_false")
     parser.add_argument("--demo_objects", type=int, default=2)

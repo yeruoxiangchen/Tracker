@@ -68,19 +68,82 @@ def load_frame_data(dataset_dir: Path, sparse_dir: Path, args: argparse.Namespac
         if camera is None:
             continue
         frames.append({"name": Path(name).name, "image": image_path, "mask": mask_path, "meta": meta, "camera": camera})
-    if args.max_frames > 0 and len(frames) > int(args.max_frames):
-        if args.frame_select == "uniform":
-            ids = np.linspace(0, len(frames) - 1, int(args.max_frames))
-            keep = sorted({int(round(x)) for x in ids})
-            frames = [frames[i] for i in keep][: int(args.max_frames)]
-        elif args.frame_select == "stride":
-            stride = max(int(args.frame_stride), 1)
-            frames = frames[::stride][: int(args.max_frames)]
-        else:
-            frames = frames[: int(args.max_frames)]
+    frames = select_frames(frames, args)
     if len(frames) < 2:
         raise ValueError(f"need at least two image/mask frames with COLMAP poses: {dataset_dir}")
     return frames
+
+
+def pose_diverse_frame_indices(frames: list[dict], count: int, seed: int, randomized: bool) -> list[int]:
+    if count <= 0 or len(frames) <= count:
+        return list(range(len(frames)))
+    centers = np.stack([camera_center(frame) for frame in frames], axis=0).astype(np.float64)
+    center = np.median(centers, axis=0, keepdims=True)
+    rel = centers - center
+    norm = np.linalg.norm(rel, axis=1, keepdims=True)
+    if float(norm.max()) < 1e-8:
+        rel = np.arange(len(frames), dtype=np.float64).reshape(-1, 1)
+        norm = np.maximum(np.linalg.norm(rel, axis=1, keepdims=True), 1.0)
+    feat = rel / np.maximum(norm, 1e-8)
+    rng = np.random.default_rng(int(seed))
+    first = int(rng.integers(0, len(frames))) if randomized else 0
+    selected = [first]
+    min_dist = np.sum((feat - feat[first]) ** 2, axis=1)
+    min_dist[first] = -1.0
+    while len(selected) < count:
+        if randomized:
+            order = np.argsort(-min_dist)
+            topn = max(1, min(len(order), max(3, int(math.ceil(count * 0.5)))))
+            pool = order[:topn]
+            weights = np.maximum(min_dist[pool], 0.0)
+            weights = weights / weights.sum() if float(weights.sum()) > 0 else None
+            nxt = int(rng.choice(pool, p=weights))
+        else:
+            nxt = int(np.argmax(min_dist))
+        if nxt in selected or min_dist[nxt] < 0:
+            break
+        selected.append(nxt)
+        dist = np.sum((feat - feat[nxt]) ** 2, axis=1)
+        min_dist = np.minimum(min_dist, dist)
+        min_dist[selected] = -1.0
+    return sorted(selected)
+
+
+def select_frames(frames: list[dict], args: argparse.Namespace) -> list[dict]:
+    max_frames = int(args.max_frames)
+    if max_frames <= 0 or len(frames) <= max_frames:
+        return frames
+    mode = str(args.frame_select)
+    if mode == "uniform":
+        ids = np.linspace(0, len(frames) - 1, max_frames)
+        keep = sorted({int(round(x)) for x in ids})
+    elif mode == "stride":
+        stride = max(int(args.frame_stride), 1)
+        keep = list(range(0, len(frames), stride))[:max_frames]
+    elif mode == "random":
+        rng = np.random.default_rng(int(args.frame_select_seed))
+        keep = sorted(rng.choice(len(frames), size=max_frames, replace=False).astype(int).tolist())
+    elif mode == "random_uniform":
+        rng = np.random.default_rng(int(args.frame_select_seed))
+        edges = np.linspace(0, len(frames), max_frames + 1)
+        keep = []
+        for start, end in zip(edges[:-1], edges[1:]):
+            lo = int(math.floor(start))
+            hi = max(lo + 1, int(math.ceil(end)))
+            hi = min(hi, len(frames))
+            keep.append(int(rng.integers(lo, hi)))
+        keep = sorted(set(keep))
+        if len(keep) < max_frames:
+            rest = [i for i in range(len(frames)) if i not in keep]
+            extra = rng.choice(rest, size=min(max_frames - len(keep), len(rest)), replace=False).astype(int).tolist()
+            keep = sorted(keep + extra)
+    elif mode == "pose_farthest":
+        keep = pose_diverse_frame_indices(frames, max_frames, int(args.frame_select_seed), randomized=False)
+    elif mode == "pose_random_farthest":
+        keep = pose_diverse_frame_indices(frames, max_frames, int(args.frame_select_seed), randomized=True)
+    else:
+        keep = list(range(max_frames))
+    return [frames[i] for i in keep[:max_frames]]
 
 
 def projection_matrix(frame: dict) -> np.ndarray:
@@ -443,6 +506,7 @@ def write_arpose_tracker_proxy(
             "output_sparse_subdir": str(args.output_sparse_subdir),
             "frame_select": str(args.frame_select),
             "frame_stride": int(args.frame_stride),
+            "frame_select_seed": int(args.frame_select_seed),
             "matcher": str(args.matcher),
             "max_pair_gap": int(args.max_pair_gap),
             "feature_mask_mode": str(args.feature_mask_mode),
@@ -556,8 +620,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input_sparse_subdir", default="sparse/0")
     parser.add_argument("--output_sparse_subdir", default="sparse_slam/0")
     parser.add_argument("--max_frames", type=int, default=18)
-    parser.add_argument("--frame_select", choices=["first", "uniform", "stride"], default="first")
+    parser.add_argument(
+        "--frame_select",
+        choices=["first", "uniform", "stride", "random", "random_uniform", "pose_farthest", "pose_random_farthest"],
+        default="first",
+    )
     parser.add_argument("--frame_stride", type=int, default=1)
+    parser.add_argument("--frame_select_seed", type=int, default=42)
     parser.add_argument("--max_features", type=int, default=4096)
     parser.add_argument("--feature_mask_mode", choices=["none", "mask"], default="none")
     parser.add_argument("--matcher", choices=["exhaustive", "sequential"], default="exhaustive")

@@ -31,6 +31,7 @@ TRIANGULATE_OVERWRITE="${TRIANGULATE_OVERWRITE:-1}"
 MAX_FRAMES="${MAX_FRAMES:-18}"
 FRAME_SELECT="${FRAME_SELECT:-first}"
 FRAME_STRIDE="${FRAME_STRIDE:-1}"
+FRAME_SELECT_SEED="${FRAME_SELECT_SEED:-42}"
 POINT_COUNT="${POINT_COUNT:-1500}"
 MIN_PRIOR_POINTS="${MIN_PRIOR_POINTS:-200}"
 TOPK_SPECS="${TOPK_SPECS:-12000}"
@@ -73,6 +74,7 @@ if [[ "${RUN_TRIANGULATE}" == "1" ]]; then
     --max_frames "${MAX_FRAMES}" \
     --frame_select "${FRAME_SELECT}" \
     --frame_stride "${FRAME_STRIDE}" \
+    --frame_select_seed "${FRAME_SELECT_SEED}" \
     --max_features "${TRI_MAX_FEATURES:-4096}" \
     --feature_mask_mode "${TRI_FEATURE_MASK_MODE:-none}" \
     --matcher "${TRI_MATCHER:-exhaustive}" \
@@ -105,6 +107,7 @@ if [[ "${RUN_BUILD}" == "1" ]]; then
     --max_frames "${MAX_FRAMES}" \
     --frame_select "${FRAME_SELECT}" \
     --frame_stride "${FRAME_STRIDE}" \
+    --frame_select_seed "${FRAME_SELECT_SEED}" \
     --point_count "${POINT_COUNT}" \
     --min_prior_points "${MIN_PRIOR_POINTS}" \
     --seed 42 \

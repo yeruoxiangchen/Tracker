@@ -26,20 +26,42 @@ fi
 
 RUN_TRIANGULATE="${RUN_TRIANGULATE:-1}"
 RUN_BUILD="${RUN_BUILD:-1}"
-RUN_EVAL="${RUN_EVAL:-1}"
+RUN_EVAL="${RUN_EVAL:-0}"
+RUN_RECONSTRUCT_POSE="${RUN_RECONSTRUCT_POSE:-0}"
 PRIOR_SOURCE="${PRIOR_SOURCE:-colmap_points}"
 NORMALIZATION_SOURCE="${NORMALIZATION_SOURCE:-prior_bbox}"
 ALLOW_MODEL_FALLBACK="${ALLOW_MODEL_FALLBACK:-0}"
 MAX_FRAMES="${MAX_FRAMES:-32}"
-FRAME_SELECT="${FRAME_SELECT:-uniform}"
+FRAME_SELECT="${FRAME_SELECT:-pose_random_farthest}"
 FRAME_STRIDE="${FRAME_STRIDE:-1}"
+FRAME_SELECT_SEED="${FRAME_SELECT_SEED:-42}"
 POINT_COUNT="${POINT_COUNT:-1500}"
 MIN_PRIOR_POINTS="${MIN_PRIOR_POINTS:-40}"
-TOPK_SPECS="${TOPK_SPECS:-6000,12000,16000}"
+TOPK_SPECS="${TOPK_SPECS:-8192,12000,16000}"
 MODES="${MODES:-stock_sparse,stage2_correct}"
 MESH_EVAL_SAMPLES="${MESH_EVAL_SAMPLES:-2000}"
 SPARSE_SUBDIR="${SPARSE_SUBDIR:-sparse_arproxy_streaming/0}"
-TRI_INPUT_SPARSE_SUBDIR="${TRI_INPUT_SPARSE_SUBDIR:-sparse/0}"
+POSE_SPARSE_SUBDIR="${POSE_SPARSE_SUBDIR:-sparse_colmap_arproxy/0}"
+TRI_INPUT_SPARSE_SUBDIR="${TRI_INPUT_SPARSE_SUBDIR:-}"
+if [[ -z "${TRI_INPUT_SPARSE_SUBDIR}" ]]; then
+  if [[ "${RUN_RECONSTRUCT_POSE}" == "1" ]]; then
+    TRI_INPUT_SPARSE_SUBDIR="${POSE_SPARSE_SUBDIR}"
+  else
+    TRI_INPUT_SPARSE_SUBDIR="sparse/0"
+  fi
+fi
+
+COLMAP_MAX_FRAMES="${COLMAP_MAX_FRAMES:-${MAX_FRAMES}}"
+COLMAP_FRAME_SELECT="${COLMAP_FRAME_SELECT:-random_uniform}"
+COLMAP_FRAME_STRIDE="${COLMAP_FRAME_STRIDE:-1}"
+COLMAP_FRAME_SELECT_SEED="${COLMAP_FRAME_SELECT_SEED:-${FRAME_SELECT_SEED}}"
+COLMAP_MATCHER="${COLMAP_MATCHER:-sequential}"
+COLMAP_SEQUENTIAL_OVERLAP="${COLMAP_SEQUENTIAL_OVERLAP:-8}"
+COLMAP_MAX_FEATURES="${COLMAP_MAX_FEATURES:-4096}"
+COLMAP_USE_MASKS="${COLMAP_USE_MASKS:-0}"
+COLMAP_USE_GPU="${COLMAP_USE_GPU:-0}"
+COLMAP_WORK_SUBDIR="${COLMAP_WORK_SUBDIR:-colmap_arproxy_work}"
+COLMAP_BIN="${COLMAP_BIN:-colmap}"
 
 TRI_MATCHER="${TRI_MATCHER:-sequential}"
 TRI_MAX_PAIR_GAP="${TRI_MAX_PAIR_GAP:-4}"
@@ -54,7 +76,7 @@ TRI_MIN_SUPPORT_RATIO="${TRI_MIN_SUPPORT_RATIO:-0.10}"
 export ROOT PY GPU RUN_NAME OUT_ROOT
 export RUN_TRIANGULATE RUN_BUILD RUN_EVAL
 export PRIOR_SOURCE NORMALIZATION_SOURCE ALLOW_MODEL_FALLBACK
-export MAX_FRAMES FRAME_SELECT FRAME_STRIDE POINT_COUNT MIN_PRIOR_POINTS
+export MAX_FRAMES FRAME_SELECT FRAME_STRIDE FRAME_SELECT_SEED POINT_COUNT MIN_PRIOR_POINTS
 export TOPK_SPECS MODES MESH_EVAL_SAMPLES SPARSE_SUBDIR TRI_INPUT_SPARSE_SUBDIR
 export TRI_MATCHER TRI_MAX_PAIR_GAP TRI_MAX_FEATURES TRI_FEATURE_MASK_MODE
 export TRI_ALLOW_PAIR_OUTSIDE_MASK TRI_MIN_PAIR_MATCHES TRI_MIN_OUTPUT_POINTS
@@ -73,7 +95,34 @@ export DATASETS="${DATASETS_JOINED}"
 echo "[ar_like_streaming_slam] run=${RUN_NAME}"
 echo "[ar_like_streaming_slam] datasets=${DATASETS}"
 echo "[ar_like_streaming_slam] frame_select=${FRAME_SELECT} max_frames=${MAX_FRAMES} matcher=${TRI_MATCHER} gap=${TRI_MAX_PAIR_GAP}"
+echo "[ar_like_streaming_slam] run_reconstruct_pose=${RUN_RECONSTRUCT_POSE} pose_sparse=${TRI_INPUT_SPARSE_SUBDIR}"
 echo "[ar_like_streaming_slam] output=${OUT_ROOT}/${RUN_NAME}"
+
+if [[ "${RUN_RECONSTRUCT_POSE}" == "1" ]]; then
+  COLMAP_EXTRA_ARGS=()
+  if [[ "${COLMAP_USE_MASKS}" == "1" ]]; then
+    COLMAP_EXTRA_ARGS+=(--use_masks)
+  fi
+  if [[ "${COLMAP_USE_GPU}" == "1" ]]; then
+    COLMAP_EXTRA_ARGS+=(--use_gpu)
+  fi
+  echo "[ar_like_streaming_slam] reconstruct COLMAP pose+points -> ${POSE_SPARSE_SUBDIR}"
+  "${PY}" -u "${ROOT}/trellis_point_prior_mv/reconstruct_colmap_slam_proxy.py" \
+    --datasets "${DATASET_ARGS[@]}" \
+    --output_sparse_subdir "${POSE_SPARSE_SUBDIR}" \
+    --work_subdir "${COLMAP_WORK_SUBDIR}" \
+    --max_frames "${COLMAP_MAX_FRAMES}" \
+    --frame_select "${COLMAP_FRAME_SELECT}" \
+    --frame_stride "${COLMAP_FRAME_STRIDE}" \
+    --seed "${COLMAP_FRAME_SELECT_SEED}" \
+    --matcher "${COLMAP_MATCHER}" \
+    --sequential_overlap "${COLMAP_SEQUENTIAL_OVERLAP}" \
+    --max_features "${COLMAP_MAX_FEATURES}" \
+    --colmap_bin "${COLMAP_BIN}" \
+    --overwrite \
+    --output_report "${OUT_ROOT}/${RUN_NAME}/colmap_reconstruction_report.json" \
+    "${COLMAP_EXTRA_ARGS[@]}"
+fi
 
 bash "${ROOT}/trellis_point_prior_mv/scripts/run_real_slam_prior_eval.sh"
 

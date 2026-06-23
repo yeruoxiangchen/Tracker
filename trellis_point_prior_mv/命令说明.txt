@@ -2783,7 +2783,7 @@ RUN_EVAL=1 \
 MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/manifest/manifest.json \
 INDICES=0-2 \
 MODES=stock_sparse,stage2_correct \
-TOPK_SPECS=6000,12000,16000 \
+TOPK_SPECS=8192,12000,16000 \
 MESH_EVAL_SAMPLES=2000 \
 bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 ```
@@ -2801,7 +2801,7 @@ RUN_EVAL=1 \
 MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v1/manifest/manifest.json \
 INDICES=all \
 MODES=stock_sparse,stage2_correct \
-TOPK_SPECS=6000,12000,16000 \
+TOPK_SPECS=8192,12000,16000 \
 MESH_EVAL_SAMPLES=2000 \
 bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 ```
@@ -2892,7 +2892,7 @@ RUN_EVAL=1 \
 MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_omni20_countcheck_v1/manifest/manifest.json \
 INDICES=all \
 MODES=stock_sparse,stage2_correct \
-TOPK_SPECS=6000,12000,16000 \
+TOPK_SPECS=8192,12000,16000 \
 MESH_EVAL_SAMPLES=2000 \
 bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 ```
@@ -2942,7 +2942,7 @@ MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam
 STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s1000_seed42/checkpoints/last.ckpt \
 INDICES=all \
 MODES=stock_sparse,stage2_correct \
-TOPK_SPECS=6000,12000,16000 \
+TOPK_SPECS=8192,12000,16000 \
 MESH_EVAL_SAMPLES=2000 \
 bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 ```
@@ -2965,4 +2965,240 @@ bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 OmniObject3D 小子集:
   与内部真实数据 trend 一致
   不依赖 full mask smoke
+```
+
+## 三十八、输入帧选择、RGB->SLAM pose 构建与 wrapper 默认策略修正
+
+时间：`2026-06-23 06:12:15 UTC`
+
+### 1. 数据构建注意事项
+
+对于图像帧较多的真实/大型数据集，不应该把所有帧都输入 TRELLIS/Stage2/mesh eval。原因：
+
+```text
+1. 帧数太多会显著增加条件编码和评估耗时；
+2. 连续相邻帧高度重复，不能有效增加物体覆盖；
+3. 简单平均抽帧可能刚好落在轨迹重复/遮挡/模糊段；
+4. 真实 AR 采集本质上也不是全帧输入，而是 keyframe / tracking map 输入。
+```
+
+现在支持的帧选择：
+
+```text
+first                 取前 N 帧，只适合 debug
+uniform               均匀抽帧，确定性强，但随机性不足
+random                全局随机，可能覆盖不均
+random_uniform        按时间分 bin，每个 bin 随机取一帧；适合无 pose 前的 RGB->SLAM
+pose_farthest         基于相机中心 farthest point sampling；适合已有 pose 后
+pose_random_farthest  farthest + 随机性；当前内部真实数据默认推荐
+stride                固定步长，适合已知帧率/轨迹稳定的视频
+```
+
+推荐：
+
+```text
+RGB video -> 离线 COLMAP/SLAM 估计 pose:
+  COLMAP_FRAME_SELECT=random_uniform
+
+已有 pose 后构建 Stage2 输入:
+  FRAME_SELECT=pose_random_farthest
+```
+
+构建数据集还需要注意：
+
+```text
+1. 每个样本至少保留 8-16 个有效 keyframes；
+2. 相机视角尽量覆盖目标物体 180-360 度，而不是集中在一个正面；
+3. 保留一定随机性，避免模型只适配固定轨迹；
+4. mask 要和 RGB 同尺寸同命名，边界过松会引入背景点，过紧会丢掉物体边缘；
+5. pose 和 point 坐标系必须一致；
+6. prior_bbox normalization 对局部点云敏感，要记录 normalization_scale；
+7. 每个样本都要记录 point_count / support / mask-hit / extent，用于后续拒绝坏 prior；
+8. 训练集应混合 strong/weak prior、strict/relaxed prior、不同点数和不同覆盖度；
+9. 评估集不能只看成功样本，要保留低纹理、遮挡、mask 质量差、点数少的失败样本；
+10. reference mesh 只用于 target/eval，不能参与 prior 构建。
+```
+
+### 2. wrapper 默认策略修改
+
+`run_ar_like_streaming_slam_eval.sh` 已修改默认值：
+
+```text
+RUN_TRIANGULATE=1
+RUN_BUILD=1
+RUN_EVAL=0
+TOPK_SPECS=8192,12000,16000
+FRAME_SELECT=pose_random_farthest
+```
+
+理由：
+
+```text
+1. 默认不跑 GPU mesh eval，避免内部 7 数据集第一次 smoke 过重；
+2. 6000 在真实 SLAM-like top-k sweep 中偏欠覆盖，不适合作 candidate 主集合；
+3. 8192/12000/16000 更适合作 rerank 候选；
+4. 6000 后续只保留为 fast smoke / low-cost diagnostic。
+```
+
+注意：当前机器没有检测到 `colmap` 可执行文件，所以 wrapper 默认仍允许用已有 `sparse/0` 做对照测试。正式 RGB->SLAM proxy 必须显式：
+
+```text
+RUN_RECONSTRUCT_POSE=1
+```
+
+### 3. 正式 RGB video -> COLMAP pose+points 构建
+
+该命令不复用已有 `sparse/0`，而是从 RGB 视频帧重新估计 pose + sparse map points：
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+RUN_NAME=ar_like_rgb_to_colmap_heimei_countcheck_v1 \
+RUN_RECONSTRUCT_POSE=1 \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+COLMAP_FRAME_SELECT=random_uniform \
+COLMAP_MAX_FRAMES=64 \
+COLMAP_MATCHER=sequential \
+COLMAP_SEQUENTIAL_OVERLAP=8 \
+COLMAP_MAX_FEATURES=4096 \
+COLMAP_USE_MASKS=0 \
+POSE_SPARSE_SUBDIR=sparse_colmap_arproxy_v1/0 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_from_colmap_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+如果系统没有 `colmap`，会报：
+
+```text
+COLMAP executable not found
+```
+
+这时需要先安装 COLMAP 或设置：
+
+```bash
+COLMAP_BIN=/path/to/colmap
+```
+
+### 4. 内部 7 数据集 countcheck 推荐命令
+
+使用已有 `sparse/0` 作为对照 pose，不跑 GPU eval：
+
+```bash
+cd /home/zjr/Tracker
+
+RUN_NAME=ar_like_streaming_internal7_countcheck_v2 \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_MAX_FEATURES=2048 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_v2/0 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 5. 内部 7 数据集 mesh eval 推荐命令
+
+countcheck 通过后再单独跑：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_internal7_mesh_eval_v2 \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_internal7_countcheck_v2/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000,16000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 6. OmniObject3D 子集策略修正
+
+OmniObject3D 转换器默认不再复制已有 sparse/transforms：
+
+```text
+POSE_POLICY=none
+```
+
+原因：正式 proxy 应该是：
+
+```text
+RGB video -> 离线 COLMAP/SLAM 估计 pose+points -> object point prior
+```
+
+而不是直接复用数据集自带 pose。自带 pose/transforms 只作为对照或 fallback：
+
+```bash
+POSE_POLICY=copy_if_available
+```
+
+推荐 OmniObject3D 准备命令：
+
+```bash
+cd /home/zjr/Tracker
+
+OMNI_SOURCE_ROOT=/data/OmniObject3D \
+OMNI_OUTPUT_ROOT=/data/trellis_point_prior_mv/omniobject3d_subset \
+POSE_POLICY=none \
+MAX_OBJECTS=20 \
+MAX_FRAMES=64 \
+MIN_FRAMES=16 \
+OVERWRITE=1 \
+bash trellis_point_prior_mv/scripts/prepare_omniobject3d_subset.sh
+```
+
+随后对 Omni 子集做 RGB->COLMAP pose+points：
+
+```bash
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OMNI_DATASETS=$($PY - <<'PY'
+import json
+from pathlib import Path
+p = Path('/data/trellis_point_prior_mv/omniobject3d_subset/dataset_manifest.json')
+d = json.loads(p.read_text())
+print(':'.join(d['datasets']))
+PY
+)
+
+DATASETS="$OMNI_DATASETS" \
+RUN_NAME=ar_like_rgb_to_colmap_omni20_countcheck_v1 \
+RUN_RECONSTRUCT_POSE=1 \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+COLMAP_FRAME_SELECT=random_uniform \
+COLMAP_MAX_FRAMES=64 \
+COLMAP_MATCHER=sequential \
+COLMAP_SEQUENTIAL_OVERLAP=8 \
+POSE_SPARSE_SUBDIR=sparse_colmap_arproxy_v1/0 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_from_colmap_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
 ```
