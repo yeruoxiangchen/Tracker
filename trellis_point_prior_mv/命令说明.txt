@@ -3413,3 +3413,1977 @@ RGB/mask video
 ```
 
 这样 Stage2 训练和 eval 不需要改格式，只需要替换 pose+points 的来源。
+
+### 6. 当前新增 guard 和诊断字段
+
+`run_ar_like_streaming_slam_eval.sh` 现在增加了几个硬 guard：
+
+```text
+1. PRIOR_BRANCH=colmap_direct 且 RUN_RECONSTRUCT_POSE=0 时：
+   会提前检查每个 DATASET 的 ${SPARSE_SUBDIR}/points3D.txt 是否存在。
+
+2. RUN_TRIANGULATE=1 时：
+   如果 SPARSE_SUBDIR == TRI_INPUT_SPARSE_SUBDIR，会提前退出，避免覆盖输入 sparse。
+
+3. RUN_RECONSTRUCT_POSE=1 时：
+   shell 层先检查 COLMAP_BIN 是否存在，不再等 Python 深处报错。
+
+4. COLMAP_OVERWRITE 控制是否覆盖 COLMAP 输出：
+   COLMAP_OVERWRITE=1 适合 smoke；
+   COLMAP_OVERWRITE=0 适合正式批量实验，避免误删已有 reconstruction。
+```
+
+COLMAP reconstruction report 现在额外记录：
+
+```text
+registered_image_count
+registered_ratio
+points3D_count
+mean_reprojection_error
+camera_count
+sparse_model_count
+intrinsics_source
+camera_model
+camera_params
+fix_intrinsics
+```
+
+默认最低质量 guard：
+
+```bash
+COLMAP_MIN_REGISTERED_IMAGES=8
+COLMAP_MIN_POINTS3D=100
+```
+
+如果想跑特别小的 smoke，可以显式调低：
+
+```bash
+COLMAP_MIN_REGISTERED_IMAGES=4 \
+COLMAP_MIN_POINTS3D=20
+```
+
+`build_real_slam_prior_manifest.py` 现在也会优先从 `sparse_subdir/images.txt` 已注册图像中选帧，避免 `MAX_FRAMES/FRAME_SELECT` 从原始全量 images 中选到 COLMAP 没注册的帧。build report 新增：
+
+```text
+frame_image_mask_pair_count
+frame_registered_image_count
+frame_registered_pair_count
+frame_unregistered_pair_count
+frame_requested_count
+frame_unmatched_count
+frame_selection_source
+frame_unmatched_names
+frame_unregistered_names
+```
+
+如果 `frame_registered_pair_count` 很低，说明 COLMAP/SLAM 注册帧不足；如果 `projection_matched_frame_count` 明显低于 `frame_requested_count`，说明 sparse pose/image name/mask 仍有对不齐问题。
+
+---
+
+## 四十、heimei direct/streaming 后续评测命令
+
+时间：2026-06-23 UTC
+
+目标：
+
+```text
+1. 对比 heimei existing sparse direct vs existing sparse streaming；
+2. 对比 RGB->COLMAP direct vs RGB->COLMAP streaming；
+3. 为后续 candidate rerank 选择 top-k 主候选。
+```
+
+### 1. heimei direct existing sparse mesh eval
+
+使用已有 `heimei/sparse/0/points3D.txt` 直接作为 COLMAP points prior，经 mask/pose filter 后进入 Stage2。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_direct_heimei_existing_sparse_mesh_eval_v1 \
+PRIOR_BRANCH=colmap_direct \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_existing_sparse_countcheck_v1/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000,16000 \
+MESH_EVAL_SAMPLES=4000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_direct_heimei_existing_sparse_mesh_eval_v1/mesh_eval/report.json
+```
+
+### 2. heimei streaming existing sparse mesh eval
+
+使用已有 `heimei/sparse/0` 的 pose，重新执行 streaming pair triangulation 得到 object prior。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_heimei_existing_sparse_mesh_eval_v1 \
+PRIOR_BRANCH=streaming \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_existing_sparse_countcheck_v1/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000,16000 \
+MESH_EVAL_SAMPLES=4000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_existing_sparse_mesh_eval_v1/mesh_eval/report.json
+```
+
+### 3. heimei RGB->COLMAP direct 64 帧 countcheck
+
+从 RGB 重新跑 COLMAP，直接使用 COLMAP 原生 `points3D.txt` 作为 prior 来源。
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+RUN_NAME=ar_like_colmap_direct_heimei_rgb64_countcheck_v1 \
+PRIOR_BRANCH=colmap_direct \
+RUN_RECONSTRUCT_POSE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+COLMAP_FRAME_SELECT=random_uniform \
+COLMAP_MAX_FRAMES=64 \
+COLMAP_MATCHER=sequential \
+COLMAP_SEQUENTIAL_OVERLAP=8 \
+COLMAP_MAX_FEATURES=4096 \
+COLMAP_INTRINSICS_SOURCE=auto \
+COLMAP_FIX_INTRINSICS=1 \
+COLMAP_MIN_REGISTERED_IMAGES=8 \
+COLMAP_MIN_POINTS3D=100 \
+COLMAP_OVERWRITE=1 \
+POSE_SPARSE_SUBDIR=sparse_colmap_arproxy_rgb64_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_rgb64_countcheck_v1/colmap_reconstruction_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_rgb64_countcheck_v1/manifest/build_report.json
+```
+
+### 4. heimei RGB->COLMAP streaming 64 帧 countcheck
+
+复用上一条命令生成的 COLMAP pose，不重复重建 COLMAP；仅重新做 streaming pair triangulation。
+
+```bash
+cd /home/zjr/Tracker
+
+DATASETS=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+RUN_NAME=ar_like_streaming_heimei_rgb64_countcheck_v1 \
+PRIOR_BRANCH=streaming \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+TRI_INPUT_SPARSE_SUBDIR=sparse_colmap_arproxy_rgb64_v1/0 \
+SPARSE_SUBDIR=sparse_arproxy_streaming_from_colmap_rgb64_v1/0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_rgb64_countcheck_v1/slam_like_points_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_rgb64_countcheck_v1/manifest/build_report.json
+```
+
+### 5. RGB->COLMAP direct mesh eval
+
+只有在第 3 步 countcheck 通过后再跑。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_colmap_direct_heimei_rgb64_mesh_eval_v1 \
+PRIOR_BRANCH=colmap_direct \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_rgb64_countcheck_v1/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000,16000 \
+MESH_EVAL_SAMPLES=4000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 6. RGB->COLMAP streaming mesh eval
+
+只有在第 4 步 countcheck 通过后再跑。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=ar_like_streaming_heimei_rgb64_mesh_eval_v1 \
+PRIOR_BRANCH=streaming \
+RUN_RECONSTRUCT_POSE=0 \
+RUN_TRIANGULATE=0 \
+RUN_BUILD=0 \
+RUN_EVAL=1 \
+MANIFEST=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_rgb64_countcheck_v1/manifest/manifest.json \
+INDICES=all \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000,16000 \
+MESH_EVAL_SAMPLES=4000 \
+bash trellis_point_prior_mv/scripts/run_ar_like_streaming_slam_eval.sh
+```
+
+### 判断标准
+
+重点比较：
+
+```text
+1. direct vs streaming 的 source_point_count / prior_point_count；
+2. projection_mask_hit_over_inside_mean；
+3. ref_norm_chamfer_l2_mean；
+4. prior_norm_chamfer_l2_mean；
+5. extent_ratio；
+6. vertex_count / face_count。
+```
+
+如果 direct mesh 明显更好，第一版真实 proxy 可以优先用 COLMAP 原生 points；
+如果 streaming mesh 更稳，后续手机端 AR/SLAM point map 更值得按 streaming object-prior 方向实现。
+
+## 四十一、2026-06-23 AR 手机 session smoke 流程
+
+目标：使用 `trellis_point_prior_mv/server.py` 采集出来的手机 AR session，或显式传入已有 session 目录，构建真实流程的 point-prior smoke：
+
+```text
+手机 RGB / mask / AR pose
+-> trellis_point_prior_mv 下整理成独立 dataset
+-> sparse/0 写入手机 pose
+-> pose_streaming: 用 pose+mask 离线三角化 object points
+-> ar_direct: 使用前端上传的 ARFoundation point cloud
+-> build_real_slam_prior_manifest
+-> 可选 Stage2 mesh eval
+```
+
+### 0. server.py 保存前端点云
+
+`ARposeTTracker.cs` 已新增 `ARPointCloudManager pointCloudManager` 和 `slam_points_json` 上传字段。`trellis_point_prior_mv/server.py` 已接入保存逻辑，会把每帧点云写入：
+
+```text
+trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/slam_points.jsonl
+```
+
+原 `CoarseModel/connect/server.py` 不包含 point-prior hook，不影响原 ReconViaGen + CoarseModel 流程。如果没有上传点云，也可以跑 `pose_streaming` 分支，它只需要 RGB、mask 和手机 pose。
+
+### 1. 当前/指定 session 的 pose-streaming countcheck
+
+先在原 `server.py` 流程里完成录制和 SAM2 分割，确保：
+
+```text
+/home/zjr/Tracker/ReconViaGen/ar_tracker/data/<SESSION_ID>/poses.txt
+/home/zjr/Tracker/ReconViaGen/ar_tracker/masks/<SESSION_ID>/frame_XXXX.png
+```
+
+然后运行：
+
+```bash
+cd /home/zjr/Tracker
+
+SESSION_ID=<替换成当前session_id> \
+RUN_NAME=ar_session_<替换成当前session_id>_pose_streaming_countcheck_v1 \
+PRIOR_BRANCH=pose_streaming \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_<替换成当前session_id>_pose_streaming_countcheck_v1/prepare/prepare_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_<替换成当前session_id>_pose_streaming_countcheck_v1/slam_like_points_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_<替换成当前session_id>_pose_streaming_countcheck_v1/manifest/build_report.json
+```
+
+重点看：
+
+```text
+final_point_count
+source_point_count
+prior_point_count
+projection_any_mask_hit_ratio
+projection_mask_hit_over_inside_mean
+projection_support_mean
+normalization_scale
+```
+
+### 2. 当前/指定 session 的 AR direct countcheck
+
+前提：`server.py` 已接入第 0 步 hook，并且 session data 目录里存在：
+
+```text
+/home/zjr/Tracker/ReconViaGen/ar_tracker/data/<SESSION_ID>/slam_points.jsonl
+```
+
+运行：
+
+```bash
+cd /home/zjr/Tracker
+
+SESSION_ID=<替换成当前session_id> \
+RUN_NAME=ar_session_<替换成当前session_id>_ar_direct_countcheck_v1 \
+PRIOR_BRANCH=ar_direct \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_<替换成当前session_id>_ar_direct_countcheck_v1/prepare/prepare_report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_<替换成当前session_id>_ar_direct_countcheck_v1/manifest/build_report.json
+```
+
+### 3. countcheck 通过后的轻量 mesh smoke
+
+以 pose-streaming 为例：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+SESSION_ID=<替换成当前session_id> \
+RUN_NAME=ar_session_<替换成当前session_id>_pose_streaming_mesh_v1 \
+PRIOR_BRANCH=pose_streaming \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=1 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MATCHER=sequential \
+TRI_MAX_PAIR_GAP=4 \
+TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+TRI_MIN_PAIR_MATCHES=8 \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_<替换成当前session_id>_pose_streaming_mesh_v1/mesh_eval/report.json
+```
+
+注意：真实手机 session 通常没有 GT mesh，因此 `ref_norm_*` 指标会关闭；这一步主要看 mesh 是否能生成、`prior_norm_*`、extent、vertex/face 数量和可视化 OBJ。
+
+## 四十二、2026-06-23 独立 trellis_point_prior_mv/server.py
+
+现在已经把 `CoarseModel/connect/server.py` 复制并改造成：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/server.py
+```
+
+它保留原手机端 API：
+
+```text
+/start_record
+/upload
+/preprocess
+/get_frame/<id>
+/add_seg_point
+/segment_frame/<id>
+/approve_seed_frame/<id>
+/run_segmentation
+/input_qc
+/generate
+```
+
+区别：
+
+```text
+1. 代码入口在 trellis_point_prior_mv 下；
+2. /upload 会额外保存前端上传的 ARFoundation point cloud 到 slam_points.jsonl；
+3. 原 CoarseModel/connect/server.py 不再包含 point-prior hook，不影响原 ReconViaGen + CoarseModel 流程；
+4. runtime 目录是 trellis_point_prior_mv/ar_tracker；
+5. /generate 不启动 ReconViaGen/run_local.py，也不做 CoarseModel 后处理；
+6. 默认 TPP_GENERATE_ENABLED=0，只保存采集/分割数据；需要显式设为 1 才调用 trellis_point_prior_mv 当前 point-prior 模型生成 mesh。
+```
+
+### 1. 启动独立 server
+
+如果不运行原 `CoarseModel/connect/server.py`，直接用 5000 端口：
+
+```bash
+cd /home/zjr/Tracker
+
+bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+```
+
+等价显式写法：
+
+```bash
+cd /home/zjr/Tracker
+
+PORT=5000 \
+bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+```
+
+如果原 `CoarseModel/connect/server.py` 还在 5000 端口运行，不要并行抢同一个端口。可以改用 5001，同时 Unity 里的 `serverURL` 改成对应端口：
+
+```bash
+cd /home/zjr/Tracker
+
+PORT=5001 \
+bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+```
+
+### 1.1 server /generate 默认行为
+
+按下手机端“确认生成”后，默认只写采集完成报告，不跑模型：
+
+```text
+trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/trellis_point_prior_capture_report.json
+```
+
+这个 report 会包含后续离线测试命令、session_data_dir、session_mask_dir、是否存在 slam_points.jsonl、QC 结果和筛选后的帧序号。
+
+如果要让手机端点击“确认生成”时直接跑当前 point-prior 模型，需要显式启动：
+
+```bash
+cd /home/zjr/Tracker
+
+PORT=5000 \
+TPP_GENERATE_ENABLED=1 \
+TPP_GPU=4 \
+bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+```
+
+生成模式默认参数：
+
+```text
+TPP_PRIOR_BRANCH=auto
+  有 slam_points.jsonl -> ar_direct
+  无 slam_points.jsonl -> pose_streaming
+TPP_MODES=stage2_correct
+TPP_TOPK_SPECS=12000
+TPP_MAX_FRAMES=32
+TPP_FRAME_SELECT=pose_random_farthest
+TPP_OUT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_server
+```
+
+可通过环境变量修改，例如：
+
+```bash
+cd /home/zjr/Tracker
+
+PORT=5000 \
+TPP_GENERATE_ENABLED=1 \
+TPP_GPU=4 \
+TPP_PRIOR_BRANCH=ar_direct \
+TPP_TOPK_SPECS=8192,12000 \
+TPP_MODES=stage2_correct \
+bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+```
+
+### 2. 前端 Unity 需要确认
+
+`ARposeTTracker.cs` 已新增：
+
+```text
+ARPointCloudManager pointCloudManager
+uploadSlamPoints
+maxSlamPointsPerFrame
+slamPointStride
+```
+
+在 Unity Inspector 里需要把场景里的 `AR Point Cloud Manager` 拖到 `pointCloudManager` 字段。否则 server 仍能采集 RGB/pose，但不会生成：
+
+```text
+trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/slam_points.jsonl
+```
+
+### 3. 独立 server 采集完成后的 point-prior smoke
+
+完成录制、点选、视频分割后，server 会有：
+
+```text
+trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/poses.txt
+trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/slam_points.jsonl   # 如果前端已上传点云
+trellis_point_prior_mv/ar_tracker/masks/<SESSION_ID>/frame_XXXX.png
+```
+
+先跑 pose-streaming 分支：
+
+```bash
+cd /home/zjr/Tracker
+
+SESSION_ID=<替换成当前session_id> \
+SESSION_DATA_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/<替换成当前session_id> \
+SESSION_MASK_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/masks/<替换成当前session_id> \
+RUN_NAME=ar_session_<替换成当前session_id>_pose_streaming_countcheck_v1 \
+PRIOR_BRANCH=pose_streaming \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+TRI_MIN_OUTPUT_POINTS=20 \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+再跑 AR direct 分支：
+
+```bash
+cd /home/zjr/Tracker
+
+SESSION_ID=<替换成当前session_id> \
+SESSION_DATA_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/<替换成当前session_id> \
+SESSION_MASK_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/masks/<替换成当前session_id> \
+RUN_NAME=ar_session_<替换成当前session_id>_ar_direct_countcheck_v1 \
+PRIOR_BRANCH=ar_direct \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=0 \
+MAX_FRAMES=32 \
+FRAME_SELECT=pose_random_farthest \
+MIN_PRIOR_POINTS=20 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+## 四十三、2026-06-24 四组手机 AR session 格式检查与测试命令
+
+本次 `bash trellis_point_prior_mv/scripts/run_ar_session_server.sh` 采集到 5 个 data 目录，其中 4 个已经完成 `/generate` capture-only finalize，并写入 `trellis_point_prior_capture_report.json`；最后一个 `20260624_012428_904` 没有 report，当前视为未完成/未确认生成。
+
+四个可测试 session：
+
+```text
+20260624_010530_849
+  images=55, poses=55, masks=55, slam_jsonl_lines=55, slam_points_total=7657, qc=True
+  selected=[3,4,5,10,12,13,16,17,18,24,25,27,29,33,34,52,53,54]
+
+20260624_011149_207
+  images=41, poses=41, masks=41, slam_jsonl_lines=41, slam_points_total=4705, qc=True
+  selected=[4,5,6,10,11,12,13,14,16,21,23,24,25,26,31,32,38,39]
+
+20260624_011450_447
+  images=18, poses=18, masks=18, slam_jsonl_lines=18, slam_points_total=1440, qc=True
+  selected=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]
+
+20260624_011933_843
+  images=67, poses=67, masks=67, slam_jsonl_lines=67, slam_points_total=13218, qc=True
+  selected=[0,1,5,6,15,17,20,21,31,38,40,54,59,61,62,63,64,66]
+```
+
+结论：格式是合适的。四组都有 RGB、`poses.txt`、最终 mask、`slam_points.jsonl` 和 capture report；AR direct point prior 可以进入当前构建脚本。
+
+已完成 `ar_direct` 非 GPU countcheck：
+
+```text
+20260624_010530_849: frames=18, source_points=2810, prior=565,  mask_any=0.986, hit_inside=0.326, support=3.61
+20260624_011149_207: frames=18, source_points=2025, prior=302,  mask_any=0.997, hit_inside=0.270, support=3.99
+20260624_011450_447: frames=18, source_points=278,  prior=100,  mask_any=1.000, hit_inside=0.430, support=7.45
+20260624_011933_843: frames=18, source_points=9811, prior=1500, mask_any=0.996, hit_inside=0.374, support=5.26
+```
+
+其中 `20260624_011933_843` 点云最密、prior 达到 1500 上限，最适合先做 mesh smoke；`20260624_011450_447` 点较少，但投影支持很强，适合做低点数压力测试。
+
+### 1. 重新跑四组 AR direct countcheck
+
+不占 GPU，只检查 AR 点云、pose、mask 是否能构建 point prior：
+
+```bash
+cd /home/zjr/Tracker
+
+for SID in \
+  20260624_010530_849 \
+  20260624_011149_207 \
+  20260624_011450_447 \
+  20260624_011933_843; do
+  SELECTED=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; r=json.load(open('/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/'+'$SID'+'/trellis_point_prior_capture_report.json')); print(','.join(map(str,r['filtered_selected_indices'])))")
+
+  SESSION_DATA_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/$SID \
+  SESSION_MASK_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/masks/$SID \
+  SELECTED_INDICES=$SELECTED \
+  RUN_NAME=ar_session_${SID}_ar_direct_countcheck_v1 \
+  PRIOR_BRANCH=ar_direct \
+  RUN_PREPARE=1 \
+  RUN_BUILD=1 \
+  RUN_EVAL=0 \
+  MAX_FRAMES=18 \
+  FRAME_SELECT=pose_random_farthest \
+  MIN_PRIOR_POINTS=20 \
+  bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+done
+```
+
+查看结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_ar_direct_countcheck_v1/manifest/build_report.json
+```
+
+### 2. 跑 pose-streaming 对照 countcheck
+
+这条不直接用 ARFoundation 点云，而是用手机 pose + mask 离线 SIFT 三角化 object-like points。它用于回答：手机直接返回的 AR 点云更好，还是图像特征三角化 proxy 更好。
+
+```bash
+cd /home/zjr/Tracker
+
+for SID in \
+  20260624_010530_849 \
+  20260624_011149_207 \
+  20260624_011450_447 \
+  20260624_011933_843; do
+  SELECTED=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; r=json.load(open('/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/'+'$SID'+'/trellis_point_prior_capture_report.json')); print(','.join(map(str,r['filtered_selected_indices'])))")
+
+  SESSION_DATA_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/$SID \
+  SESSION_MASK_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/masks/$SID \
+  SELECTED_INDICES=$SELECTED \
+  RUN_NAME=ar_session_${SID}_pose_streaming_countcheck_v1 \
+  PRIOR_BRANCH=pose_streaming \
+  RUN_PREPARE=1 \
+  RUN_BUILD=1 \
+  RUN_EVAL=0 \
+  MAX_FRAMES=18 \
+  FRAME_SELECT=pose_random_farthest \
+  TRI_MATCHER=sequential \
+  TRI_MAX_PAIR_GAP=4 \
+  TRI_ALLOW_PAIR_OUTSIDE_MASK=1 \
+  TRI_MIN_PAIR_MATCHES=8 \
+  TRI_MIN_OUTPUT_POINTS=20 \
+  MIN_PRIOR_POINTS=20 \
+  bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+done
+```
+
+### 3. 先跑最推荐的一组 mesh smoke
+
+先用点云最密的 `20260624_011933_843`，只跑 AR direct：
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+SELECTED=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; r=json.load(open('/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/'+'$SID'+'/trellis_point_prior_capture_report.json')); print(','.join(map(str,r['filtered_selected_indices'])))")
+
+GPU=4 \
+SESSION_DATA_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/$SID \
+SESSION_MASK_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/masks/$SID \
+SELECTED_INDICES=$SELECTED \
+RUN_NAME=ar_session_${SID}_ar_direct_mesh_smoke_v1 \
+PRIOR_BRANCH=ar_direct \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=1 \
+MAX_FRAMES=18 \
+FRAME_SELECT=pose_random_farthest \
+MIN_PRIOR_POINTS=20 \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+查看 mesh 和 report：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_ar_direct_mesh_smoke_v1/mesh_eval/report.json
+find /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_ar_direct_mesh_smoke_v1/mesh_eval -name 'mesh.obj' -print
+```
+
+注意：这些真实手机 session 没有 GT mesh，`ref_norm_*` 指标会关闭；重点看 mesh 是否能正常生成、`prior_norm_*`、extent、顶点/面数，以及 OBJ 可视化。
+
+### 4. 低点数压力测试
+
+`20260624_011450_447` 只有 100 个 voxel prior，但 mask 支持强，适合验证模型对稀疏 AR 点云的下限：
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011450_447
+SELECTED=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json; r=json.load(open('/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/'+'$SID'+'/trellis_point_prior_capture_report.json')); print(','.join(map(str,r['filtered_selected_indices'])))")
+
+GPU=4 \
+SESSION_DATA_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/$SID \
+SESSION_MASK_DIR=/home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/masks/$SID \
+SELECTED_INDICES=$SELECTED \
+RUN_NAME=ar_session_${SID}_ar_direct_sparse_mesh_smoke_v1 \
+PRIOR_BRANCH=ar_direct \
+RUN_PREPARE=1 \
+RUN_BUILD=1 \
+RUN_EVAL=1 \
+MAX_FRAMES=18 \
+FRAME_SELECT=pose_random_farthest \
+MIN_PRIOR_POINTS=20 \
+MODES=stock_sparse,stage2_correct \
+TOPK_SPECS=8192,12000 \
+MESH_EVAL_SAMPLES=2000 \
+bash trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+
+
+  bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+
+  等价于：
+
+  PORT=5000 \
+  TPP_GENERATE_ENABLED=0 \
+  bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+
+  默认行为：
+
+  - 手机端录制 RGB / pose / intrinsics / AR point cloud
+  - 交互分割
+  - 点击“确认生成”后，不跑模型
+  - 只保存采集完成报告：
+
+  /home/zjr/Tracker/trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/trellis_point_prior_capture_report.json
+
+  数据位置：
+
+  trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/poses.txt
+  trellis_point_prior_mv/ar_tracker/data/<SESSION_ID>/slam_points.jsonl
+  trellis_point_prior_mv/ar_tracker/masks/<SESSION_ID>/frame_XXXX.png
+
+如果之后想让手机端点击“确认生成”时直接跑当前模型，再显式打开：
+
+  PORT=5000 \
+  TPP_GENERATE_ENABLED=1 \
+  TPP_GPU=4 \
+  bash trellis_point_prior_mv/scripts/run_ar_session_server.sh
+
+## 四十四、2026-06-24 Stage2 sparse 诊断与 eval-time sparse filter 命令
+
+本节用于验证：
+
+```text
+1. 黑色碎片是否来自 Stage2 sparse coords 本身碎；
+2. unsupported sparse coords 是否会被冻结 slat/mesh 放大成黑色碎片；
+3. topk=4096 + sparse filter 是否能在不重训的情况下改善 mesh。
+```
+
+本轮新增代码：
+
+```text
+trellis_point_prior_mv/sparse_coord_tools.py
+trellis_point_prior_mv/eval_real_slam_stage2_sparse_diagnostics.py
+trellis_point_prior_mv/run_real_slam_prior_mesh.py
+trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+### 1. 四组手机 AR session 的 Stage2 sparse-level 诊断
+
+这一步不跑 slat/mesh，只输出 Stage2 sparse coords 的连通块、prior 距离和 mask 投影支持。
+
+```bash
+cd /home/zjr/Tracker
+
+for SID in \
+  20260624_010530_849 \
+  20260624_011149_207 \
+  20260624_011450_447 \
+  20260624_011933_843; do
+
+  CUDA_VISIBLE_DEVICES=4 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_real_slam_stage2_sparse_diagnostics.py \
+    --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+    --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_stage2_sparse_diag_v1 \
+    --weights microsoft/TRELLIS-image-large \
+    --indices all \
+    --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+    --stage2_topk_specs 4096,6000,8192,12000 \
+    --filter_specs 'none;largest_component;largest_component,prior_radius;largest_component,prior_radius,projection_support' \
+    --filter_prior_radius 4.0 \
+    --filter_min_component_size 64 \
+    --filter_min_support_views 1 \
+    --filter_min_support_ratio 0.0 \
+    --steps 12 \
+    --guidance_strength 1.0 \
+    --known_latent_clamp_strength 1.0 \
+    --known_clamp_start_t 0.5 \
+    --known_logit_boost 0.0 \
+    --known_conf_power 1.0 \
+    --lora_rank 64 \
+    --lora_alpha 128
+done
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_sparse_diag_v1/report.json
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_sparse_diag_v1/report.csv
+```
+
+重点看：
+
+```text
+raw_component_count
+raw_largest_component_ratio
+raw_projection_keep_ratio
+final_component_count
+final_largest_component_ratio
+final_projection_keep_ratio
+sparse_filter_total_keep_ratio
+```
+
+判断：
+
+```text
+如果 raw sparse 已经 component 很多、largest 很低：
+  问题在 Stage2 sparse 本身；
+
+如果 raw sparse 还可以，但进 slat 后 mesh 碎：
+  问题更偏 frozen slat/mesh decoder OOD；
+
+如果 projection_support filter 后 final sparse 明显变干净：
+  说明 unsupported sparse coords 是黑色碎片主因之一。
+```
+
+### 2. dense session filtered mesh smoke
+
+先只测点云最密的 `20260624_011933_843`，因为它是唯一一个 Stage2 有相对可分析结果的真实手机 session。
+
+```bash
+cd /home/zjr/Tracker
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_filtered_largest_prior_support_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_sparse_filter largest_component,prior_radius,projection_support \
+  --filter_prior_radius 4.0 \
+  --filter_min_component_size 64 \
+  --filter_min_support_views 1 \
+  --filter_min_support_ratio 0.0 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_filtered_largest_prior_support_mesh_v1/report.json
+find /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_filtered_largest_prior_support_mesh_v1 -name 'mesh.obj' -print
+```
+
+重点比较上一轮未过滤结果：
+
+```text
+未过滤 stage2_correct_4096:
+  prior chamfer = 0.0056
+  black ratio = 26.0%
+  component count = 394
+  largest component ratio = 58.3%
+
+过滤后重点看：
+  stage2_final_sparse_component_count
+  stage2_final_sparse_largest_component_ratio
+  stage2_final_sparse_projection_keep_ratio
+  coord_count
+  prior_norm_chamfer_l2_mean
+  mesh 可视化黑色碎片是否减少
+```
+
+### 3. filtered mesh ablation
+
+如果第 2 步 filter 太强或效果不清楚，跑下面三组对照。
+
+```bash
+cd /home/zjr/Tracker
+
+for FILTER in \
+  largest_component \
+  largest_component,prior_radius \
+  prior_radius,projection_support \
+  largest_component,prior_radius,projection_support; do
+
+  SAFE_FILTER=${FILTER//,/__}
+
+  CUDA_VISIBLE_DEVICES=4 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+    --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+    --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_filter_${SAFE_FILTER}_mesh_v1 \
+    --weights microsoft/TRELLIS-image-large \
+    --indices all \
+    --modes stock_sparse,stage2_correct \
+    --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+    --stage2_topk_specs 4096 \
+    --stage2_sparse_filter "$FILTER" \
+    --filter_prior_radius 4.0 \
+    --filter_min_component_size 64 \
+    --filter_min_support_views 1 \
+    --filter_min_support_ratio 0.0 \
+    --filter_min_coords 128 \
+    --max_frames 18 \
+    --cond_mode multi_stochastic \
+    --ss_steps 12 \
+    --slat_steps 12 \
+    --ss_guidance_strength 7.5 \
+    --slat_guidance_strength 7.5 \
+    --slat_guidance_rescale 0.5 \
+    --slat_rescale_t 3.0 \
+    --steps 12 \
+    --guidance_strength 1.0 \
+    --known_latent_clamp_strength 1.0 \
+    --known_clamp_start_t 0.5 \
+    --known_logit_boost 0.0 \
+    --known_conf_power 1.0 \
+    --mesh_eval_samples 2000
+done
+```
+
+### 4. 四组 session 的 filtered mesh 快速对照
+
+只有当 dense session 的 filtered mesh 明显减少黑色碎片后，再跑四组。
+
+```bash
+cd /home/zjr/Tracker
+
+for SID in \
+  20260624_010530_849 \
+  20260624_011149_207 \
+  20260624_011450_447 \
+  20260624_011933_843; do
+
+  CUDA_VISIBLE_DEVICES=4 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+    --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+    --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_stage2_filtered_4096_mesh_v1 \
+    --weights microsoft/TRELLIS-image-large \
+    --indices all \
+    --modes stock_sparse,stage2_correct \
+    --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+    --stage2_topk_specs 4096 \
+    --stage2_sparse_filter largest_component,prior_radius,projection_support \
+    --filter_prior_radius 4.0 \
+    --filter_min_component_size 64 \
+    --filter_min_support_views 1 \
+    --filter_min_support_ratio 0.0 \
+    --filter_min_coords 128 \
+    --max_frames 18 \
+    --cond_mode multi_stochastic \
+    --ss_steps 12 \
+    --slat_steps 12 \
+    --ss_guidance_strength 7.5 \
+    --slat_guidance_strength 7.5 \
+    --slat_guidance_rescale 0.5 \
+    --slat_rescale_t 3.0 \
+    --steps 12 \
+    --guidance_strength 1.0 \
+    --known_latent_clamp_strength 1.0 \
+    --known_clamp_start_t 0.5 \
+    --known_logit_boost 0.0 \
+    --known_conf_power 1.0 \
+    --mesh_eval_samples 2000
+done
+```
+
+### 当前不建议直接训练
+
+这一步仍然是测试/诊断，不是新训练。
+
+原因：
+
+```text
+1. 现在还没确认 Stage2 sparse 本身是否可被简单过滤修干净；
+2. 如果 sparse 输出仍然碎，直接训练 slat flow 会把 unsupported/fragmented sparse 当训练输入；
+3. 应先证明 eval-time filter 能减少黑色碎片，再决定是否训练 slat flow。
+```
+
+### 5. stricter visual-hull sparse diagnostics
+
+上一轮 `projection_support` 使用：
+
+```text
+filter_min_support_views=1
+filter_min_support_ratio=0.0
+```
+
+这只表示“任意一帧投影进 mask”，太宽松。当前代码已经补充：
+
+```text
+visible_outside_mask_event_ratio
+visible_outside_mask_point_mean
+visible_support_ratio_mean
+visual_hull_keep_ratio
+```
+
+并支持在 `projection_support` filter 里同时加入：
+
+```text
+visual_hull_min_visible_views
+visual_hull_min_support_ratio
+```
+
+建议先只跑 dense session：
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/eval_real_slam_stage2_sparse_diagnostics.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_stage2_sparse_diag_strict_vh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 2048,4096 \
+  --filter_specs 'none;min_component_size;prior_radius,projection_support;min_component_size,prior_radius,projection_support;largest_component,prior_radius,projection_support' \
+  --filter_prior_radius 4.0 \
+  --filter_min_component_size 64 \
+  --filter_min_support_views 2 \
+  --filter_min_support_ratio 0.0 \
+  --visual_hull_min_visible_views 2 \
+  --visual_hull_min_support_ratio 0.25 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --lora_rank 64 \
+  --lora_alpha 128
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_stage2_sparse_diag_strict_vh_v1/report.json
+```
+
+重点看：
+
+```text
+final_visible_outside_mask_event_ratio 越低越好；
+final_visual_hull_keep_ratio 越高越好；
+final_component_count 越低越好；
+final_largest_component_ratio 越高越好；
+sparse_filter_total_keep_ratio 不应低到只剩几十点。
+```
+
+### 6. stricter visual-hull filtered mesh smoke
+
+如果上一步 `4096` 过滤后仍保留至少几百 coords，再跑 mesh：
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_stage2_filter_strict_vh_4096_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_sparse_filter min_component_size,prior_radius,projection_support \
+  --filter_prior_radius 4.0 \
+  --filter_min_component_size 64 \
+  --filter_min_support_views 2 \
+  --filter_min_support_ratio 0.0 \
+  --visual_hull_min_visible_views 2 \
+  --visual_hull_min_support_ratio 0.25 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+如果该命令让 mesh 黑色碎片下降，下一步再扩到四组 session。若仍然黑，问题就更偏向 frozen slat/mesh OOD，而不是单纯 unsupported sparse。
+
+## 四十五、2026-06-24 Stage2 connectivity / anti-island 训练与测试命令
+
+### 结论背景
+
+当前已经确认：
+
+```text
+1. stock/base sparse 在手机 AR、真实 SLAM、PixalV9 synthetic 上基本是单主连通结构；
+2. Stage2 sparse 在这些数据上普遍碎成上千个 component；
+3. strict visual-hull + component filter 能显著减少黑色碎片，但只是后处理安全阀。
+```
+
+因此下一轮先训练 Stage2 sparse 的连通性，不先训练 slat flow。
+
+本轮新增训练参数：
+
+```text
+CONNECTIVITY_LOSS_WEIGHT
+CONNECTIVITY_NEIGHBOR_THRESHOLD
+```
+
+默认关闭。下面命令显式开启。
+
+### 1. connectivity smoke 训练
+
+先跑 20 steps，确认新 loss 不会立刻破坏 sparse recall / mesh：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_connectivity_w001_smoke \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+CONNECTIVITY_LOSS_WEIGHT=0.01 \
+CONNECTIVITY_NEIGHBOR_THRESHOLD=0.08 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+### 2. connectivity smoke synthetic mesh eval
+
+看 val16 上的 mesh artifact 和 sparse 指标。重点比较旧 `antioverfill_rank_w0005_ws05_s200_seed42` 与这次 smoke 的：
+
+```text
+artifact_mesh_component_count
+artifact_mesh_largest_component_ratio
+artifact_black_vertex_ratio_lum_lt_003
+artifact_dark_vertex_ratio_lum_lt_008
+stage2 sparse component count
+mesh_to_target / target_to_mesh
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=connectivity_w001_smoke_val16_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_connectivity_w001_smoke \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+结果查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/connectivity_w001_smoke_val16_mesh_r05/report.json
+```
+
+### 3. connectivity smoke 手机 AR strict VH mesh eval
+
+用 dense session `20260624_011933_843` 做真实手机 AR smoke。这里继续使用 strict filter，观察新 checkpoint 的 raw sparse 是否更少碎、filter 后 black ratio 是否继续下降。
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+CKPT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_connectivity_w001_smoke/checkpoints/last.ckpt
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_connectivity_w001_smoke_strict_vh_4096_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stage2_correct \
+  --stage2_checkpoint "$CKPT" \
+  --stage2_topk_specs 4096 \
+  --stage2_sparse_filter min_component_size,prior_radius,projection_support \
+  --filter_prior_radius 4.0 \
+  --filter_min_component_size 64 \
+  --filter_min_support_views 2 \
+  --filter_min_support_ratio 0.0 \
+  --visual_hull_min_visible_views 2 \
+  --visual_hull_min_support_ratio 0.25 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+查看：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_connectivity_w001_smoke_strict_vh_4096_mesh_v1/report.json
+```
+
+### 4. 如果 smoke 不劣化，再跑 s200
+
+判断 smoke 可以进入 s200 的条件：
+
+```text
+1. synthetic val16 的 artifact_mesh_component_count 下降或不明显上升；
+2. artifact_black_vertex_ratio_lum_lt_003 不上升；
+3. mesh_to_target / target_to_mesh 不明显劣化；
+4. 手机 AR strict VH 后 coord_count 不低于几百，filter 没有退化到只剩极少 coords。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=s200 \
+RUN_NAME=pointprior_pixal_v9_stage2_connectivity_w001_s200_seed42 \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+CONNECTIVITY_LOSS_WEIGHT=0.01 \
+CONNECTIVITY_NEIGHBOR_THRESHOLD=0.08 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+### 5. s200 synthetic val64 mesh eval
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=connectivity_w001_s200_seed42_val64_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_connectivity_w001_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_connectivity_w001_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 6. 如果 connectivity=0.01 过强，降到 0.005
+
+过强的表现：
+
+```text
+1. coord_count 明显降低；
+2. mesh 变薄；
+3. target_to_mesh 变差；
+4. phone AR strict filter 后只剩很少 coords。
+```
+
+降权 smoke：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=pointprior_pixal_v9_stage2_connectivity_w0005_smoke \
+BUILD_SEED=42 \
+TRAIN_SEED=42 \
+ANTI_OVERFILL_LOSS_WEIGHT=0.02 \
+KNOWN_FLOW_LOSS_WEIGHT=2.0 \
+KNOWN_X0_LOSS_WEIGHT=0.5 \
+KNOWN_USE_CONFIDENCE=0 \
+RANKING_LOSS_WEIGHT=0.005 \
+RANKING_OUTSIDE_WEIGHT=0.0 \
+RANKING_OBSERVED_WEIGHT=0.25 \
+RANKING_WRONG_SUPPORT_WEIGHT=0.5 \
+RANKING_TARGET_SUPPORT_WEIGHT=0.0 \
+RANKING_NEGATIVE_MODES=shuffle,random \
+CONNECTIVITY_LOSS_WEIGHT=0.005 \
+CONNECTIVITY_NEIGHBOR_THRESHOLD=0.08 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+## 四十六、2026-06-24 Stage2 stock/base-guided selection 测试命令
+
+### 目的
+
+当前 strict visual-hull filter 能减少黑色碎片，但它是事后删点，容易把 mesh 删薄。下一步测试更温和的 topology prior：
+
+```text
+stock/base sparse 负责 TRELLIS 原生拓扑；
+Stage2 logits 只在 stock/base sparse 的膨胀邻域内排序；
+Stage2 负责贴近 point prior / target correction。
+```
+
+新增参数：
+
+```text
+STAGE2_BASE_GUIDANCE=stock_sparse
+STAGE2_BASE_RADIUS=2.0/4.0/6.0
+STAGE2_BASE_MIN_CANDIDATES=512
+```
+
+报告重点看：
+
+```text
+stage2_base_guidance_candidate_count
+stage2_base_guidance_fallback_unmasked
+stage2_topk_requested / stage2_topk_effective
+sparse_component_count
+sparse_largest_component_ratio
+sparse_small_component_coord_ratio_lt64
+stage2_pre_filter_sparse_component_count
+stage2_pre_filter_sparse_largest_component_ratio
+stage2_final_sparse_component_count
+stage2_final_sparse_largest_component_ratio
+stage2_final_sparse_small_component_coord_ratio_lt64
+sparse_filter_output_count
+sparse_filter_total_keep_ratio
+artifact_mesh_component_count
+artifact_mesh_largest_component_ratio
+artifact_black_vertex_ratio_lum_lt_003
+artifact_dark_vertex_ratio_lum_lt_008
+sparse_iou / sparse_target_recall / sparse_pred_precision
+mesh_to_target_mean / target_to_mesh_mean
+```
+
+### 1. synthetic val16 base-guided radius sweep，旧 s200 checkpoint
+
+先用目前最稳的旧 s200 checkpoint，不混入 connectivity smoke。这样能单独判断 base-guided selection 是否有效。
+
+```bash
+cd /home/zjr/Tracker
+
+for R in 2.0 4.0 6.0; do
+  SAFE_R=${R//./p}
+
+  GPU=4 \
+  MODE=val8 \
+  INDICES=0-15 \
+  RUN_NAME=baseguided_r${SAFE_R}_s200_seed42_val16_mesh_r05 \
+  POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+  STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  KNOWN_CLAMP_START_T=0.5 \
+  TOPK_SPECS=r0.50_cap8192 \
+  STAGE2_BASE_GUIDANCE=stock_sparse \
+  STAGE2_BASE_RADIUS=$R \
+  STAGE2_BASE_MIN_CANDIDATES=512 \
+  bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+done
+```
+
+结果查看：
+
+```bash
+for R in 2p0 4p0 6p0; do
+  echo "==== R=$R ===="
+  cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/baseguided_r${R}_s200_seed42_val16_mesh_r05/report.json
+done
+```
+
+注意：不要只看 black/dark。`R=2.0` 可能最干净，但也可能只是过度贴 stock/base；优先看 `R=4.0` 是否在 sparse/mesh component 和 chamfer 之间最平衡。
+
+### 1.1 synthetic val16 base-guided + component-aware post-filter
+
+在 base-guided 的基础上加轻量连通块过滤。先用 `min_component_size=32`，不要直接用 64，避免把细部结构删薄。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=baseguided_r4_mincomp32_s200_seed42_val16_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+STAGE2_BASE_GUIDANCE=stock_sparse \
+STAGE2_BASE_RADIUS=4.0 \
+STAGE2_BASE_MIN_CANDIDATES=512 \
+STAGE2_SPARSE_FILTER=min_component_size \
+FILTER_MIN_COMPONENT_SIZE=32 \
+FILTER_MIN_COORDS=128 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+如果 `min_component_size=32` 明显减少 `artifact_mesh_component_count`，且 `mesh_to_target_mean / target_to_mesh_mean` 不劣化，再扩到 val64。
+
+### 2. synthetic val64 base-guided 主半径复测
+
+如果 val16 中 `R=4.0` 最稳，跑 val64：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=baseguided_r4_s200_seed42_val64_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+STAGE2_BASE_GUIDANCE=stock_sparse \
+STAGE2_BASE_RADIUS=4.0 \
+STAGE2_BASE_MIN_CANDIDATES=512 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+如果 val16 的 `base-guided + min_component_size=32` 更稳，则 val64 改跑：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-63 \
+RUN_NAME=baseguided_r4_mincomp32_s200_seed42_val64_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+STAGE2_BASE_GUIDANCE=stock_sparse \
+STAGE2_BASE_RADIUS=4.0 \
+STAGE2_BASE_MIN_CANDIDATES=512 \
+STAGE2_SPARSE_FILTER=min_component_size \
+FILTER_MIN_COMPONENT_SIZE=32 \
+FILTER_MIN_COORDS=128 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 3. 手机 AR dense session：base-guided only
+
+先不加 strict visual-hull filter，只看 base-guided selection 本身是否减少黑色碎片和小连通块。
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_baseguided_r4_s200_4096_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_base_guidance stock_sparse \
+  --stage2_base_radius 4.0 \
+  --stage2_base_min_candidates 512 \
+  --stage2_sparse_filter none \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+### 4. 手机 AR dense session：base-guided + light projection filter
+
+如果 base-guided only 还有少量 unsupported surface，再加轻量 projection/prior filter。注意这里不加 `min_component_size`，避免过度剪薄。
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_baseguided_r4_s200_4096_lightproj_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_base_guidance stock_sparse \
+  --stage2_base_radius 4.0 \
+  --stage2_base_min_candidates 512 \
+  --stage2_sparse_filter prior_radius,projection_support \
+  --filter_prior_radius 4.0 \
+  --filter_min_support_views 1 \
+  --filter_min_support_ratio 0.0 \
+  --visual_hull_min_visible_views 1 \
+  --visual_hull_min_support_ratio 0.0 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+### 5. 手机 AR dense session：base-guided + min_component_size=32
+
+这条专门测试 component-aware post-filter。它比 strict visual-hull 温和，不使用 projection filter，只去掉很小的 isolated components。
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_baseguided_r4_s200_4096_mincomp32_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_correct \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_base_guidance stock_sparse \
+  --stage2_base_radius 4.0 \
+  --stage2_base_min_candidates 512 \
+  --stage2_sparse_filter min_component_size \
+  --filter_min_component_size 32 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+### 判断标准
+
+如果 base-guided 有效，应看到：
+
+```text
+1. stage2_base_guidance_fallback_unmasked = 0；
+2. sparse/mesh component 数明显低于未引导 Stage2；
+3. largest component ratio 明显高于未引导 Stage2；
+4. black/dark ratio 下降；
+5. synthetic 上 mesh_to_target / target_to_mesh 不劣化；
+6. 手机 AR 上 prior_norm_chamfer 不像 strict VH 那样明显变差。
+```
+
+如果 `R=2.0` 过薄、`R=6.0` 仍碎，优先尝试：
+
+```text
+R=4.0 + light projection filter
+```
+
+如果 base-guided 仍然失败，再考虑训练阶段把 stock/base sparse 作为额外 condition，而不是只做 eval-time selection。
+
+## 四十七、2026-06-26 eval-time stock union 测试命令
+
+本节测试新的 eval-time union：
+
+```text
+stage2_union_stock = unique(stock_sparse ∪ filtered_stage2_coords)
+```
+
+目的：
+
+```text
+1. stock_sparse 提供 TRELLIS 原生拓扑骨架和稳定颜色区域；
+2. Stage2 filtered sparse 提供 AR point prior correction；
+3. 不重训 sparse/slat，先判断 union 是否能同时降低黑色碎片并保持 prior alignment。
+```
+
+新增 mode：
+
+```text
+stage2_union_stock
+```
+
+也可以用全局开关：
+
+```text
+STAGE2_UNION_STOCK=1
+```
+
+优先看 report 中这些字段：
+
+```text
+stage2_stock_union_enabled
+stage2_stock_union_stock_count
+stage2_stock_union_stage2_count
+stage2_stock_union_intersection_count
+stage2_stock_union_stock_only_count
+stage2_stock_union_stage2_only_count
+stage2_stock_union_output_count
+artifact_black_vertex_ratio_lum_lt_003
+artifact_dark_vertex_ratio_lum_lt_008
+artifact_mesh_component_count
+artifact_mesh_largest_component_ratio
+prior_norm_chamfer_l2_mean
+extent_ratio
+```
+
+### 1. 手机 AR dense session：stock ∪ R4 lightproj
+
+这是第一优先级。它把之前表现最平衡的 `R4 + prior_radius + light projection_support` 与 stock sparse 做 union。
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_union_stock_r4_lightproj_4096_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_union_stock \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_base_guidance stock_sparse \
+  --stage2_base_radius 4.0 \
+  --stage2_base_min_candidates 512 \
+  --stage2_sparse_filter prior_radius,projection_support \
+  --filter_prior_radius 4.0 \
+  --filter_min_support_views 1 \
+  --filter_min_support_ratio 0.0 \
+  --visual_hull_min_visible_views 1 \
+  --visual_hull_min_support_ratio 0.0 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+查看结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_union_stock_r4_lightproj_4096_mesh_v1/report.json
+```
+
+### 2. 手机 AR dense session：stock ∪ R4 projection-only 0.15
+
+这是诊断对照。上一轮 `R4 projection-only 0.15` 的 prior chamfer 几乎退回 stock，本轮看 union 是否只靠 stock backbone 就能修复颜色和拓扑。
+
+```bash
+cd /home/zjr/Tracker
+
+SID=20260624_011933_843
+
+CUDA_VISIBLE_DEVICES=4 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u trellis_point_prior_mv/run_real_slam_prior_mesh.py \
+  --manifest /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_ar_direct_mesh_smoke_topk_diag_v2/manifest/manifest.json \
+  --output_dir /home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_${SID}_union_stock_r4_proj015_4096_mesh_v1 \
+  --weights microsoft/TRELLIS-image-large \
+  --indices all \
+  --modes stock_sparse,stage2_union_stock \
+  --stage2_checkpoint /home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+  --stage2_topk_specs 4096 \
+  --stage2_base_guidance stock_sparse \
+  --stage2_base_radius 4.0 \
+  --stage2_base_min_candidates 512 \
+  --stage2_sparse_filter projection_support \
+  --filter_min_support_views 1 \
+  --filter_min_support_ratio 0.15 \
+  --visual_hull_min_visible_views 1 \
+  --visual_hull_min_support_ratio 0.15 \
+  --filter_min_coords 128 \
+  --max_frames 18 \
+  --cond_mode multi_stochastic \
+  --ss_steps 12 \
+  --slat_steps 12 \
+  --ss_guidance_strength 7.5 \
+  --slat_guidance_strength 7.5 \
+  --slat_guidance_rescale 0.5 \
+  --slat_rescale_t 3.0 \
+  --steps 12 \
+  --guidance_strength 1.0 \
+  --known_latent_clamp_strength 1.0 \
+  --known_clamp_start_t 0.5 \
+  --known_logit_boost 0.0 \
+  --known_conf_power 1.0 \
+  --mesh_eval_samples 2000
+```
+
+### 3. synthetic val16：stock ∪ R4 + mincomp32 sanity check
+
+synthetic 不支持 projection filter，因此先用 `min_component_size=32` 做轻量 topology sanity check。重点看 union 是否进一步降低 black/mesh component，同时不要让 `target_to_mesh` 比原来的 base-guided min32 更差。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+INDICES=0-15 \
+RUN_NAME=union_stock_r4_mincomp32_s200_seed42_val16_mesh_r05 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+STAGE2_CHECKPOINT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42/checkpoints/last.ckpt \
+MODES=stock_sparse,target_sparse,stage2_union_stock \
+KNOWN_CLAMP_START_T=0.5 \
+TOPK_SPECS=r0.50_cap8192 \
+STAGE2_BASE_GUIDANCE=stock_sparse \
+STAGE2_BASE_RADIUS=4.0 \
+STAGE2_BASE_MIN_CANDIDATES=512 \
+STAGE2_SPARSE_FILTER=min_component_size \
+FILTER_MIN_COMPONENT_SIZE=32 \
+FILTER_MIN_COORDS=128 \
+bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+```
+
+### 4. 判断标准
+
+`stock ∪ R4 lightproj` 可以进入四组手机 AR session 扩展测试的条件：
+
+```text
+1. black ratio 接近 stock 或至少低于 0.03-0.05；
+2. mesh component 明显低于未 union 的 R4 lightproj；
+3. prior_norm_chamfer 不应明显高于 R4 lightproj，最好仍 < 0.02；
+4. extent_ratio 不能退回 stock 的薄片形态；
+5. stage2_stock_union_stage2_only_count 不能过大，否则 union 仍在大量引入 Stage2 小岛。
+```
+
+如果 `stock ∪ R4 lightproj` 好于两端单独结果，再补：
+
+```text
+1. 四组手机 AR session；
+2. real internal7 existing sparse；
+3. synthetic val64；
+4. 再决定是否训练 slat flow。
+```

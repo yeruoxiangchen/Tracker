@@ -12,12 +12,22 @@ MANIFEST="${MANIFEST:-${POINT_RUN_ROOT}/data/val/manifest.json}"
 STAGE2_CHECKPOINT="${STAGE2_CHECKPOINT:-${POINT_RUN_ROOT}/checkpoints/last.ckpt}"
 WEIGHTS="${WEIGHTS:-microsoft/TRELLIS-image-large}"
 TOPK_SPECS="${TOPK_SPECS:-r0.35_cap4096,r0.50_cap8192,r0.75_cap12000,r1.00_cap12000,target_unique}"
+MODES="${MODES:-stock_sparse,target_sparse,stage2_correct}"
 
 MAX_FRAMES="${MAX_FRAMES:-8}"
 SS_STEPS="${SS_STEPS:-12}"
 SLAT_STEPS="${SLAT_STEPS:-12}"
 MESH_EVAL_SAMPLES="${MESH_EVAL_SAMPLES:-4000}"
 KNOWN_CLAMP_START_T="${KNOWN_CLAMP_START_T:-1.0}"
+STAGE2_BASE_GUIDANCE="${STAGE2_BASE_GUIDANCE:-none}"
+STAGE2_BASE_RADIUS="${STAGE2_BASE_RADIUS:-3.0}"
+STAGE2_BASE_MIN_CANDIDATES="${STAGE2_BASE_MIN_CANDIDATES:-512}"
+STAGE2_UNION_STOCK="${STAGE2_UNION_STOCK:-0}"
+STAGE2_SPARSE_FILTER="${STAGE2_SPARSE_FILTER:-none}"
+FILTER_MIN_COMPONENT_SIZE="${FILTER_MIN_COMPONENT_SIZE:-64}"
+FILTER_PRIOR_RADIUS="${FILTER_PRIOR_RADIUS:-4.0}"
+FILTER_MIN_COORDS="${FILTER_MIN_COORDS:-128}"
+FILTER_FALLBACK_UNFILTERED="${FILTER_FALLBACK_UNFILTERED:-0}"
 
 case "${MODE}" in
   smoke)
@@ -37,8 +47,20 @@ esac
 OUTPUT_DIR="${OUTPUT_DIR:-/home/zjr/Tracker/trellis_point_prior_mv/outputs/mesh_frozen_downstream/${RUN_NAME}}"
 
 echo "[mesh_topk_sweep] mode=${MODE} indices=${INDICES}"
+echo "[mesh_topk_sweep] modes=${MODES}"
 echo "[mesh_topk_sweep] topk_specs=${TOPK_SPECS}"
+echo "[mesh_topk_sweep] base_guidance=${STAGE2_BASE_GUIDANCE} radius=${STAGE2_BASE_RADIUS}"
+echo "[mesh_topk_sweep] union_stock=${STAGE2_UNION_STOCK}"
+echo "[mesh_topk_sweep] sparse_filter=${STAGE2_SPARSE_FILTER} min_component=${FILTER_MIN_COMPONENT_SIZE}"
 echo "[mesh_topk_sweep] output=${OUTPUT_DIR}"
+
+filter_extra=()
+if [[ "${FILTER_FALLBACK_UNFILTERED}" == "1" ]]; then
+  filter_extra+=(--filter_fallback_unfiltered)
+fi
+if [[ "${STAGE2_UNION_STOCK}" == "1" ]]; then
+  filter_extra+=(--stage2_union_stock)
+fi
 
 CUDA_VISIBLE_DEVICES="${GPU}" \
 HF_HUB_OFFLINE=1 \
@@ -54,7 +76,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --output_dir "${OUTPUT_DIR}" \
   --weights "${WEIGHTS}" \
   --indices "${INDICES}" \
-  --modes stock_sparse,target_sparse,stage2_correct \
+  --modes "${MODES}" \
   --stage2_checkpoint "${STAGE2_CHECKPOINT}" \
   --stage2_topk_specs "${TOPK_SPECS}" \
   --max_frames "${MAX_FRAMES}" \
@@ -71,6 +93,14 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --known_clamp_start_t "${KNOWN_CLAMP_START_T}" \
   --known_logit_boost 0.0 \
   --known_conf_power 1.0 \
-  --mesh_eval_samples "${MESH_EVAL_SAMPLES}"
+  --stage2_base_guidance "${STAGE2_BASE_GUIDANCE}" \
+  --stage2_base_radius "${STAGE2_BASE_RADIUS}" \
+  --stage2_base_min_candidates "${STAGE2_BASE_MIN_CANDIDATES}" \
+  --stage2_sparse_filter "${STAGE2_SPARSE_FILTER}" \
+  --filter_min_component_size "${FILTER_MIN_COMPONENT_SIZE}" \
+  --filter_prior_radius "${FILTER_PRIOR_RADIUS}" \
+  --filter_min_coords "${FILTER_MIN_COORDS}" \
+  --mesh_eval_samples "${MESH_EVAL_SAMPLES}" \
+  "${filter_extra[@]}"
 
 echo "[mesh_topk_sweep] report=${OUTPUT_DIR}/report.json"

@@ -231,7 +231,7 @@ def find_frame_pairs(
     frame_stride: int = 1,
     frame_select_seed: int = 42,
     sparse_subdir: str = "sparse/0",
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     image_dir = dataset_dir / "images"
     if not image_dir.exists():
         image_dir = dataset_dir / "rgb"
@@ -252,8 +252,35 @@ def find_frame_pairs(
                 "stem": image_path.stem,
             }
         )
-    metas = parse_colmap_images(dataset_dir / sparse_subdir / "images.txt") if str(frame_select).startswith("pose_") else None
-    return select_frames(frames, int(max_frames), frame_select, int(frame_stride), int(frame_select_seed), metas)
+    metas_all = parse_colmap_images(dataset_dir / sparse_subdir / "images.txt")
+    registered_names = {Path(name).name for name in metas_all.keys()}
+    registered_name_count = len(registered_names)
+    unregistered_names = []
+    selection_pool = frames
+    if registered_names:
+        selection_pool = []
+        for frame in frames:
+            if Path(frame["name"]).name in registered_names:
+                selection_pool.append(frame)
+            else:
+                unregistered_names.append(frame["name"])
+    metas = metas_all if str(frame_select).startswith("pose_") else None
+    selected = select_frames(selection_pool, int(max_frames), frame_select, int(frame_stride), int(frame_select_seed), metas)
+    selected_unmatched = []
+    if registered_names:
+        selected_unmatched = [f["name"] for f in selected if Path(f["name"]).name not in registered_names]
+    stats = {
+        "frame_image_mask_pair_count": int(len(frames)),
+        "frame_registered_image_count": int(registered_name_count),
+        "frame_registered_pair_count": int(len(selection_pool)) if registered_names else 0,
+        "frame_unregistered_pair_count": int(len(unregistered_names)) if registered_names else 0,
+        "frame_requested_count": int(len(selected)),
+        "frame_unmatched_count": int(len(selected_unmatched)),
+        "frame_selection_source": "registered_sparse" if registered_names else "all_image_mask_pairs",
+        "frame_unmatched_names": selected_unmatched[:32],
+        "frame_unregistered_names": unregistered_names[:32],
+    }
+    return selected, stats
 
 
 def find_reference_model(dataset_dir: Path) -> Path | None:
@@ -535,7 +562,7 @@ def projection_diagnostics_for_coords(
 
 def build_one(dataset_dir: Path, out_dir: Path, args: argparse.Namespace, out_index: int) -> tuple[dict, dict]:
     uid = dataset_dir.name
-    frames = find_frame_pairs(
+    frames, frame_stats = find_frame_pairs(
         dataset_dir,
         max_frames=args.max_frames,
         frame_select=args.frame_select,
@@ -551,12 +578,13 @@ def build_one(dataset_dir: Path, out_dir: Path, args: argparse.Namespace, out_in
     selected_points = np.zeros((0, 3), dtype=np.float32)
     selected_conf = np.zeros((0,), dtype=np.float32)
     source_used = args.prior_source
-    stats: dict[str, Any] = {}
+    stats: dict[str, Any] = dict(frame_stats)
     fallback_used = False
     fallback_reason = ""
 
     if args.prior_source in {"auto", "colmap_points"}:
-        selected_points, selected_conf, stats = project_mask_filter_colmap_points(dataset_dir, frames, colmap_points, args)
+        selected_points, selected_conf, point_stats = project_mask_filter_colmap_points(dataset_dir, frames, colmap_points, args)
+        stats.update(point_stats)
         source_used = "colmap_points"
         if selected_points.shape[0] < int(args.min_prior_points):
             fallback_reason = (
@@ -627,6 +655,7 @@ def build_one(dataset_dir: Path, out_dir: Path, args: argparse.Namespace, out_in
         "normalization": norm,
         "fallback_used": bool(fallback_used),
         "fallback_reason": fallback_reason,
+        "frame_selection": frame_stats,
         "projection_diagnostics": projection_stats,
         "prior_point_count": int(coords.shape[0]),
         "source_point_count": int(selected_points.shape[0]),

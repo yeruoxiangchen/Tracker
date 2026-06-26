@@ -29,10 +29,13 @@ from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline  # no
 
 from trellis_point_prior_mv.common import parse_indices, resolve_path, write_json  # noqa: E402
 from trellis_point_prior_mv.eval_mesh_frozen_downstream import (  # noqa: E402
+    apply_base_guidance_to_logits,
     apply_mask_and_crop,
     coords_np_to_torch,
     expand_modes_with_stage2_specs,
+    is_stage2_union_mode,
     load_stage2_bundle,
+    mesh_artifact_metrics_from_obj,
     mesh_basic_metrics,
     parse_stage2_topk_specs,
     prepare_cond,
@@ -42,8 +45,13 @@ from trellis_point_prior_mv.eval_mesh_frozen_downstream import (  # noqa: E402
     sample_stock_sparse,
     stage2_topk_label,
     torch_coords_to_np,
+    union_stage2_with_stock_coords,
 )
 from trellis_point_prior_mv.eval_sparse_inpaint import topk_coords_from_logits  # noqa: E402
+from trellis_point_prior_mv.sparse_coord_tools import (  # noqa: E402
+    filter_sparse_coords,
+    sparse_diagnostic_metrics,
+)
 
 
 def load_json(path: str | Path) -> Any:
@@ -212,6 +220,7 @@ def main() -> None:
         coord_bank: dict[str, torch.Tensor] = {}
         stage2_info: dict[str, dict] = {}
         stage2_logits = None
+        base_guidance_coords_np: np.ndarray | None = None
         for mode_idx, mode in enumerate(modes):
             mode_seed = int(args.seed + sample_idx * 1009 + mode_idx * 17)
             if mode == "prior_sparse":
@@ -226,11 +235,123 @@ def main() -> None:
                 if stage2_logits is None:
                     stage2_logits = sample_stage2_logits(stage2_bundle, pipeline, prior_coords, prior_conf, args, device, mode_seed)
                 topk, info = resolve_stage2_topk(stage2_mode_specs[mode], target_unique_estimate)
-                coords = coords_from_stage2_logits_abs(stage2_logits, topk, args, device, mode_seed)
+                guided_logits = stage2_logits
+                effective_topk = int(topk)
+                if str(args.stage2_base_guidance).strip().lower() not in {"", "none"}:
+                    if str(args.stage2_base_guidance).strip().lower() not in {"stock", "stock_sparse", "base", "base_sparse"}:
+                        raise ValueError(f"unsupported --stage2_base_guidance={args.stage2_base_guidance!r}")
+                    if base_guidance_coords_np is None:
+                        if "stock_sparse" in coord_bank:
+                            base_guidance_coords_np = torch_coords_to_np(coord_bank["stock_sparse"])
+                        else:
+                            base_coords = sample_stock_sparse(pipeline, cond, cond_count, args, mode_seed + 39031)
+                            base_guidance_coords_np = torch_coords_to_np(base_coords)
+                    guided_logits, candidate_count, base_info = apply_base_guidance_to_logits(
+                        stage2_logits,
+                        base_guidance_coords_np,
+                        radius=float(args.stage2_base_radius),
+                        min_candidates=int(args.stage2_base_min_candidates),
+                    )
+                    if not int(base_info.get("stage2_base_guidance_fallback_unmasked", 0)):
+                        effective_topk = min(effective_topk, int(candidate_count))
+                    info = {
+                        **info,
+                        **base_info,
+                        "stage2_topk_requested": int(topk),
+                        "stage2_topk_effective": int(effective_topk),
+                    }
+                raw_coords = topk_coords_from_logits(guided_logits, effective_topk)
+                raw_metrics = sparse_diagnostic_metrics(
+                    "stage2_raw_sparse",
+                    raw_coords,
+                    prior_coords,
+                    sample,
+                    prior_radius=float(args.filter_prior_radius),
+                    min_support_views=int(args.filter_min_support_views),
+                    min_support_ratio=float(args.filter_min_support_ratio),
+                    visual_hull_min_visible_views=int(args.visual_hull_min_visible_views),
+                    visual_hull_min_support_ratio=float(args.visual_hull_min_support_ratio),
+                    grid_resolution=int(args.filter_grid_resolution),
+                    mask_threshold=int(args.filter_mask_threshold),
+                )
+                filter_metrics: dict[str, Any] = {}
+                coords_np = raw_coords
+                if str(args.stage2_sparse_filter).strip().lower() not in {"", "none", "raw"}:
+                    coords_np, filter_metrics = filter_sparse_coords(
+                        raw_coords,
+                        prior_coords,
+                        sample,
+                        filter_spec=str(args.stage2_sparse_filter),
+                        prior_radius=float(args.filter_prior_radius),
+                        min_component_size=int(args.filter_min_component_size),
+                        min_support_views=int(args.filter_min_support_views),
+                        min_support_ratio=float(args.filter_min_support_ratio),
+                        visual_hull_min_visible_views=int(args.visual_hull_min_visible_views),
+                        visual_hull_min_support_ratio=float(args.visual_hull_min_support_ratio),
+                        grid_resolution=int(args.filter_grid_resolution),
+                        mask_threshold=int(args.filter_mask_threshold),
+                    )
+                    if coords_np.shape[0] < int(args.filter_min_coords) and bool(args.filter_fallback_unfiltered):
+                        filter_metrics["sparse_filter_fallback_unfiltered"] = 1
+                        filter_metrics["sparse_filter_fallback_reason"] = (
+                            f"filtered_count {coords_np.shape[0]} < filter_min_coords {int(args.filter_min_coords)}"
+                        )
+                        coords_np = raw_coords
+                    else:
+                        filter_metrics["sparse_filter_fallback_unfiltered"] = 0
+                        filter_metrics["sparse_filter_fallback_reason"] = ""
+                pre_union_metrics: dict[str, Any] = {}
+                union_metrics: dict[str, Any] = {"stage2_stock_union_enabled": 0}
+                if is_stage2_union_mode(mode, args):
+                    stage2_before_union_np = coords_np
+                    if base_guidance_coords_np is None:
+                        if "stock_sparse" in coord_bank:
+                            base_guidance_coords_np = torch_coords_to_np(coord_bank["stock_sparse"])
+                        else:
+                            base_coords = sample_stock_sparse(pipeline, cond, cond_count, args, mode_seed + 39031)
+                            base_guidance_coords_np = torch_coords_to_np(base_coords)
+                    coords_np, union_metrics = union_stage2_with_stock_coords(
+                        base_guidance_coords_np,
+                        stage2_before_union_np,
+                        resolution=int(args.filter_grid_resolution),
+                    )
+                    pre_union_metrics = sparse_diagnostic_metrics(
+                        "stage2_pre_union_sparse",
+                        stage2_before_union_np,
+                        prior_coords,
+                        sample,
+                        prior_radius=float(args.filter_prior_radius),
+                        min_support_views=int(args.filter_min_support_views),
+                        min_support_ratio=float(args.filter_min_support_ratio),
+                        visual_hull_min_visible_views=int(args.visual_hull_min_visible_views),
+                        visual_hull_min_support_ratio=float(args.visual_hull_min_support_ratio),
+                        grid_resolution=int(args.filter_grid_resolution),
+                        mask_threshold=int(args.filter_mask_threshold),
+                    )
+                filtered_metrics = sparse_diagnostic_metrics(
+                    "stage2_final_sparse",
+                    coords_np,
+                    prior_coords,
+                    sample,
+                    prior_radius=float(args.filter_prior_radius),
+                    min_support_views=int(args.filter_min_support_views),
+                    min_support_ratio=float(args.filter_min_support_ratio),
+                    visual_hull_min_visible_views=int(args.visual_hull_min_visible_views),
+                    visual_hull_min_support_ratio=float(args.visual_hull_min_support_ratio),
+                    grid_resolution=int(args.filter_grid_resolution),
+                    mask_threshold=int(args.filter_mask_threshold),
+                )
+                coords = coords_np_to_torch(coords_np, device, max_coords=args.max_coords, seed=mode_seed)
                 stage2_info[mode] = {
                     **info,
                     "stage2_topk_reference": int(target_unique_estimate),
-                    "stage2_topk_absolute": int(topk),
+                    "stage2_topk_absolute": int(effective_topk),
+                    "stage2_sparse_filter": str(args.stage2_sparse_filter),
+                    **raw_metrics,
+                    **filter_metrics,
+                    **pre_union_metrics,
+                    **union_metrics,
+                    **filtered_metrics,
                 }
             else:
                 raise ValueError(f"unsupported mode={mode!r}")
@@ -270,6 +391,7 @@ def main() -> None:
                 "mesh_obj": str(obj_path),
                 **projection_metrics,
                 **mesh_basic_metrics(mesh),
+                **mesh_artifact_metrics_from_obj(obj_path),
                 **real_reference_metrics(mesh, sample, prior_coords, args, int(args.seed + sample_idx * 7919)),
             }
             if mode in stage2_info:
@@ -339,6 +461,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent_channels", type=int, default=8)
     parser.add_argument("--latent_grid_resolution", type=int, default=16)
     parser.add_argument("--cond_channels", type=int, default=1024)
+    parser.add_argument(
+        "--stage2_base_guidance",
+        default="none",
+        help="Optional topology prior for Stage2 top-k selection. Use stock_sparse to restrict Stage2 ranking near stock/base sparse coords.",
+    )
+    parser.add_argument("--stage2_base_radius", type=float, default=3.0)
+    parser.add_argument("--stage2_base_min_candidates", type=int, default=512)
+    parser.add_argument(
+        "--stage2_union_stock",
+        action="store_true",
+        help="Union every Stage2 sparse output with stock/base sparse before frozen slat. Equivalent to using mode stage2_union_stock.",
+    )
+    parser.add_argument(
+        "--stage2_sparse_filter",
+        default="none",
+        help=(
+            "Comma-separated eval-time filter steps for Stage2 sparse coords before slat. "
+            "Supported: none, largest_component, min_component_size, prior_radius, projection_support."
+        ),
+    )
+    parser.add_argument("--filter_prior_radius", type=float, default=4.0)
+    parser.add_argument("--filter_min_component_size", type=int, default=64)
+    parser.add_argument("--filter_min_support_views", type=int, default=1)
+    parser.add_argument("--filter_min_support_ratio", type=float, default=0.0)
+    parser.add_argument("--visual_hull_min_visible_views", type=int, default=1)
+    parser.add_argument("--visual_hull_min_support_ratio", type=float, default=0.0)
+    parser.add_argument("--filter_grid_resolution", type=int, default=64)
+    parser.add_argument("--filter_mask_threshold", type=int, default=127)
+    parser.add_argument("--filter_min_coords", type=int, default=128)
+    parser.add_argument("--filter_fallback_unfiltered", action="store_true")
     return parser.parse_args()
 
 

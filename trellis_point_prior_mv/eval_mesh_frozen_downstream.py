@@ -37,6 +37,7 @@ from trellis_point_prior_mv.common import (  # noqa: E402
     write_json,
 )
 from trellis_point_prior_mv.eval_sparse_inpaint import topk_coords_from_logits  # noqa: E402
+from trellis_point_prior_mv.sparse_coord_tools import component_metrics, filter_sparse_coords, nearest_prior_metrics  # noqa: E402
 
 
 def load_json(path: str | Path) -> Any:
@@ -152,6 +153,55 @@ def torch_coords_to_np(coords: torch.Tensor) -> np.ndarray:
     return coords.detach().cpu().numpy().astype(np.int32)
 
 
+def normalize_coords_np(coords: np.ndarray, *, resolution: int = 64) -> np.ndarray:
+    xyz = coords[:, -3:].astype(np.int32, copy=False) if coords.size else np.zeros((0, 3), dtype=np.int32)
+    if xyz.size:
+        valid = ((xyz >= 0) & (xyz < int(resolution))).all(axis=1)
+        xyz = xyz[valid]
+        if xyz.shape[0] > 1:
+            xyz = np.unique(xyz, axis=0)
+    batch = np.zeros((xyz.shape[0], 1), dtype=np.int32)
+    return np.concatenate([batch, xyz.astype(np.int32)], axis=1)
+
+
+def union_stage2_with_stock_coords(
+    stock_coords: np.ndarray,
+    stage2_coords: np.ndarray,
+    *,
+    resolution: int = 64,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    stock = normalize_coords_np(stock_coords, resolution=resolution)
+    stage2 = normalize_coords_np(stage2_coords, resolution=resolution)
+    stock_set = {tuple(x) for x in stock[:, -3:].tolist()}
+    stage2_set = {tuple(x) for x in stage2[:, -3:].tolist()}
+    intersection = stock_set & stage2_set
+    union = stock_set | stage2_set
+    if union:
+        union_xyz = np.asarray(sorted(union), dtype=np.int32)
+    else:
+        union_xyz = np.zeros((0, 3), dtype=np.int32)
+    union_coords = np.concatenate([np.zeros((union_xyz.shape[0], 1), dtype=np.int32), union_xyz], axis=1)
+    metrics = {
+        "stage2_stock_union_enabled": 1,
+        "stage2_stock_union_stock_count": int(len(stock_set)),
+        "stage2_stock_union_stage2_count": int(len(stage2_set)),
+        "stage2_stock_union_intersection_count": int(len(intersection)),
+        "stage2_stock_union_stock_only_count": int(len(stock_set - stage2_set)),
+        "stage2_stock_union_stage2_only_count": int(len(stage2_set - stock_set)),
+        "stage2_stock_union_output_count": int(len(union)),
+        "stage2_stock_union_intersection_over_stock": float(len(intersection) / max(len(stock_set), 1)),
+        "stage2_stock_union_intersection_over_stage2": float(len(intersection) / max(len(stage2_set), 1)),
+        "stage2_stock_union_output_over_stock": float(len(union) / max(len(stock_set), 1)),
+        "stage2_stock_union_output_over_stage2": float(len(union) / max(len(stage2_set), 1)),
+    }
+    return union_coords, metrics
+
+
+def is_stage2_union_mode(mode: str, args: argparse.Namespace) -> bool:
+    mode = str(mode).strip().lower()
+    return bool(getattr(args, "stage2_union_stock", False)) or mode.startswith("stage2_union_stock") or mode.startswith("stage2_stock_union")
+
+
 def prepare_cond(pipeline, images: list[Image.Image], mode: str) -> tuple[dict, int]:
     if mode == "first":
         return pipeline.get_cond([images[0]]), 1
@@ -247,6 +297,173 @@ def mesh_basic_metrics(mesh) -> dict[str, Any]:
             }
         )
     return out
+
+
+def mesh_artifact_metrics_from_obj(obj_path: str | Path, prefix: str = "artifact") -> dict[str, Any]:
+    """Parse exported OBJ vertex colors and face connectivity for artifact diagnostics."""
+    path = Path(obj_path)
+    if not path.exists():
+        return {f"{prefix}_enabled": 0, f"{prefix}_error": "missing_obj"}
+
+    vertices: list[tuple[float, float, float]] = []
+    colors: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("v "):
+                    parts = line.strip().split()
+                    if len(parts) >= 4:
+                        vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                    if len(parts) >= 7:
+                        colors.append((float(parts[4]), float(parts[5]), float(parts[6])))
+                elif line.startswith("f "):
+                    idx = []
+                    for token in line.strip().split()[1:]:
+                        if not token:
+                            continue
+                        raw = int(token.split("/")[0])
+                        idx.append(raw - 1 if raw > 0 else len(vertices) + raw)
+                    if len(idx) >= 3:
+                        for i in range(1, len(idx) - 1):
+                            faces.append((idx[0], idx[i], idx[i + 1]))
+    except Exception as exc:
+        return {f"{prefix}_enabled": 0, f"{prefix}_error": f"parse_failed: {exc}"}
+
+    vertex_count = len(vertices)
+    if vertex_count == 0:
+        return {f"{prefix}_enabled": 0, f"{prefix}_error": "empty_vertices"}
+
+    parent = np.arange(vertex_count, dtype=np.int64)
+    size = np.ones(vertex_count, dtype=np.int64)
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return int(x)
+
+    def union(a: int, b: int) -> None:
+        if a < 0 or b < 0 or a >= vertex_count or b >= vertex_count:
+            return
+        ra = find(a)
+        rb = find(b)
+        if ra == rb:
+            return
+        if size[ra] < size[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        size[ra] += size[rb]
+
+    for a, b, c in faces:
+        union(a, b)
+        union(a, c)
+
+    roots = np.asarray([find(i) for i in range(vertex_count)], dtype=np.int64)
+    component_sizes = np.unique(roots, return_counts=True)[1]
+    component_sizes_sorted = sorted((int(v) for v in component_sizes.tolist()), reverse=True)
+
+    out: dict[str, Any] = {
+        f"{prefix}_enabled": 1,
+        f"{prefix}_vertex_count": int(vertex_count),
+        f"{prefix}_face_count": int(len(faces)),
+        f"{prefix}_mesh_component_count": int(len(component_sizes_sorted)),
+        f"{prefix}_mesh_largest_component_ratio": float(component_sizes_sorted[0] / max(vertex_count, 1)),
+        f"{prefix}_mesh_small_component_count_lt100": int(sum(1 for v in component_sizes_sorted if v < 100)),
+        f"{prefix}_mesh_small_component_vertex_ratio_lt100": float(
+            sum(v for v in component_sizes_sorted if v < 100) / max(vertex_count, 1)
+        ),
+        f"{prefix}_mesh_top10_component_counts": ",".join(str(v) for v in component_sizes_sorted[:10]),
+    }
+
+    if len(colors) == vertex_count:
+        color = np.asarray(colors, dtype=np.float32)
+        if float(color.max(initial=0.0)) > 1.5:
+            color = color / 255.0
+        color = np.clip(color, 0.0, 1.0)
+        lum = 0.2126 * color[:, 0] + 0.7152 * color[:, 1] + 0.0722 * color[:, 2]
+        out.update(
+            {
+                f"{prefix}_color_count": int(color.shape[0]),
+                f"{prefix}_black_vertex_ratio_lum_lt_003": float(np.mean(lum < 0.03)),
+                f"{prefix}_dark_vertex_ratio_lum_lt_008": float(np.mean(lum < 0.08)),
+                f"{prefix}_luminance_mean": float(np.mean(lum)),
+                f"{prefix}_luminance_median": float(np.median(lum)),
+            }
+        )
+    else:
+        out.update(
+            {
+                f"{prefix}_color_count": int(len(colors)),
+                f"{prefix}_black_vertex_ratio_lum_lt_003": 0.0,
+                f"{prefix}_dark_vertex_ratio_lum_lt_008": 0.0,
+                f"{prefix}_luminance_mean": 0.0,
+                f"{prefix}_luminance_median": 0.0,
+            }
+        )
+    return out
+
+
+def _radius_mask_from_coords(coords: np.ndarray, resolution: int, radius: float) -> np.ndarray:
+    xyz = np.asarray(coords, dtype=np.int32)
+    if xyz.size == 0:
+        return np.zeros((resolution, resolution, resolution), dtype=bool)
+    xyz = xyz[:, -3:]
+    valid = ((xyz >= 0) & (xyz < resolution)).all(axis=1)
+    xyz = np.unique(xyz[valid], axis=0) if np.any(valid) else np.zeros((0, 3), dtype=np.int32)
+    if xyz.shape[0] == 0:
+        return np.zeros((resolution, resolution, resolution), dtype=bool)
+
+    occupied = np.zeros((resolution, resolution, resolution), dtype=bool)
+    occupied[xyz[:, 0], xyz[:, 1], xyz[:, 2]] = True
+    radius = float(radius)
+    if radius <= 0:
+        return occupied
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        return distance_transform_edt(~occupied) <= radius
+    except Exception:
+        from scipy.spatial import cKDTree
+
+        grid = np.stack(np.meshgrid(np.arange(resolution), np.arange(resolution), np.arange(resolution), indexing="ij"), axis=-1)
+        flat = grid.reshape(-1, 3)
+        dist = cKDTree(xyz.astype(np.float32)).query(flat.astype(np.float32), k=1)[0]
+        return (dist <= radius).reshape(resolution, resolution, resolution)
+
+
+def apply_base_guidance_to_logits(
+    logits: torch.Tensor,
+    base_coords: np.ndarray,
+    *,
+    radius: float,
+    min_candidates: int,
+) -> tuple[torch.Tensor, int, dict[str, Any]]:
+    if logits.ndim != 5 or logits.shape[0] != 1:
+        raise ValueError(f"expected logits [1,C,D,H,W], got {tuple(logits.shape)}")
+    resolution = int(logits.shape[-1])
+    base_xyz = np.asarray(base_coords, dtype=np.int32)
+    base_count = int(np.unique(base_xyz[:, -3:], axis=0).shape[0]) if base_xyz.size else 0
+    keep = _radius_mask_from_coords(base_coords, resolution=resolution, radius=float(radius))
+    candidate_count = int(keep.sum())
+    metrics: dict[str, Any] = {
+        "stage2_base_guidance_enabled": 1,
+        "stage2_base_guidance_radius": float(radius),
+        "stage2_base_guidance_base_coord_count": int(base_count),
+        "stage2_base_guidance_candidate_count": int(candidate_count),
+        "stage2_base_guidance_candidate_ratio": float(candidate_count / max(resolution**3, 1)),
+        "stage2_base_guidance_fallback_unmasked": 0,
+    }
+    if candidate_count < int(min_candidates):
+        metrics["stage2_base_guidance_fallback_unmasked"] = 1
+        metrics["stage2_base_guidance_fallback_reason"] = (
+            f"candidate_count {candidate_count} < min_candidates {int(min_candidates)}"
+        )
+        return logits, int(logits.numel()), metrics
+    mask = torch.as_tensor(keep, device=logits.device, dtype=torch.bool).view(1, 1, resolution, resolution, resolution)
+    masked_logits = logits.masked_fill(~mask, -1.0e9)
+    metrics["stage2_base_guidance_fallback_reason"] = ""
+    return masked_logits, candidate_count, metrics
 
 
 def coords_to_points(coords: np.ndarray, resolution: int = 64) -> np.ndarray:
@@ -429,12 +646,13 @@ def expand_modes_with_stage2_specs(raw_modes: list[str], stage2_specs: list[str]
     expanded: list[str] = []
     stage2_mode_specs: dict[str, str] = {}
     multi_specs = len(stage2_specs) > 1
+    stage2_base_modes = {"stage2_correct", "stage2_union_stock", "stage2_stock_union"}
     for mode in raw_modes:
-        if mode == "stage2_correct" and multi_specs:
+        if mode in stage2_base_modes and multi_specs:
             used: set[str] = set()
             for spec in stage2_specs:
                 label = stage2_topk_label(spec)
-                name = f"stage2_correct_{label}"
+                name = f"{mode}_{label}"
                 if name in used:
                     raise ValueError(f"duplicate stage2 top-k label {label!r}; use distinct specs")
                 used.add(name)
@@ -442,7 +660,7 @@ def expand_modes_with_stage2_specs(raw_modes: list[str], stage2_specs: list[str]
                 stage2_mode_specs[name] = spec
         else:
             expanded.append(mode)
-            if mode == "stage2_correct":
+            if mode in stage2_base_modes:
                 stage2_mode_specs[mode] = stage2_specs[0]
     return expanded, stage2_mode_specs
 
@@ -538,6 +756,7 @@ def main() -> None:
         coord_bank: dict[str, torch.Tensor] = {}
         stage2_topk_info: dict[str, dict[str, Any]] = {}
         stage2_logits = None
+        base_guidance_coords_np: np.ndarray | None = None
         stage2_seed = int(args.seed + sample_idx * 1009 + 991)
         for mode in modes:
             mode_seed = int(args.seed + sample_idx * 1009 + len(coord_bank) * 17)
@@ -555,7 +774,103 @@ def main() -> None:
                 if stage2_logits is None:
                     stage2_logits = sample_stage2_logits(stage2_bundle, pipeline, prior_coords, prior_conf, args, device, stage2_seed)
                 topk, info = resolve_stage2_topk(stage2_mode_specs[mode], target_unique)
-                coords = coords_from_stage2_logits(stage2_logits, topk, args, device, mode_seed)
+                guided_logits = stage2_logits
+                effective_topk = int(topk)
+                if str(args.stage2_base_guidance).strip().lower() not in {"", "none"}:
+                    if str(args.stage2_base_guidance).strip().lower() not in {"stock", "stock_sparse", "base", "base_sparse"}:
+                        raise ValueError(f"unsupported --stage2_base_guidance={args.stage2_base_guidance!r}")
+                    if base_guidance_coords_np is None:
+                        if "stock_sparse" in coord_bank:
+                            base_guidance_coords_np = torch_coords_to_np(coord_bank["stock_sparse"])
+                        else:
+                            base_coords = sample_stock_sparse(pipeline, cond, cond_count, args, mode_seed + 39031)
+                            base_guidance_coords_np = torch_coords_to_np(base_coords)
+                    guided_logits, candidate_count, base_info = apply_base_guidance_to_logits(
+                        stage2_logits,
+                        base_guidance_coords_np,
+                        radius=float(args.stage2_base_radius),
+                        min_candidates=int(args.stage2_base_min_candidates),
+                    )
+                    if not int(base_info.get("stage2_base_guidance_fallback_unmasked", 0)):
+                        effective_topk = min(effective_topk, int(candidate_count))
+                    info = {
+                        **info,
+                        **base_info,
+                        "stage2_topk_requested": int(topk),
+                        "stage2_topk_effective": int(effective_topk),
+                    }
+                coords = coords_from_stage2_logits(guided_logits, effective_topk, args, device, mode_seed)
+                pre_filter_np = torch_coords_to_np(coords)
+                filter_spec = str(args.stage2_sparse_filter).strip()
+                if filter_spec.lower() not in {"", "none", "raw"}:
+                    unsupported = {
+                        part.strip()
+                        for part in filter_spec.split(",")
+                        if part.strip() in {"projection", "projection_support", "mask_support"}
+                    }
+                    if unsupported:
+                        raise ValueError(
+                            "eval_mesh_frozen_downstream.py synthetic eval does not support projection sparse filters; "
+                            "use min_component_size/largest_component/prior_radius here, or run real/AR eval for projection_support."
+                        )
+                    filtered_np, filter_info = filter_sparse_coords(
+                        pre_filter_np,
+                        prior_coords,
+                        {},
+                        filter_spec=filter_spec,
+                        prior_radius=float(args.filter_prior_radius),
+                        min_component_size=int(args.filter_min_component_size),
+                    )
+                    if filtered_np.shape[0] < int(args.filter_min_coords) and bool(args.filter_fallback_unfiltered):
+                        filter_info["sparse_filter_fallback_unfiltered"] = 1
+                        filter_info["sparse_filter_fallback_reason"] = (
+                            f"filtered_count {filtered_np.shape[0]} < filter_min_coords {int(args.filter_min_coords)}"
+                        )
+                        filtered_np = pre_filter_np
+                    else:
+                        filter_info["sparse_filter_fallback_unfiltered"] = 0
+                        filter_info["sparse_filter_fallback_reason"] = ""
+                    coords = coords_np_to_torch(filtered_np, device, max_coords=args.max_coords, seed=mode_seed)
+                    info = {
+                        **info,
+                        **component_metrics("stage2_pre_filter_sparse", pre_filter_np),
+                        **filter_info,
+                    }
+                else:
+                    info = {
+                        **info,
+                        **component_metrics("stage2_pre_filter_sparse", pre_filter_np),
+                        "sparse_filter_spec": "none",
+                        "sparse_filter_input_count": int(pre_filter_np.shape[0]),
+                        "sparse_filter_output_count": int(pre_filter_np.shape[0]),
+                        "sparse_filter_total_keep_ratio": 1.0,
+                        "sparse_filter_fallback_unfiltered": 0,
+                        "sparse_filter_fallback_reason": "",
+                    }
+                stage2_before_union_np = torch_coords_to_np(coords)
+                if is_stage2_union_mode(mode, args):
+                    if base_guidance_coords_np is None:
+                        if "stock_sparse" in coord_bank:
+                            base_guidance_coords_np = torch_coords_to_np(coord_bank["stock_sparse"])
+                        else:
+                            base_coords = sample_stock_sparse(pipeline, cond, cond_count, args, mode_seed + 39031)
+                            base_guidance_coords_np = torch_coords_to_np(base_coords)
+                    union_np, union_info = union_stage2_with_stock_coords(
+                        base_guidance_coords_np,
+                        stage2_before_union_np,
+                        resolution=64,
+                    )
+                    coords = coords_np_to_torch(union_np, device, max_coords=args.max_coords, seed=mode_seed)
+                    info = {
+                        **info,
+                        **component_metrics("stage2_pre_union_sparse", stage2_before_union_np),
+                        **union_info,
+                    }
+                else:
+                    info = {
+                        **info,
+                        "stage2_stock_union_enabled": 0,
+                    }
                 stage2_topk_info[mode] = info
             else:
                 raise ValueError(f"unsupported mode={mode!r}")
@@ -570,6 +885,10 @@ def main() -> None:
             coords_np = torch_coords_to_np(coords)
             np.savez_compressed(mode_dir / "sparse_coords.npz", coords=coords_np)
             sparse_metrics = sparse_overlap_metrics(coords_np, target_coords)
+            sparse_topology_metrics = {
+                **component_metrics("sparse", coords_np),
+                **nearest_prior_metrics("sparse", coords_np, prior_coords, radius=4.0),
+            }
             print(
                 f"[mesh_frozen] sample={sample_idx} uid={uid} mode={mode} "
                 f"coords={coords_np.shape[0]} sparse_iou={sparse_metrics['iou']:.4f}",
@@ -592,11 +911,20 @@ def main() -> None:
                 "sparse_intersection": sparse_metrics["intersection"],
                 "target_unique": sparse_metrics["target_unique"],
                 "mesh_obj": str(obj_path),
+                **sparse_topology_metrics,
                 **mesh_basic_metrics(mesh),
+                **mesh_artifact_metrics_from_obj(obj_path),
                 **mesh_target_distance_metrics(mesh, target_coords, args.mesh_eval_samples, int(args.seed + sample_idx * 7919)),
             }
             if mode in stage2_topk_info:
                 metrics.update(stage2_topk_info[mode])
+                metrics.update(
+                    {
+                        key.replace("sparse_", "stage2_final_sparse_", 1): value
+                        for key, value in sparse_topology_metrics.items()
+                        if key.startswith("sparse_")
+                    }
+                )
             rows.append(metrics)
             write_json(mode_dir / "metrics.json", metrics)
             torch.cuda.empty_cache()
@@ -658,6 +986,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent_channels", type=int, default=8)
     parser.add_argument("--latent_grid_resolution", type=int, default=16)
     parser.add_argument("--cond_channels", type=int, default=1024)
+    parser.add_argument(
+        "--stage2_base_guidance",
+        default="none",
+        help="Optional topology prior for Stage2 top-k selection. Use stock_sparse to restrict Stage2 ranking near stock/base sparse coords.",
+    )
+    parser.add_argument("--stage2_base_radius", type=float, default=3.0)
+    parser.add_argument("--stage2_base_min_candidates", type=int, default=512)
+    parser.add_argument(
+        "--stage2_union_stock",
+        action="store_true",
+        help="Union every Stage2 sparse output with stock/base sparse before frozen slat. Equivalent to using mode stage2_union_stock.",
+    )
+    parser.add_argument(
+        "--stage2_sparse_filter",
+        default="none",
+        help=(
+            "Optional Stage2 sparse post-filter before frozen slat. Synthetic eval supports none, largest_component, "
+            "min_component_size, prior_radius. Use real/AR eval for projection_support."
+        ),
+    )
+    parser.add_argument("--filter_min_component_size", type=int, default=64)
+    parser.add_argument("--filter_prior_radius", type=float, default=4.0)
+    parser.add_argument("--filter_min_coords", type=int, default=128)
+    parser.add_argument("--filter_fallback_unfiltered", action="store_true")
     return parser.parse_args()
 
 

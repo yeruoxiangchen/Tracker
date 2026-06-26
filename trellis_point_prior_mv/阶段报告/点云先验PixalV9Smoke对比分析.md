@@ -4658,3 +4658,2336 @@ mask_hit_inside_mean 不低于 0.25-0.30
 ```
 
 如果真实手机 session 达不到这些阈值，就优先改前端采集/点云筛选；如果能达到，再接 candidate rerank 到系统 pipeline。
+
+---
+
+## 真实内部数据 existing sparse direct/streaming 结果
+
+时间：2026-06-23 07:08:06 UTC
+
+相关输出：
+
+```text
+heimei direct countcheck:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_existing_sparse_countcheck_v1/manifest/build_report.json
+
+heimei streaming countcheck:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_existing_sparse_countcheck_v1/manifest/build_report.json
+
+internal7 streaming countcheck:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_existing_internal7_countcheck_v1/manifest/build_report.json
+
+internal7 streaming mesh eval:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_existing_internal7_mesh_eval_v1/mesh_eval/report.json
+```
+
+### Countcheck 结果
+
+| run | uid | frames | source pts | prior pts | mask-any | hit/inside | support mean | norm scale |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| heimei_direct | heimei | 32 | 3059 | 970 | 1.000 | 0.692 | 21.52 | 10.153 |
+| heimei_stream | heimei | 32 | 322 | 140 | 1.000 | 0.903 | 28.58 | 4.836 |
+| internal7_stream | GOOD_MESH_TEST | 18 | 460 | 363 | 1.000 | 0.547 | 9.61 | 0.783 |
+| internal7_stream | reconviagen_20260520_021556 | 18 | 35 | 32 | 1.000 | 0.321 | 4.00 | 1.221 |
+| internal7_stream | reconviagen_20260617_073549 | 18 | 37 | 33 | 1.000 | 0.251 | 4.15 | 0.547 |
+| internal7_stream | reconviagen_20260617_075506 | 18 | 77 | 53 | 0.962 | 0.287 | 3.45 | 2.674 |
+| internal7_stream | heimei | 32 | 322 | 140 | 1.000 | 0.903 | 28.58 | 4.836 |
+| internal7_stream | maliao | 32 | 92 | 85 | 1.000 | 0.914 | 29.08 | 3.555 |
+| internal7_stream | snoopy | 32 | 907 | 334 | 1.000 | 0.777 | 24.12 | 11.169 |
+
+补充现象：
+
+```text
+1. heimei direct 使用已有 sparse/0 的 COLMAP points，object prior 很强：3059 source points -> 970 voxel prior。
+2. heimei streaming 更稀疏，但点更集中在 mask 内：322 source points -> 140 prior，hit/inside 从 0.692 提升到 0.903。
+3. internal7 direct 使用已有 sparse/0 时在 GOOD_MESH_TEST 上失败：supported points = 0 < min_prior_points 20。
+   这说明已有 sparse/0 的 points3D 不一定是可用 object prior，不能把 existing sparse direct 当作所有真实数据的默认路线。
+4. internal7 streaming 分支 7/7 通过 countcheck，prior 点数从 32 到 363 不等；弱样本集中在 2026 几个 reconviagen 序列。
+```
+
+当前解释：
+
+```text
+direct COLMAP points:
+  点多，覆盖可能更强，但更依赖原始 COLMAP points 是否真的落在物体上。
+  heimei 上很好，GOOD_MESH_TEST existing sparse/0 上为 0，说明 direct 需要逐数据集检查。
+
+streaming triangulation:
+  点少，但经过 mask/pose support 后更像未来 AR-like object points。
+  在 internal7 上鲁棒性更好，至少能为所有样本生成可用 prior。
+```
+
+### Mesh Eval 汇总
+
+internal7 streaming mesh eval 使用：
+
+```text
+MODES=stock_sparse,stage2_correct
+TOPK_SPECS=8192,12000,16000
+MESH_EVAL_SAMPLES=2000
+```
+
+| mode | count | ref chamfer mean | ref chamfer median | prior chamfer mean | extent ratio mean | vertex mean |
+|---|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 7 | 0.0609 | 0.0502 | 0.1046 | 0.6358 | 271110 |
+| stage2_correct_8192 | 7 | 0.0253 | 0.0277 | 0.0537 | 0.9369 | 111966 |
+| stage2_correct_12000 | 7 | 0.0252 | 0.0267 | 0.0580 | 0.9383 | 206115 |
+| stage2_correct_16000 | 7 | 0.0246 | 0.0262 | 0.0582 | 0.9405 | 310333 |
+
+逐样本关键结果：
+
+| uid | mode | coord | extent | ref chamfer | prior chamfer | vertices |
+|---|---|---:|---:|---:|---:|---:|
+| GOOD_MESH_TEST | stock_sparse | 23819 | 0.999 | 0.1143 | 0.1817 | 753348 |
+| GOOD_MESH_TEST | stage2_correct_8192 | 8192 | 0.968 | 0.0162 | 0.0227 | 168164 |
+| GOOD_MESH_TEST | stage2_correct_12000 | 12000 | 0.948 | 0.0160 | 0.0280 | 289410 |
+| GOOD_MESH_TEST | stage2_correct_16000 | 16000 | 0.947 | 0.0161 | 0.0261 | 380860 |
+| heimei | stock_sparse | 3715 | 0.515 | 0.0664 | 0.0532 | 106498 |
+| heimei | stage2_correct_8192 | 8192 | 0.881 | 0.0344 | 0.0422 | 133558 |
+| heimei | stage2_correct_12000 | 12000 | 0.881 | 0.0296 | 0.0441 | 244518 |
+| heimei | stage2_correct_16000 | 16000 | 0.907 | 0.0279 | 0.0465 | 353768 |
+| maliao | stock_sparse | 2802 | 0.657 | 0.0502 | 0.0659 | 70912 |
+| maliao | stage2_correct_8192 | 8192 | 0.915 | 0.0222 | 0.0451 | 108148 |
+| maliao | stage2_correct_12000 | 12000 | 0.917 | 0.0260 | 0.0498 | 234346 |
+| maliao | stage2_correct_16000 | 16000 | 0.943 | 0.0280 | 0.0468 | 376676 |
+| reconviagen_20260520_021556 | stock_sparse | 4204 | 0.827 | 0.0355 | 0.1312 | 99316 |
+| reconviagen_20260520_021556 | stage2_correct_8192 | 8192 | 0.986 | 0.0281 | 0.0625 | 86898 |
+| reconviagen_20260520_021556 | stage2_correct_12000 | 12000 | 0.975 | 0.0267 | 0.0630 | 118688 |
+| reconviagen_20260520_021556 | stage2_correct_16000 | 16000 | 0.981 | 0.0252 | 0.0695 | 216764 |
+| reconviagen_20260617_073549 | stock_sparse | 15809 | 0.817 | 0.0346 | 0.0506 | 299398 |
+| reconviagen_20260617_073549 | stage2_correct_8192 | 8192 | 0.979 | 0.0169 | 0.0572 | 107460 |
+| reconviagen_20260617_073549 | stage2_correct_12000 | 12000 | 0.981 | 0.0179 | 0.0580 | 227256 |
+| reconviagen_20260617_073549 | stage2_correct_16000 | 16000 | 0.953 | 0.0186 | 0.0530 | 326948 |
+| reconviagen_20260617_075506 | stock_sparse | 4802 | 0.090 | 0.0788 | 0.1723 | 117043 |
+| reconviagen_20260617_075506 | stage2_correct_8192 | 8192 | 0.979 | 0.0318 | 0.0919 | 60326 |
+| reconviagen_20260617_075506 | stage2_correct_12000 | 12000 | 0.996 | 0.0308 | 0.1099 | 139302 |
+| reconviagen_20260617_075506 | stage2_correct_16000 | 16000 | 1.000 | 0.0262 | 0.1144 | 242638 |
+| snoopy | stock_sparse | 19648 | 0.546 | 0.0468 | 0.0770 | 451258 |
+| snoopy | stage2_correct_8192 | 8192 | 0.851 | 0.0277 | 0.0541 | 119206 |
+| snoopy | stage2_correct_12000 | 12000 | 0.871 | 0.0291 | 0.0532 | 189288 |
+| snoopy | stage2_correct_16000 | 16000 | 0.852 | 0.0300 | 0.0508 | 274678 |
+
+### 结论
+
+这一轮结果支持继续推进真实 AR/SLAM point prior 路线。
+
+关键依据：
+
+```text
+1. internal7 streaming prior 全部样本通过 countcheck，没有出现 prior 完全不可用的问题。
+2. Stage2_correct 在 7 个样本上都明显降低 ref_norm_chamfer_l2_mean：
+   stock mean 0.0609 -> stage2 约 0.0246-0.0253。
+3. extent_ratio 从 stock mean 0.636 提升到 stage2 约 0.937-0.940；
+   这说明 Stage2 不只是贴 prior 点，而是在补完整物体尺度。
+4. 8192 top-k 的 reference chamfer 与 12000/16000 接近，但顶点数显著更低：
+   8192 mean vertices 111,966；
+   12000 mean vertices 206,115；
+   16000 mean vertices 310,333。
+```
+
+因此，现在不是“模型没用”的趋势。更准确的判断是：
+
+```text
+1. 对真实 sparse/SLAM-like prior，Stage2 已经能显著改善 stock sparse/mesh 下游。
+2. 目前收益主要体现在 sparse->mesh 的粗几何覆盖和尺度恢复；
+3. 还不能直接宣称最终系统可用，因为缺少真实手机 AR point map、candidate rerank、以及 direct COLMAP/streaming 的正式成对比较。
+```
+
+### 下一步建议
+
+第一优先级：补 direct vs streaming 成对 mesh eval。
+
+```text
+heimei direct existing sparse 已经有 970 prior coords；
+heimei streaming 有 140 prior coords。
+```
+
+应对同一个 heimei 分别跑 mesh eval：
+
+```text
+branch A: existing sparse direct
+branch B: existing sparse streaming
+```
+
+观察：
+
+```text
+1. direct 是否因为点更多而 mesh 更好；
+2. streaming 是否因为点更干净而更稳；
+3. 8192/12000/16000 哪个 top-k 更适合真实 prior。
+```
+
+第二优先级：补 `RUN_RECONSTRUCT_POSE=1` 的 COLMAP direct/streaming 分支。
+
+当前系统已经可用：
+
+```text
+/home/zjr/anaconda3/envs/foundpose/bin/colmap
+```
+
+小 smoke 显示 heimei 8 帧 COLMAP 可跑通：
+
+```text
+registered_image_count=3 / selected_count=8
+points3D_count=83
+mean_reprojection_error=0.614
+intrinsics_source=existing_sparse
+```
+
+但 8 帧注册比例偏低，不足以作为正式结论。建议用 64 帧跑：
+
+```text
+branch A: RGB -> COLMAP points -> direct prior
+branch B: RGB -> COLMAP pose -> streaming triangulation prior
+```
+
+第三优先级：candidate rerank。
+
+当前 8192、12000、16000 都有合理场景：
+
+```text
+8192:
+  mesh 更轻，prior chamfer 通常更好，适合默认第一候选；
+
+12000:
+  ref chamfer 与 16000 接近，复杂度适中，适合作主候选；
+
+16000:
+  ref chamfer mean 最低，但复杂度最高，适合补 coverage 或弱 prior 样本。
+```
+
+下一步不建议只固定一个 top-k，而是输出 3 个 mesh candidate，再用：
+
+```text
+1. render mask IoU / silhouette consistency
+2. AR/SLAM prior point-to-mesh distance
+3. extent ratio sanity
+4. mesh complexity penalty
+```
+
+做 rerank。
+
+第四优先级：真实手机 AR session smoke。
+
+离线 existing sparse 和 COLMAP proxy 已经说明路线有潜力，但最终系统还是要看手机端返回的 sparse point map 是否达到：
+
+```text
+prior coords >= 40-60
+projection_any_mask_hit_ratio 接近 1
+projection_mask_hit_over_inside_mean >= 0.25-0.30
+support_mean >= 3
+```
+
+如果真实手机点云达不到这个阈值，优先改前端点云采集/筛选；如果达标，再把 candidate rerank 接入实际 AR pipeline。
+
+---
+
+## heimei direct/streaming 与 RGB->COLMAP 64 帧评测结果
+
+时间：2026-06-23 UTC
+
+相关输出：
+
+```text
+existing sparse direct mesh:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_direct_heimei_existing_sparse_mesh_eval_v1/mesh_eval/report.json
+
+existing sparse streaming mesh:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_existing_sparse_mesh_eval_v1/mesh_eval/report.json
+
+RGB->COLMAP direct countcheck:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_rgb64_countcheck_v1/colmap_reconstruction_report.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_rgb64_countcheck_v1/manifest/build_report.json
+
+RGB->COLMAP streaming countcheck:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_rgb64_countcheck_v1/slam_like_points_report.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_rgb64_countcheck_v1/manifest/build_report.json
+
+RGB->COLMAP direct mesh:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_colmap_direct_heimei_rgb64_mesh_eval_v1/mesh_eval/report.json
+
+RGB->COLMAP streaming mesh:
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_like_streaming_slam/ar_like_streaming_heimei_rgb64_mesh_eval_v1/mesh_eval/report.json
+```
+
+### Countcheck 对比
+
+| prior source | frames | source pts | prior pts | mask-any | hit/inside | support mean | norm scale |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| existing direct | 32 | 3059 | 970 | 1.000 | 0.692 | 21.52 | 10.153 |
+| existing streaming | 32 | 322 | 140 | 1.000 | 0.903 | 28.58 | 4.836 |
+| RGB64 direct | 29 | 434 | 182 | 0.989 | 0.649 | 18.73 | 18.075 |
+| RGB64 streaming | 29 | 69 | 55 | 1.000 | 0.915 | 26.55 | 7.359 |
+
+RGB->COLMAP 64 帧重建质量：
+
+```text
+selected_count = 64
+registered_image_count = 29
+registered_ratio = 0.453
+points3D_count = 1656
+mean_reprojection_error = 0.549
+intrinsics_source = existing_sparse
+fix_intrinsics = 1
+```
+
+解释：
+
+```text
+1. existing direct 是 heimei 上最强的 point prior：已有 sparse/0 中 object support 后还有 3059 点，voxel 后 970 点。
+2. existing streaming 点更少，但更“干净”：hit/inside 达到 0.903，高于 direct 的 0.692。
+3. RGB64 direct 的 COLMAP 重建可用，但注册率只有 29/64=45.3%，导致 object prior 比 existing direct 明显变弱。
+4. RGB64 streaming 点最少，仅 55 prior coords，但 mask 命中质量最好，说明 streaming filter 更严格。
+```
+
+### Mesh Eval 对比
+
+| prior | mode | coord | ref chamfer | prior chamfer | extent | vertices |
+|---|---|---:|---:|---:|---:|---:|
+| existing direct | stock_sparse | 7714 | 0.0533 | 0.0712 | 0.645 | 163068 |
+| existing direct | stage2_8192 | 8192 | 0.0186 | 0.0242 | 0.960 | 143620 |
+| existing direct | stage2_12000 | 12000 | 0.0197 | 0.0301 | 0.964 | 248826 |
+| existing direct | stage2_16000 | 16000 | 0.0196 | 0.0334 | 0.979 | 337523 |
+| existing streaming | stock_sparse | 7714 | 0.0534 | 0.0731 | 0.645 | 163082 |
+| existing streaming | stage2_8192 | 8192 | 0.0189 | 0.0438 | 0.943 | 151004 |
+| existing streaming | stage2_12000 | 12000 | 0.0206 | 0.0437 | 0.952 | 258234 |
+| existing streaming | stage2_16000 | 16000 | 0.0181 | 0.0450 | 0.939 | 371172 |
+| RGB64 direct | stock_sparse | 6780 | 0.0545 | 0.0328 | 0.557 | 122324 |
+| RGB64 direct | stage2_8192 | 8192 | 0.0210 | 0.0521 | 0.948 | 165072 |
+| RGB64 direct | stage2_12000 | 12000 | 0.0208 | 0.0449 | 0.939 | 280299 |
+| RGB64 direct | stage2_16000 | 16000 | 0.0204 | 0.0447 | 0.955 | 391754 |
+| RGB64 streaming | stock_sparse | 6780 | 0.0554 | 0.0636 | 0.557 | 122362 |
+| RGB64 streaming | stage2_8192 | 8192 | 0.0207 | 0.0590 | 0.961 | 174424 |
+| RGB64 streaming | stage2_12000 | 12000 | 0.0203 | 0.0592 | 0.953 | 273444 |
+| RGB64 streaming | stage2_16000 | 16000 | 0.0210 | 0.0590 | 0.952 | 395704 |
+
+### 结论
+
+这轮 heimei 结果有三个明确结论。
+
+第一，Stage2 对真实 prior 是有效的，不是只在合成数据上有效：
+
+```text
+existing direct:
+  stock ref chamfer 0.0533 -> stage2 0.0186-0.0197
+
+existing streaming:
+  stock ref chamfer 0.0534 -> stage2 0.0181-0.0206
+
+RGB64 direct:
+  stock ref chamfer 0.0545 -> stage2 0.0204-0.0210
+
+RGB64 streaming:
+  stock ref chamfer 0.0554 -> stage2 0.0203-0.0210
+```
+
+第二，existing sparse direct 在 heimei 上最好：
+
+```text
+existing direct + stage2_8192:
+  ref chamfer = 0.0186
+  prior chamfer = 0.0242
+  extent = 0.960
+  vertices = 143620
+```
+
+它同时有最强 prior 点数和最低 prior chamfer。说明如果真实系统能提供高质量 sparse map points，直接使用 map points 是有价值的。
+
+第三，RGB->COLMAP proxy 目前能跑通，但还不是最优 proxy：
+
+```text
+registered_ratio = 0.453
+RGB64 direct prior = 182 coords
+RGB64 streaming prior = 55 coords
+```
+
+这说明当前 RGB->COLMAP 64 帧在 heimei 上只注册了不到一半帧。Stage2 仍然能补出合理几何，但 prior 本身明显弱于已有 `sparse/0`。因此如果后面要用 RGB->COLMAP 作为真实数据集 proxy，应该先优化 COLMAP/SLAM 重建质量，而不是直接把它当作最终训练数据来源。
+
+### top-k 判断
+
+当前 heimei 上：
+
+```text
+8192:
+  通常已经足够，顶点数最低；
+  existing direct 中 ref/prior chamfer 都最好。
+
+12000:
+  更稳的中间值，但复杂度明显上升；
+  RGB64 direct/streaming 中与 8192/16000 差距不大。
+
+16000:
+  有时 ref chamfer 略好，但顶点/面数最高；
+  不适合作默认唯一输出，适合作候选之一。
+```
+
+因此默认 candidate 仍建议保留：
+
+```text
+8192 / 12000 / 16000
+```
+
+但 rerank 时应该偏好：
+
+```text
+1. ref/silhouette 合理；
+2. prior distance 不爆；
+3. extent_ratio 在合理区间；
+4. vertex_count 不过高。
+```
+
+### 下一步建议
+
+第一优先级：补 `COLMAP_USE_MASKS=1` ablation。
+
+目的不是让 mask-only 必然更好，而是判断：
+
+```text
+full-image COLMAP:
+  pose 更稳，但背景点更多；
+
+mask-only COLMAP:
+  object points 更干净，但低纹理物体可能注册失败。
+```
+
+建议只先跑 heimei：
+
+```text
+RGB64 direct full-image vs RGB64 direct mask-only
+RGB64 streaming full-image vs RGB64 streaming mask-only
+```
+
+第二优先级：优化 RGB->COLMAP 注册率。
+
+当前 `registered_ratio=0.453` 偏低。建议尝试：
+
+```text
+1. COLMAP_MAX_FRAMES=96 或 128；
+2. COLMAP_MATCHER=sequential, COLMAP_SEQUENTIAL_OVERLAP=12；
+3. COLMAP_FRAME_SELECT=random_uniform 保持；
+4. 保持 fixed existing intrinsics。
+```
+
+目标是：
+
+```text
+registered_ratio >= 0.65
+points3D_count 明显高于 1656
+object prior coords >= 300
+```
+
+第三优先级：实现 candidate rerank。
+
+现在 Stage2 候选都有效，真正需要的是自动选：
+
+```text
+8192 / 12000 / 16000 哪个 mesh 更适合当前样本。
+```
+
+rerank 指标建议：
+
+```text
+1. multi-view silhouette IoU；
+2. prior point-to-mesh distance；
+3. mesh extent sanity；
+4. vertex/face complexity penalty。
+```
+
+第四优先级：真实手机 AR session smoke。
+
+heimei 说明：如果有高质量 sparse points，direct route 很强。
+所以手机端如果能上传 AR/SLAM map points，应优先测试：
+
+```text
+AR map points direct prior
+AR pose + local feature streaming triangulation prior
+```
+
+并比较二者是否复现 heimei 的趋势。
+
+## 四十四、2026-06-24 手机 AR session mesh smoke 与黑色碎片分析
+
+### 测试对象
+
+本轮使用 `trellis_point_prior_mv/scripts/run_ar_session_server.sh` 采集的真实手机 AR session，其中四组完成 capture-only finalize，具备 RGB、pose、mask、`slam_points.jsonl` 和 `trellis_point_prior_capture_report.json`：
+
+```text
+20260624_010530_849
+20260624_011149_207
+20260624_011450_447
+20260624_011933_843
+```
+
+其中 `20260624_011933_843` 点云最密，`ar_direct` 构建后达到 `prior=1500` 上限；`20260624_011450_447` 只有 `prior=100`，用于低点数压力测试。
+
+可视化和统计输出路径：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/mesh_visual_analysis_20260624/
+```
+
+### AR direct countcheck 结论
+
+| session | frames | source points | prior coords | mask any | hit inside | support mean |
+|---|---:|---:|---:|---:|---:|---:|
+| 20260624_010530_849 | 18 | 2810 | 565 | 0.986 | 0.326 | 3.61 |
+| 20260624_011149_207 | 18 | 2025 | 302 | 0.997 | 0.270 | 3.99 |
+| 20260624_011450_447 | 18 | 278 | 100 | 1.000 | 0.430 | 7.45 |
+| 20260624_011933_843 | 18 | 9811 | 1500 | 0.996 | 0.374 | 5.26 |
+
+结论：
+
+1. 真实手机 session 的格式是可用的，AR direct point prior 能进入当前 Stage2 构建和 mesh eval 流程。
+2. 手机直接回传的 AR 点云明显比 pose-streaming SIFT 三角化更密。`pose_streaming` 在同样 session 上通常只有几十到一百多个 prior coords，因此当前真实手机接入优先测试 `ar_direct`。
+3. `20260624_011933_843` 是当前最适合做 mesh smoke 的样本；`20260624_011450_447` 是低点数失败边界样本。
+
+### Dense session mesh 结果
+
+session：`20260624_011933_843`
+
+输入图像显示目标是紫红色透明/半透明抽屉类物体，背景主要是地砖和椅子，不存在大面积黑色目标表面。
+
+| mode | prior coords | sparse coords | vertices | faces | extent ratio | prior chamfer | black vertex ratio | components |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 1500 | 3097 | 93978 | 187940 | 0.201 | 0.0587 | 0.64% | 2 |
+| stage2_correct_8192 | 1500 | 8192 | 140036 | 276360 | 0.789 | 0.0178 | 54.9% | 1004 |
+| stage2_correct_12000 | 1500 | 12000 | 246140 | 488766 | 0.824 | 0.0246 | 60.9% | 957 |
+
+判断：
+
+1. `stage2_correct_8192` 明显比 `stock_sparse` 更贴近 AR point prior，`prior chamfer` 从 `0.0587` 降到 `0.0178`。
+2. 但 Stage2 输出接冻结 stock slat/mesh 后产生大量黑色碎片。`8192` 已经有 `1004` 个连通块，最大连通块比例只有约 `46.8%`。
+3. `12000` 比 `8192` 更过填充，顶点/面数大幅增加，黑色顶点比例和 prior chamfer 都更差，不应作为当前主候选。
+
+### Sparse session mesh 结果
+
+session：`20260624_011450_447`
+
+输入图像显示目标是橙红色玩具，颜色干净，目标本身也不能解释 Stage2 mesh 的大面积黑色。
+
+| mode | prior coords | sparse coords | vertices | faces | extent ratio | prior chamfer | black vertex ratio | largest component ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 100 | 4383 | 77874 | 155736 | 0.448 | 0.2155 | 0.61% | 86.1% |
+| stage2_correct_8192 | 100 | 8192 | 141134 | 274924 | 0.946 | 0.1743 | 82.8% | 3.7% |
+| stage2_correct_12000 | 100 | 12000 | 248234 | 489604 | 0.941 | 0.1684 | 67.9% | 2.4% |
+
+判断：
+
+1. 低点数 AR prior 下，Stage2 仍会把预测 sparse 拉向 prior 附近，但 mesh 基本碎成大量黑色小片。
+2. 该样本只能说明“100 个 voxel prior 太弱”，不能作为当前模型可用于 CoarseModel 的证据。
+3. 真实 AR session 进入 mesh 生成时，至少需要 prior coords 达到几百以上；`prior=100` 这种场景应触发重采集或降级到 stock/reconviagen，而不是直接使用 Stage2 mesh。
+
+### 黑色微影原因
+
+本轮检查了 OBJ 顶点颜色。黑色不是 viewer 阴影，也不是输入物体真实颜色，而是写入 OBJ 的顶点颜色本身已经大面积接近黑色。
+
+主要原因判断：
+
+1. 当前 Stage2 只训练/替换 sparse flow，后续 slat flow、mesh decoder、texture/vertex color 仍是冻结 stock TRELLIS/ReconViaGen 下游。
+2. Stage2 输出的 sparse coords 对冻结 slat flow 来说存在分布偏移，尤其是 AR prior bbox 归一化后可能产生 unsupported voxel 和大量孤立小连通块。
+3. 这些孤立 voxel 进入冻结 slat/mesh 后没有可靠图像支持，texture/vertex color 容易被生成为黑色或近黑色。
+4. top-k 越高，unsupported coords 越多，黑色碎片越明显。`12000` 在本轮已经比 `8192` 更差。
+5. 低点数 prior 下，模型为了补全会更容易发散到大范围碎片，因此黑色微影更严重。
+
+因此，这不是简单的“颜色后处理”问题。重染色只能遮住黑色，不能修复 geometry 碎片。真正需要先处理 Stage2 输出 sparse 的 unsupported / isolated component。
+
+### 当前阶段结论
+
+1. 真实手机 AR direct point prior 已经打通，数据格式和构建流程可用。
+2. Dense AR point prior 上，Stage2 sparse 的确有正向信号：它能显著提升 mesh 对 point prior 的贴合程度。
+3. 但当前 Stage2 mesh 不能直接作为最终 mesh 进入 CoarseModel，因为黑色碎片和连通块爆炸说明 sparse 输出与冻结下游 slat/mesh 不匹配。
+4. `stage2_correct_8192` 是当前比 `12000` 更合理的候选；`12000/16000` 不应作为默认主候选。
+5. 在解决 post-filter / rerank / slat 适配之前，不建议直接做大规模长训并期望 mesh 质量自然变好。
+
+### 下一步建议
+
+第一优先级：补低 top-k sweep，只测 dense session。
+
+建议：
+
+```text
+topk = 4096 / 6144 / 8192
+```
+
+目标是确认能否在保留 prior 贴合收益的同时减少黑色碎片和连通块数量。
+
+第二优先级：在 Stage2 sparse 输出后、进入 slat 前增加过滤。
+
+建议过滤项：
+
+```text
+1. mask/pose projection support filter；
+2. visible/support view count filter；
+3. remove tiny connected components；
+4. optionally keep largest/high-support components；
+5. 对过低 prior_point_count 的 session 直接拒绝或降级。
+```
+
+第三优先级：实现 candidate rerank。
+
+候选不应该只按 prior distance 排序，还需要加入：
+
+```text
+1. dark_vertex_ratio；
+2. component_count；
+3. largest_component_ratio；
+4. mesh extent sanity；
+5. prior point-to-mesh distance；
+6. multi-view mask silhouette consistency。
+```
+
+第四优先级：再考虑 slat flow 训练。
+
+如果过滤和 rerank 后 Stage2 sparse 仍然稳定优于 stock 但颜色/细节差，才进入 slat flow 训练。当前直接训练 slat flow 的风险是：sparse 输入本身还没有被约束干净，slat 会被迫学习处理大量 unsupported/fragmented geometry。
+
+## 四十五、2026-06-24 四组手机 AR session top-k 诊断结果
+
+### 测试设置
+
+本轮对四组真实手机 AR session 统一运行：
+
+```text
+PRIOR_BRANCH=ar_direct
+MODES=stock_sparse,stage2_correct
+TOPK_SPECS=4096,6000,8192,12000
+MESH_EVAL_SAMPLES=2000
+```
+
+对应输出：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_*_ar_direct_mesh_smoke_topk_diag_v2/
+```
+
+额外 OBJ 级黑色顶点和连通块统计：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/topk_diag_v2_mesh_artifact_summary.json
+```
+
+### 按 top-k 聚合结果
+
+| mode | count | chamfer mean | black mean | component mean | largest comp mean | vertex mean | extent mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 4 | 0.1099 | 0.019 | 4.2 | 0.962 | 108276 | 0.373 |
+| stage2_correct_4096 | 4 | 0.0464 | 0.532 | 738.2 | 0.258 | 44348 | 0.908 |
+| stage2_correct_6000 | 4 | 0.0702 | 0.649 | 1360.2 | 0.182 | 87518 | 0.914 |
+| stage2_correct_8192 | 4 | 0.0794 | 0.705 | 1662.8 | 0.156 | 144989 | 0.910 |
+| stage2_correct_12000 | 4 | 0.0789 | 0.709 | 1635.8 | 0.169 | 262682 | 0.913 |
+
+结论：
+
+1. `4096` 是当前最稳的 Stage2 top-k。四个 session 中，`stage2_correct_4096` 都是 prior chamfer 最低的 Stage2 候选。
+2. top-k 增大后，vertex/face 数显著增加，但 prior chamfer 反而变差，说明 `6000/8192/12000` 主要是在补 unsupported / low-confidence 区域，而不是稳定补全物体。
+3. 降到 `4096` 能减少碎片和黑色顶点，但没有根治。`stage2_correct_4096` 的平均黑色顶点比例仍有 `53.2%`，平均连通块仍有 `738` 个。
+4. stock mesh 的 black ratio 和连通性非常正常，说明黑色碎片不是输入图像或 OBJ viewer 的普遍问题，而是 Stage2 sparse 输出接冻结 slat/mesh 后产生的分布问题。
+
+### 每组最佳 Stage2 候选
+
+| session | prior | stock chamfer | stock black | stock comp | stock largest | best stage2 | stage2 chamfer | stage2 black | stage2 comp | stage2 largest |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| 20260624_010530_849 | 565 | 0.0602 | 0.064 | 1 | 1.000 | stage2_correct_4096 | 0.0103 | 0.515 | 682 | 0.166 |
+| 20260624_011149_207 | 302 | 0.1007 | 0.001 | 5 | 0.999 | stage2_correct_4096 | 0.0557 | 0.537 | 914 | 0.156 |
+| 20260624_011450_447 | 100 | 0.2190 | 0.006 | 9 | 0.861 | stage2_correct_4096 | 0.1140 | 0.816 | 963 | 0.127 |
+| 20260624_011933_843 | 1500 | 0.0596 | 0.006 | 2 | 0.988 | stage2_correct_4096 | 0.0056 | 0.260 | 394 | 0.583 |
+
+解读：
+
+1. `20260624_011933_843` 是唯一一个 Stage2 结果相对可分析的 session：`prior=1500`，`stage2_correct_4096` 的 chamfer 降到 `0.0056`，黑色比例降到 `26.0%`，最大连通块比例达到 `58.3%`。
+2. 其余三组即使使用 `4096`，仍然表现为大量黑色碎片，最大连通块比例只有 `12.7%-16.6%`。这说明当前 Stage2 对低质量/低密度 AR prior 非常敏感。
+3. `prior=100` 的 `20260624_011450_447` 明确不适合作为可用生成样本，应视为重采集或降级触发条件。
+
+### 对三个可能原因的判断
+
+本轮 top-k 诊断进一步支持“三个因素叠加”的解释：
+
+```text
+1. Stage2 sparse coords 本身已经有碎片化问题；
+2. unsupported surface 缺少可靠图像条件，导致 texture/vertex color 生成黑色；
+3. 即使部分 sparse coords 贴近 prior，冻结 slat/mesh decoder 对这种 Stage2 sparse 分布仍然 OOD。
+```
+
+其中最直接的证据是：
+
+```text
+stock_sparse:
+  black mean = 1.9%
+  component mean = 4.2
+  largest comp mean = 96.2%
+
+stage2_correct_4096:
+  black mean = 53.2%
+  component mean = 738.2
+  largest comp mean = 25.8%
+```
+
+如果只是 texture 问题，连通块不应该从个位数暴增到几百上千。因此 Stage2 sparse 本身的 unsupported / isolated coords 必须优先处理。
+
+### 当前阶段结论
+
+1. 手机 AR direct point prior 方向仍然有信号：Stage2 可以显著降低 mesh 到 prior 的距离。
+2. 但当前 mesh 质量瓶颈不是 top-k 取值本身，而是 Stage2 sparse 输出缺少几何连通性和可见性约束。
+3. `4096` 应作为后续默认诊断 top-k；`8192/12000/16000` 暂时不适合作为 AR session 默认候选。
+4. 现在还不能把 Stage2 mesh 直接接入 CoarseModel，也不应该立刻进入 slat 长训。
+
+### 下一步建议
+
+第一优先级：新增 sparse-level 诊断，不经过 slat/mesh。
+
+需要直接统计 Stage2 输出 sparse coords：
+
+```text
+1. sparse coord connected components；
+2. largest sparse component ratio；
+3. tiny component count；
+4. prior-supported coord ratio；
+5. mask-projection-supported coord ratio；
+6. outside visual hull ratio。
+```
+
+如果 sparse coords 已经碎，问题在 sparse flow / top-k / prior normalization；如果 sparse coords 连通但 mesh 碎，问题更偏 slat/mesh OOD。
+
+第二优先级：实现 Stage2 sparse 输出过滤后再进 slat。
+
+建议先做 eval-time 过滤，不重训：
+
+```text
+1. keep largest sparse component；
+2. keep components near prior coords；
+3. mask/pose support filter；
+4. prior distance filter；
+5. top-k=4096。
+```
+
+只要过滤后黑色顶点比例和连通块数显著下降，就证明当前主要问题是 Stage2 输出中的 unsupported/fragment coords。
+
+第三优先级：candidate rerank 加入 artifact 指标。
+
+当前 rerank 不应只看 prior chamfer，应加入：
+
+```text
+dark_vertex_ratio
+component_count
+largest_component_ratio
+extent_ratio
+prior_norm_chamfer
+```
+
+第四优先级：设置真实 AR session 使用门槛。
+
+建议暂定：
+
+```text
+prior coords < 300:
+  不跑 Stage2，触发重采集或降级；
+
+300 <= prior coords < 800:
+  只做 diagnostic，不作为最终 mesh；
+
+prior coords >= 1000:
+  可以进入 Stage2 + filter + rerank smoke。
+```
+
+第五优先级：在 sparse 输出过滤验证有效后，再考虑 slat flow 训练。
+
+如果不先过滤 sparse，slat 训练会被迫学习大量 unsupported/fragmented sparse 输入，训练信号会混乱。当前更合理的顺序是：
+
+```text
+sparse diagnostics
+-> sparse filtering
+-> candidate rerank
+-> 再决定是否训练 slat flow
+```
+
+## 四十六、2026-06-24 Stage2 sparse filter 诊断结果与 visual-hull 指标修正
+
+### 本轮运行内容
+
+本轮对四组手机 AR session 运行了 Stage2 sparse-level 诊断：
+
+```text
+topk = 2048 / 4096 / 6144 / 8192
+filter_specs =
+  none
+  min_component_size
+  prior_radius,projection_support
+  min_component_size,prior_radius,projection_support
+  largest_component,prior_radius,projection_support
+```
+
+输出路径：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_*_stage2_sparse_diag_v1/
+```
+
+随后对最密的 session `20260624_011933_843` 跑了两组 filtered mesh：
+
+```text
+min_component_size,prior_radius,projection_support
+largest_component,prior_radius,projection_support
+```
+
+输出路径：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_filter_*_4096_mesh_v1/
+```
+
+### 代码修正
+
+本轮确认了一个问题：之前的 `projection_support` 只表示“任意一帧投影进 mask”，不是严格 visual hull。
+
+因此补充了以下指标：
+
+```text
+visible_outside_mask_event_ratio
+visible_outside_mask_point_mean
+visible_support_ratio_mean
+visible_support_ratio_median
+visual_hull_keep_ratio
+visual_hull_kept_count
+```
+
+并新增可配置阈值：
+
+```text
+--visual_hull_min_visible_views
+--visual_hull_min_support_ratio
+```
+
+修改文件：
+
+```text
+trellis_point_prior_mv/sparse_coord_tools.py
+trellis_point_prior_mv/eval_real_slam_stage2_sparse_diagnostics.py
+trellis_point_prior_mv/run_real_slam_prior_mesh.py
+trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+trellis_point_prior_mv/命令说明.txt
+```
+
+注意：
+
+```text
+--filter_min_component_size 64
+```
+
+只有在 filter spec 包含 `min_component_size` 时生效；对 `largest_component` 不生效。
+
+### Sparse 诊断结论
+
+#### 1. raw Stage2 sparse 本身已经碎
+
+以 `topk=4096` 为例：
+
+| session | prior coords | raw coord count | raw components | raw largest ratio | raw projection keep |
+|---|---:|---:|---:|---:|---:|
+| 20260624_010530_849 | 565 | 4096 | 1616 | 0.078 | 0.590 |
+| 20260624_011149_207 | 302 | 4096 | 1846 | 0.075 | 0.563 |
+| 20260624_011450_447 | 100 | 4096 | 2124 | 0.039 | 0.506 |
+| 20260624_011933_843 | 1500 | 4096 | 1214 | 0.392 | 0.737 |
+
+结论：
+
+1. 前三组 raw Stage2 sparse 已经非常碎，最大连通块比例低于 `0.08`。
+2. 最密的 `20260624_011933_843` 明显更好，但仍有 `1214` 个连通块。
+3. 因此黑色碎片不能只归因于 texture/vertex color，Stage2 sparse coords 本身确实存在 unsupported / isolated component。
+
+#### 2. filter 能显著清理 sparse，但不同策略强度不同
+
+`20260624_011933_843, topk=4096`：
+
+| filter | final coords | final components | final largest ratio | filter keep |
+|---|---:|---:|---:|---:|
+| none | 4096 | 1214 | 0.392 | 1.000 |
+| min_component_size | 1794 | 3 | 0.895 | 0.438 |
+| prior_radius,projection_support | 2280 | 147 | 0.689 | 0.557 |
+| min_component_size,prior_radius,projection_support | 1727 | 5 | 0.910 | 0.422 |
+| largest_component,prior_radius,projection_support | 1575 | 2 | 0.997 | 0.385 |
+
+结论：
+
+1. `min_component_size` 是更稳的基础过滤。它能把 component 从 `1214` 降到 `3`，同时保留 `1794` 个 coords。
+2. `largest_component` 最强，能得到接近单一连通块，但会更激进地删除结构。
+3. `prior_radius,projection_support` 单独使用不够，仍保留 `147` 个 component。
+
+#### 3. 当前 projection_support 太宽松
+
+在重新计算 stricter visual-hull 指标后，发现很多 coords 虽然能在至少一帧命中 mask，但在所有可见视角中仍大量落在 mask 外。
+
+`20260624_011933_843, topk=4096`：
+
+| filter | coord count | component | largest | projection keep | visual hull keep | outside mask event | visible support mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| none | 4096 | 1214 | 0.392 | 0.737 | 0.698 | 0.699 | 0.273 |
+| min_component_size | 1794 | 3 | 0.895 | 0.963 | 0.944 | 0.643 | 0.354 |
+| prior_radius,projection_support | 2280 | 147 | 0.689 | 1.000 | 0.975 | 0.637 | 0.367 |
+| min_component_size,prior_radius,projection_support | 1727 | 5 | 0.910 | 1.000 | 0.981 | 0.634 | 0.368 |
+| largest_component,prior_radius,projection_support | 1575 | 2 | 0.997 | 1.000 | 0.979 | 0.633 | 0.368 |
+
+解读：
+
+1. `projection_keep=1.0` 不代表严格 visual hull 正确，只代表至少满足当前支持阈值。
+2. `outside mask event` 仍在 `0.63` 左右，说明在可见视角里仍有大量投影落在 mask 外。
+3. 当前 `visual_hull_min_support_ratio=0.10` 仍较宽松；下一轮应提高到 `0.25` 或更高，并要求至少 2 个可见视角。
+
+### Filtered mesh 结果
+
+对 `20260624_011933_843, topk=4096`，两组 filtered mesh 的 OBJ 统计如下：
+
+| mode | coords | prior chamfer | black ratio | dark ratio | mesh components | largest mesh ratio | small comp ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| unfiltered stage2_4096 | 4096 | 0.0056 | 0.260 | 0.340 | 394 | 0.583 | 0.208 |
+| largest_component,prior_radius,projection_support | 1815 | 0.0089 | 0.267 | 0.341 | 45 | 0.832 | 0.020 |
+| min_component_size,prior_radius,projection_support | 1956 | 0.0043 | 0.349 | 0.424 | 72 | 0.811 | 0.049 |
+
+结论：
+
+1. sparse filter 明显改善了 mesh 连通性：mesh components 从 `394` 降到 `45/72`，最大 mesh component 从 `0.583` 提升到 `0.811-0.832`。
+2. 但黑色顶点比例没有下降，甚至 `min_component_size` 方案从 `0.260` 升到 `0.349`。
+3. 这说明过滤能修几何碎片，但黑色问题不完全由小连通块导致；冻结 slat/mesh/texture 对 Stage2 sparse 分布仍然 OOD，或者剩余表面仍缺少可靠图像支持。
+4. `largest_component,prior_radius,projection_support` 在 mesh 连通性上更好，`min_component_size,prior_radius,projection_support` 在 prior chamfer 上更好。二者体现了“几何干净”和“贴 prior”之间的 tradeoff。
+
+### 当前判断
+
+本轮结果把三个原因拆得更清楚：
+
+```text
+1. Stage2 sparse coords 本身碎：成立。
+   raw component 数量很高，largest ratio 很低。
+
+2. unsupported surface 缺少可靠图像条件：成立。
+   projection_support 过宽松，visible outside mask event 仍很高。
+
+3. frozen slat/mesh decoder 对 Stage2 coords OOD：也成立。
+   sparse filter 后 mesh 连通性改善，但黑色比例没有同步下降。
+```
+
+因此，下一步不能只做单一方案。应先继续把 sparse filter 做严格，再判断 slat 是否必须训练。
+
+### 下一步建议
+
+第一优先级：跑 stricter visual-hull diagnostics。
+
+建议配置：
+
+```text
+topk = 2048,4096
+filter_min_support_views = 2
+visual_hull_min_visible_views = 2
+visual_hull_min_support_ratio = 0.25
+```
+
+只先跑 `20260624_011933_843`。
+
+第二优先级：如果严格 visual-hull 后仍保留几百到一千多个 coords，再跑 filtered mesh。
+
+优先测试：
+
+```text
+min_component_size,prior_radius,projection_support
+```
+
+原因是它比 `largest_component` 更不容易误删真实多部件结构。
+
+第三优先级：补 mesh 后 artifact rerank。
+
+现在需要把以下指标自动算入 report：
+
+```text
+black_vertex_ratio
+dark_vertex_ratio
+mesh_component_count
+mesh_largest_component_ratio
+small_component_ratio
+```
+
+否则只能人工额外脚本统计，无法自动 rerank。
+
+第四优先级：暂不直接 slat 长训。
+
+本轮已经证明 sparse filter 能减少 mesh component，但不能解决黑色。下一步应先确认 stricter visual-hull 是否能同时减少黑色；如果不能，再考虑：
+
+```text
+1. slat flow 适配 Stage2 sparse；
+2. texture/vertex color 约束；
+3. 或 Stage2 sparse 后处理 + stock/reconviagen candidate rerank。
+```
+
+## 四十七、2026-06-24 Base sparse vs Stage2 sparse 直接对比
+
+### 测试目的
+
+上一轮已经从 mesh 结果看到：
+
+```text
+stock mesh 连通性正常；
+Stage2 mesh 黑色碎片和连通块很多。
+```
+
+但 mesh 结果仍然是经过 slat/mesh decoder 后的间接证据。本轮直接比较：
+
+```text
+base / stock sparse sampler 输出的 sparse coords
+vs
+Stage2 topk=4096 输出的 sparse coords
+```
+
+目的是回答：
+
+```text
+正常 TRELLIS sparse 输出本来是否就会像 Stage2 一样碎？
+```
+
+### 结果
+
+统计文件：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/base_vs_stage2_sparse_diag_v1.json
+```
+
+| session | prior | base coords | base comp | base largest | base proj keep | stage2 coords | stage2 comp | stage2 largest | stage2 proj keep |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20260624_010530_849 | 565 | 5530 | 1 | 1.000 | 0.533 | 4096 | 1616 | 0.078 | 0.590 |
+| 20260624_011149_207 | 302 | 5427 | 1 | 1.000 | 0.371 | 4096 | 1846 | 0.075 | 0.563 |
+| 20260624_011450_447 | 100 | 4383 | 2 | 0.901 | 0.752 | 4096 | 2124 | 0.039 | 0.506 |
+| 20260624_011933_843 | 1500 | 3097 | 1 | 1.000 | 0.812 | 4096 | 1214 | 0.392 | 0.737 |
+
+### 结论
+
+1. 可以直接证明：base sparse 的输出本来不应该像 Stage2 这样散。
+2. 四组手机 AR session 中，base sparse 基本都是 `1-2` 个连通块，最大连通块比例 `0.901-1.000`。
+3. Stage2 topk=4096 则是 `1214-2124` 个连通块，前三组最大连通块比例只有 `0.039-0.078`。
+4. 因此，Stage2 当前的碎片不是 TRELLIS sparse decoder 的天然现象，而是 Stage2 point-prior sparse 输出分布的问题。
+5. base sparse 的 projection keep 未必比 Stage2 高，但其几何连通性远强。这说明 Stage2 虽然更贴 prior，但打破了 stock sparse 的自然几何连通分布。
+
+### 对后续路线的影响
+
+这一步把问题定位进一步前移：
+
+```text
+Stage2 sparse flow 本身需要连通性 / topology regularization / component-aware filtering。
+```
+
+如果只训练 slat flow，slat 会被迫适配碎片化 sparse 输入，风险较高。更合理的顺序仍然是：
+
+```text
+1. 先修 Stage2 sparse 输出连通性；
+2. 再做 filtered sparse -> frozen slat/mesh；
+3. 若几何干净但颜色仍黑，再训练 slat / texture。
+```
+
+下一步应优先测试：
+
+```text
+1. stricter visual-hull filter；
+2. component-aware sparse post-filter；
+3. 训练阶段加入 sparse connectivity / anti-island regularization；
+4. 最后再考虑 slat flow。
+```
+
+## 四十八、2026-06-24 既有真实/合成数据的 Base vs Stage2 sparse 连通性复查
+
+### 测试目的
+
+上一节只比较了四组手机 AR session。为了确认“Stage2 sparse 碎片化”是否只发生在手机 AR session，本轮复查了先前已经跑过的既有输出：
+
+```text
+1. PixalV9 synthetic val64 top-k sweep
+2. PixalV9 synthetic val128 top-k sweep
+3. real_slam_prior_four top-k sweep
+```
+
+这一步不需要重新跑 GPU，只读取已有 `sparse_coords.npz` 并统计连通块。
+
+统计文件：
+
+```text
+trellis_point_prior_mv/outputs/sparse_component_compare_base_stage2_existing_runs_v1.json
+```
+
+### PixalV9 synthetic val64
+
+输出来源：
+
+```text
+trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_rank_w0005_ws05_s200_seed42_val64_mesh_topk/
+```
+
+| mode | count | coords mean | comp mean | comp median | largest mean | largest median | small64 coord mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| target_sparse | 64 | 8363 | 2.8 | 1.0 | 0.958 | 1.000 | 0.001 |
+| stock_sparse | 64 | 5755 | 1.9 | 1.0 | 0.941 | 1.000 | 0.002 |
+| stage2_correct_r0_35_cap4096 | 64 | 2585 | 984.8 | 1070.0 | 0.050 | 0.025 | 0.934 |
+| stage2_correct_r0_50_cap8192 | 64 | 3989 | 1101.1 | 1190.5 | 0.081 | 0.043 | 0.806 |
+| stage2_correct_r0_75_cap12000 | 64 | 5965 | 1040.2 | 1082.5 | 0.238 | 0.177 | 0.555 |
+| stage2_correct_target_unique | 64 | 8363 | 887.0 | 895.0 | 0.482 | 0.491 | 0.404 |
+
+结论：
+
+1. GT `target_sparse` 和 stock/base sparse 都是正常连通结构，median component 都是 `1`。
+2. Stage2 在所有 top-k 下都有大量碎片。即使 top-k 较低，`r0.35_cap4096` 的平均 component 也接近 `985`。
+3. Stage2 top-k 越高，largest component ratio 会提升，但 small component 占比仍然很高。
+
+### PixalV9 synthetic val128
+
+输出来源：
+
+```text
+trellis_point_prior_mv/outputs/mesh_frozen_downstream/antioverfill_rank_w0005_ws05_s200_seed42_val128_mesh_topk/
+```
+
+| mode | count | coords mean | comp mean | comp median | largest mean | largest median | small64 coord mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| target_sparse | 128 | 8159 | 2.3 | 1.0 | 0.974 | 1.000 | 0.001 |
+| stock_sparse | 128 | 5901 | 1.9 | 1.0 | 0.962 | 1.000 | 0.002 |
+| stage2_correct_r0_35_cap4096 | 128 | 2532 | 969.1 | 1053.0 | 0.061 | 0.026 | 0.923 |
+| stage2_correct_r0_50_cap8192 | 128 | 3923 | 1089.6 | 1177.5 | 0.091 | 0.043 | 0.798 |
+| stage2_correct_r0_75_cap12000 | 128 | 5868 | 1045.9 | 1049.5 | 0.244 | 0.164 | 0.567 |
+| stage2_correct_target_unique | 128 | 8159 | 919.7 | 908.5 | 0.463 | 0.476 | 0.423 |
+
+结论：
+
+1. val128 复现了 val64 的现象，说明碎片化不是小样本偶然。
+2. `target_sparse` 和 `stock_sparse` 仍然高度连通，而 Stage2 输出是上千个小岛。
+3. 这进一步证明：Stage2 sparse 输出分布偏离了 TRELLIS 正常 sparse 分布。
+
+### Real SLAM four top-k
+
+输出来源：
+
+```text
+trellis_point_prior_mv/outputs/real_slam_prior/real_slam_prior_four_triangulated_mesh_topk_v1/mesh_eval/
+```
+
+| mode | count | coords mean | comp mean | comp median | largest mean | largest median | small64 coord mean |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 4 | 12158 | 1.0 | 1.0 | 1.000 | 1.000 | 0.000 |
+| stage2_correct_6000 | 4 | 6000 | 2174.5 | 2189.0 | 0.042 | 0.026 | 0.881 |
+| stage2_correct_8192 | 4 | 8192 | 2281.2 | 2374.5 | 0.060 | 0.025 | 0.823 |
+| stage2_correct_12000 | 4 | 12000 | 1958.5 | 2060.0 | 0.145 | 0.085 | 0.663 |
+| stage2_correct_16000 | 4 | 16000 | 1502.8 | 1550.5 | 0.360 | 0.373 | 0.440 |
+
+结论：
+
+1. 真实 SLAM prior 数据上，stock sparse 也是单一主连通结构。
+2. Stage2 仍然碎成上千个 component，和手机 AR session、PixalV9 synthetic 一致。
+3. 因此，Stage2 sparse 碎片化不是手机 AR session 独有，也不是真实数据或合成数据某一类数据独有，而是当前 Stage2 sparse flow 输出的普遍问题。
+
+### 总结判断
+
+现在可以更明确地说：
+
+```text
+base / stock sparse 输出本来不应该像 Stage2 这样散。
+```
+
+证据来自三类数据：
+
+```text
+1. 手机 AR session：
+   base sparse 基本 1-2 个 component，Stage2 上千 component。
+
+2. PixalV9 synthetic：
+   target_sparse 和 stock_sparse median component = 1，Stage2 上千 component。
+
+3. real SLAM prior：
+   stock_sparse component = 1，Stage2 上千 component。
+```
+
+因此，当前问题不应优先归咎于 slat/mesh decoder。slat/mesh 确实可能对 Stage2 coords OOD，但更前面的事实是：
+
+```text
+Stage2 sparse coords 已经明显偏离正常 TRELLIS sparse topology。
+```
+
+### 下一步建议
+
+第一优先级不再是继续 top-k sweep，而是修改 Stage2 sparse 训练目标或采样后处理，让 sparse 输出接近 stock/target sparse 的连通拓扑。
+
+建议方向：
+
+```text
+1. 训练阶段加入 connectivity / anti-island loss；
+2. 对 logits 加邻域平滑或 3D connected-component prior；
+3. top-k 后强制 component-aware selection，而不是全局 top-k；
+4. 把 point-prior 作为 anchor，但不要让模型在全局 voxel 中产生大量孤立高 logit；
+5. 继续保留 eval-time min_component_size / visual-hull filter 作为安全阀。
+```
+
+第二优先级才是 slat flow：
+
+```text
+只有当 Stage2 sparse 连通性接近 stock/target 后，仍然出现黑色或 texture 错误，才说明必须训练 slat/texture。
+```
+
+## 四十九、2026-06-24 手机 AR dense session strict visual-hull filter 结果
+
+### 本轮测试
+
+样本：
+
+```text
+20260624_011933_843
+```
+
+命令使用：
+
+```text
+topk = 2048 / 4096
+filter = none / min_component_size / prior_radius,projection_support / min_component_size,prior_radius,projection_support / largest_component,prior_radius,projection_support
+filter_min_support_views = 2
+visual_hull_min_visible_views = 2
+visual_hull_min_support_ratio = 0.25
+```
+
+### sparse 诊断结论
+
+`topk=4096` 的 raw Stage2 sparse 仍然非常碎：
+
+| 指标 | 数值 |
+|---|---:|
+| raw coord count | 4096 |
+| raw component count | 1214 |
+| raw largest component ratio | 0.392 |
+| raw small component coord ratio <64 | 0.562 |
+| raw projection keep ratio | 0.629 |
+| raw visual hull keep ratio | 0.480 |
+| raw visible outside mask event ratio | 0.699 |
+| raw visible support ratio mean | 0.273 |
+
+加入 `min_component_size,prior_radius,projection_support` 后：
+
+| 指标 | 数值 |
+|---|---:|
+| final coord count | 1163 |
+| final component count | 23 |
+| final largest component ratio | 0.709 |
+| final small component coord ratio <64 | 0.194 |
+| final within prior radius ratio | 1.000 |
+| final projection keep ratio | 1.000 |
+| final visual hull keep ratio | 1.000 |
+| final visible outside mask event ratio | 0.525 |
+| final visible support ratio mean | 0.466 |
+
+这说明 strict filter 是有效的：它把上千个 sparse 小岛压到几十个 component，主连通块占比也明显提高。但它不是根治，因为最终仍有约一半的可见投影事件落在 mask 外，这意味着 sparse 仍存在明显 unsupported / 边界外扩问题。
+
+### filtered mesh 结果
+
+filtered mesh 输出：
+
+```text
+trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011933_843_stage2_filter_min_component_size__prior_radius__projection_support_4096_strict_vh_mesh_v1/
+```
+
+关键指标：
+
+| 指标 | 数值 |
+|---|---:|
+| stage2 final coords | 1163 |
+| vertex count | 24334 |
+| face count | 48504 |
+| extent ratio | 0.225 |
+| prior_norm_chamfer_l2_mean | 0.00665 |
+| black vertex ratio, luminance < 0.03 | 0.078 |
+| dark vertex ratio, luminance < 0.08 | 0.147 |
+| mesh component count | 56 |
+| mesh largest component ratio | 0.733 |
+| small mesh component vertex ratio <100 | 0.040 |
+
+相比未过滤的 Stage2 mesh，strict filter 后黑色顶点和 mesh 小碎片都有明显下降。这个结果支持一个判断：
+
+```text
+黑色碎片很大一部分来自 Stage2 sparse coords 本身的碎片化和 unsupported surface。
+```
+
+但剩余问题仍然存在：
+
+```text
+1. mesh 仍有 56 个 component，主连通块只有 73.3%；
+2. extent ratio 只有 0.225，几何偏薄；
+3. final visible outside mask event ratio 仍有 0.525；
+4. strict filter 只保留 28.4% raw coords，说明 raw Stage2 输出本身离正常 sparse 拓扑还很远。
+```
+
+### 本轮代码改动
+
+已加入自动 mesh artifact 统计：
+
+```text
+trellis_point_prior_mv/eval_mesh_frozen_downstream.py
+trellis_point_prior_mv/run_real_slam_prior_mesh.py
+```
+
+后续 mesh eval 的 `report.json / report.csv` 会直接包含：
+
+```text
+artifact_black_vertex_ratio_lum_lt_003
+artifact_dark_vertex_ratio_lum_lt_008
+artifact_mesh_component_count
+artifact_mesh_largest_component_ratio
+artifact_mesh_small_component_vertex_ratio_lt100
+artifact_mesh_top10_component_counts
+```
+
+同时已在 Stage2 训练中加入可关闭的 anti-island / connectivity regularization：
+
+```text
+trellis_point_prior_mv/train_sparse_inpaint_stage2.py
+trellis_point_prior_mv/scripts/run_pixal_v9_point_prior_stage2.sh
+```
+
+新增参数：
+
+```text
+CONNECTIVITY_LOSS_WEIGHT
+CONNECTIVITY_NEIGHBOR_THRESHOLD
+```
+
+默认 `CONNECTIVITY_LOSS_WEIGHT=0.0`，不影响旧实验复现。开启后，它会惩罚目标 sparse 外部、邻域平均概率过低但自身概率偏高的孤立 high-logit 点，目标是减少 Stage2 raw sparse 的小岛。
+
+### 下一步建议
+
+当前最合理的下一步不是训练 slat flow，而是先验证 connectivity regularization 是否能让 Stage2 sparse 接近 stock/target sparse 的拓扑：
+
+```text
+1. 先跑 connectivity smoke；
+2. 看 synthetic val16/val64 的 Stage2 component count 是否从上千下降；
+3. 看 phone AR strict VH 后的 black/dark ratio 是否继续下降；
+4. 如果 sparse topology 明显改善，再做 s200；
+5. 只有 sparse 已经连通但 mesh 仍黑，才进入 slat flow / texture 训练。
+```
+
+如果 connectivity loss 让 mesh 过薄或 recall 明显下降，应优先降低：
+
+```text
+CONNECTIVITY_LOSS_WEIGHT: 0.01 -> 0.005
+```
+
+而不是继续加强 filter。filter 适合作为安全阀，不应该成为主要建模能力。
+
+## 五十、2026-06-24 connectivity smoke 结果与 base-guided selection 判断
+
+### 本轮新结果
+
+本轮完成了：
+
+```text
+1. connectivity_w001 smoke 训练；
+2. synthetic val16 mesh eval；
+3. 手机 AR dense session 20260624_011933_843 strict visual-hull mesh eval。
+```
+
+### synthetic val16：同为 20-step smoke 的公平对比
+
+| run | sparse comp | sparse largest | sparse small64 | black | dark | mesh comp | mesh largest | mesh->target | target->mesh | sparse IoU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline smoke w0005/ws05 | 1569.4 | 0.0287 | 0.921 | 0.270 | 0.352 | 689.3 | 0.0556 | 0.0513 | 0.0518 | 0.116 |
+| connectivity w0.01 smoke | 1550.6 | 0.0305 | 0.914 | 0.256 | 0.333 | 694.6 | 0.0536 | 0.0482 | 0.0524 | 0.118 |
+
+判断：
+
+```text
+connectivity loss 在 20-step smoke 上有轻微正向信号：
+black / dark / mesh_to_target / sparse_iou 略好。
+```
+
+但改善幅度很小，mesh component 没有下降，largest component ratio 也没有实质提升。因此它不能单独解决 Stage2 sparse 碎片化。
+
+再与 s200 旧基线比较时，connectivity smoke 明显不能直接说明更好：
+
+```text
+s200 baseline first16:
+  sparse comp 1164.5
+  sparse largest 0.0907
+  sparse small64 0.749
+  mesh comp 638.8
+  mesh largest 0.106
+  chamfer 0.00898
+
+connectivity smoke:
+  sparse comp 1550.6
+  sparse largest 0.0305
+  sparse small64 0.914
+  mesh comp 694.6
+  mesh largest 0.0536
+  chamfer 0.01054
+```
+
+所以目前只能说：
+
+```text
+connectivity loss 可以保留，但不能作为主解决方案。
+```
+
+### 手机 AR strict VH：connectivity smoke 的效果
+
+样本：
+
+```text
+20260624_011933_843
+```
+
+| run | final coords | final sparse comp | final largest | black | dark | mesh comp | mesh largest | prior_norm_chamfer | extent ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| old s200 strict VH | 1163 | 23 | 0.709 | 0.0784 | 0.1466 | 56 | 0.733 | 0.00665 | 0.225 |
+| connectivity smoke strict VH | 764 | 20 | 0.819 | 0.0039 | 0.0131 | 20 | 0.780 | 0.01345 | 0.343 |
+
+判断：
+
+```text
+connectivity smoke + strict VH 在手机 AR 上显著减少黑色碎片和 mesh 小组件。
+```
+
+但代价也明显：
+
+```text
+1. coords 从 1163 降到 764；
+2. prior_norm_chamfer 从 0.00665 变差到 0.01345；
+3. raw sparse component 仍然很高：1334；
+4. final visible outside mask event ratio 仍约 0.512。
+```
+
+也就是说，这更像是“后处理选出了更干净的一小部分”，而不是 Stage2 raw sparse 本身学到了正常拓扑。
+
+### 是否需要更温和、更有拓扑先验的过滤机制？
+
+结论：需要。
+
+原因是 strict visual-hull / component filter 的性质是事后删除：
+
+```text
+Stage2 已经在全局 64^3 voxel 空间里撒点；
+filter 再把明显不支持的点删掉。
+```
+
+这种方法能减少黑点，但容易带来两个问题：
+
+```text
+1. 删得太多，mesh 变薄或缺块；
+2. 它只知道 mask/projection/component，不知道 TRELLIS 原生 sparse 拓扑是什么。
+```
+
+相比之下，stock/base-guided selection 更符合当前证据：
+
+```text
+stock/base sparse 负责形体连通性 / TRELLIS 原生拓扑；
+Stage2 sparse 只在 base sparse 附近做 point-prior correction。
+```
+
+这不是简单把 Stage2 后处理成 largest component，而是在 top-k 选择前限制候选空间：
+
+```text
+1. 先用 stock TRELLIS 生成 base sparse；
+2. 对 base sparse 做半径膨胀，得到正常拓扑附近的候选体素；
+3. Stage2 logits 只在这些候选体素里排序；
+4. 再用轻量 projection/prior filter 做安全检查。
+```
+
+这样可以避免 Stage2 在全局 64^3 空间里自由产生孤立高 logit。
+
+### 本轮代码更新
+
+已加入 eval-time base-guided selection：
+
+```text
+trellis_point_prior_mv/eval_mesh_frozen_downstream.py
+trellis_point_prior_mv/run_real_slam_prior_mesh.py
+trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
+trellis_point_prior_mv/scripts/run_ar_session_smoke.sh
+```
+
+新增参数：
+
+```text
+--stage2_base_guidance stock_sparse
+--stage2_base_radius 2/4/6
+--stage2_base_min_candidates 512
+```
+
+对应 wrapper 环境变量：
+
+```text
+STAGE2_BASE_GUIDANCE=stock_sparse
+STAGE2_BASE_RADIUS=4.0
+STAGE2_BASE_MIN_CANDIDATES=512
+```
+
+报告会记录：
+
+```text
+stage2_base_guidance_enabled
+stage2_base_guidance_radius
+stage2_base_guidance_base_coord_count
+stage2_base_guidance_candidate_count
+stage2_base_guidance_candidate_ratio
+stage2_base_guidance_fallback_unmasked
+stage2_topk_requested
+stage2_topk_effective
+```
+
+同时 synthetic frozen downstream eval 已补充 sparse topology 字段，不再需要额外脚本间接统计：
+
+```text
+sparse_component_count
+sparse_largest_component_ratio
+sparse_small_component_coord_ratio_lt64
+stage2_pre_filter_sparse_component_count
+stage2_pre_filter_sparse_largest_component_ratio
+stage2_pre_filter_sparse_small_component_coord_ratio_lt64
+stage2_final_sparse_component_count
+stage2_final_sparse_largest_component_ratio
+stage2_final_sparse_small_component_coord_ratio_lt64
+sparse_filter_output_count
+sparse_filter_total_keep_ratio
+```
+
+因此 base-guided sweep 可以直接回答：
+
+```text
+Stage2 sparse 本身是否变得更连通；
+而不是只从 mesh component 间接判断。
+```
+
+### 下一步建议
+
+优先级应调整为：
+
+```text
+1. 先跑 base-guided radius sweep；
+2. 再跑 base-guided + min_component_size=32；
+3. 如果 base-guided 显著减少 sparse/mesh component 且 chamfer 不劣化，再考虑和 connectivity loss 结合；
+4. connectivity loss 暂时只作为辅助项，不应直接 s200 放大；
+5. slat flow 仍然放后面，等 sparse topology 稳定后再判断是否需要训练。
+```
+
+最关键的判断标准：
+
+```text
+base-guided 后：
+  sparse_component_count 应明显下降；
+  stage2_final_sparse_largest_component_ratio 应上升；
+  sparse_small_component_coord_ratio_lt64 应下降；
+  mesh component 应明显下降；
+  artifact_mesh_largest_component_ratio 应上升；
+  artifact_black/dark ratio 应下降；
+  mesh_to_target / target_to_mesh 不应明显变差；
+  phone AR 上 prior_norm_chamfer 不能因为过度贴 base 而明显劣化。
+```
+
+radius 的选择不能只看黑色比例。预期情况是：
+
+```text
+R=2.0:
+  可能最干净，但修正空间太小，容易过度贴 stock/base。
+
+R=4.0:
+  最可能是拓扑稳定和 point-prior 修正之间的平衡点。
+
+R=6.0:
+  修正空间更大，但可能重新放入 island。
+```
+
+因此优先判断 `R=4.0` 是否在 component 与 chamfer 之间最平衡，而不是简单选择 black/dark 最低的半径。
+
+## 五十一、2026-06-24 base-guided sweep 与手机 AR 分支结果
+
+### 本轮运行内容
+
+本轮完成：
+
+```text
+1. synthetic val16 base-guided radius sweep: R=2/4/6
+2. synthetic val16 base-guided R=4 + min_component_size=32
+3. synthetic val64 base-guided R=4 + min_component_size=32
+4. phone AR 20260624_011933_843:
+   - base-guided only
+   - base-guided + min_component_size=32
+   - base-guided + light projection/prior filter
+   - base-guided + min_component_size=32 + light projection/prior filter
+```
+
+### synthetic val16 结果
+
+对照 baseline 是旧 `antioverfill_rank_w0005_ws05_s200_seed42` 的 val64 前 16 个样本。
+
+| run | sparse comp | sparse largest | small64 | black | mesh comp | mesh largest | mesh->target | target->mesh | chamfer | sparse IoU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| no-base baseline | 1164.5 | 0.091 | 0.749 | 0.249 | 638.8 | 0.106 | 0.036 | 0.049 | 0.00898 | 0.173 |
+| base R=2 | 74.4 | 0.825 | 0.103 | 0.094 | 132.0 | 0.756 | 0.0456 | 0.1066 | 0.0261 | 0.128 |
+| base R=4 | 191.1 | 0.691 | 0.202 | 0.100 | 253.4 | 0.637 | 0.0369 | 0.0905 | 0.0203 | 0.156 |
+| base R=6 | 348.2 | 0.584 | 0.308 | 0.141 | 385.9 | 0.485 | 0.0324 | 0.0774 | 0.0157 | 0.167 |
+| base R=4 + min32 | 4.9 | 0.832 | 0.029 | 0.032 | 102.8 | 0.689 | 0.0292 | 0.0950 | 0.0204 | 0.160 |
+
+结论：
+
+```text
+base-guided selection 明显有效。
+```
+
+它把 Stage2 sparse 从上千个 component 压到几十或几百个 component；加入 `min_component_size=32` 后，sparse component 均值降到 `4.9`，small64 ratio 降到 `0.029`，mesh component 降到 `102.8`。
+
+但代价也很清楚：
+
+```text
+base-guided 越强，target 覆盖越差。
+```
+
+`R=2` 最干净，但 target->mesh 明显变差到 `0.1066`，chamfer 也最差。`R=6` 拓扑更碎，但几何覆盖更接近 baseline。`R=4 + min32` 是“最干净”的方案，但仍有 target->mesh 偏差，说明它可能删掉了部分真实结构。
+
+### synthetic val64 结果
+
+| run | sparse comp | sparse largest | small64 | black | mesh comp | mesh largest | mesh->target | target->mesh | chamfer | sparse IoU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| no-base baseline val64 | 1101.1 | 0.081 | 0.806 | 0.193 | 523.1 | 0.103 | 0.0374 | 0.0484 | 0.00971 | 0.171 |
+| base R=4 + min32 val64 | 5.0 | 0.787 | 0.038 | 0.0735 | 79.6 | 0.646 | 0.0406 | 0.1027 | 0.0244 | 0.139 |
+
+val64 复现了 val16 的结论：
+
+```text
+base-guided + min32 在拓扑和黑色碎片上非常有效，但覆盖不足。
+```
+
+它把 sparse component 从 `1101.1` 降到 `5.0`，mesh component 从 `523.1` 降到 `79.6`，黑色顶点从 `0.193` 降到 `0.0735`。但 target->mesh 从 `0.0484` 变差到 `0.1027`，chamfer 从 `0.00971` 变差到 `0.0244`。
+
+因此它还不能作为默认最终方案，只能作为“强拓扑安全阀”。
+
+### 手机 AR 20260624_011933_843 结果
+
+| run | coords | final comp | largest | black | dark | mesh comp | mesh largest | prior norm chamfer | extent ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| old strict VH | 1163 | 23 | 0.709 | 0.078 | 0.147 | 56 | 0.733 | 0.00665 | 0.225 |
+| connectivity smoke strict VH | 764 | 20 | 0.819 | 0.0039 | 0.013 | 20 | 0.780 | 0.01345 | 0.343 |
+| base R=4 only | 4096 | 126 | 0.723 | 0.550 | 0.594 | 228 | 0.534 | 0.03865 | 0.344 |
+| base R=4 + min32 | 3547 | 6 | 0.835 | 0.477 | 0.521 | 107 | 0.649 | 0.03902 | 0.371 |
+| base R=4 + lightproj | 2253 | 23 | 0.973 | 0.038 | 0.077 | 43 | 0.942 | 0.01423 | 0.624 |
+| base R=4 + min32 + lightproj | 2236 | 14 | 0.980 | 0.041 | 0.084 | 53 | 0.933 | 0.01668 | 0.656 |
+
+结论：
+
+```text
+phone AR 上，base-guided only 不能用。
+```
+
+它虽然把 sparse 限在 stock 邻域，但没有 mask/projection 约束时，会生成大量颜色很差的 unsupported surface，black ratio 达到 `0.55`。
+
+真正有效的是：
+
+```text
+base-guided + light projection/prior filter
+```
+
+该方案相比 old strict VH：
+
+```text
+1. black 从 0.078 降到 0.038；
+2. mesh component 从 56 降到 43；
+3. mesh largest 从 0.733 升到 0.942；
+4. extent ratio 从 0.225 升到 0.624，几何不再那么薄。
+```
+
+但它的 prior norm chamfer 从 `0.00665` 变差到 `0.01423`，说明它更像是得到一个拓扑更合理、但不如 strict VH 贴近 AR prior 的 mesh。
+
+`min_component_size=32` 在 phone AR lightproj 后没有带来收益：
+
+```text
+base R=4 + lightproj:
+  black 0.038, mesh comp 43, prior_norm_chamfer 0.01423
+
+base R=4 + min32 + lightproj:
+  black 0.041, mesh comp 53, prior_norm_chamfer 0.01668
+```
+
+因此 phone AR 当前不建议默认叠加 min32。
+
+### 当前判断
+
+现在可以把路线分成两类：
+
+```text
+1. synthetic / 有 GT 的评测：
+   base-guided + min_component_size=32 是很强的拓扑安全阀，
+   但会牺牲 target coverage。
+
+2. phone AR real session：
+   base-guided + light projection/prior filter 是当前更平衡的方案，
+   比 strict VH 更不容易删薄，黑色碎片也明显减少。
+```
+
+这说明最合理的方向不是继续强化 strict VH，也不是单纯训练 connectivity loss，而是：
+
+```text
+stock/base sparse 提供拓扑候选空间；
+Stage2 logits 在候选空间里排序；
+AR point prior + mask projection 做轻量 sanity check。
+```
+
+### 下一步建议
+
+第一优先级：补 `R=6 + light projection/prior filter`，因为 synthetic 里 R=6 的 coverage 明显更好，而 phone AR 里 lightproj 可以抑制 R=6 可能带来的碎片。
+
+第二优先级：补 `R=4/R=6 + lightproj` 的四组手机 AR session，而不是只看 dense session。
+
+第三优先级：若 R=6 lightproj 在手机 AR 上能降低 prior_norm_chamfer，同时保持 black/mesh component 不爆炸，则把它作为下一阶段默认 eval-time sparse selection。
+
+第四优先级：暂时不要基于 base-guided + min32 做长训练。它太像强安全阀，容易把模型推向低覆盖。
+
+## 五十二、2026-06-24 R4/R6 projection-only 0.15 与 stock union 判断
+
+### 本轮测试内容
+
+本轮补了两组手机 AR dense session `20260624_011933_843` 的 projection-only 过滤：
+
+```text
+1. base-guided R=4 + projection_support, support_ratio=0.15
+2. base-guided R=6 + projection_support, support_ratio=0.15
+```
+
+这里刻意没有使用 `prior_radius`，目的是判断：
+
+```text
+只靠 mask projection support 是否足够约束 Stage2 sparse；
+R=6 是否能在不明显增加碎片的情况下获得更好覆盖；
+是否应该继续做 stock backbone / union。
+```
+
+### 关键结果
+
+| run | coords | final comp | largest | outside event | support ratio | black | dark | mesh comp | mesh largest | prior norm chamfer | extent ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 3097 | - | - | - | - | 0.007 | 0.018 | 2 | 0.988 | 0.0629 | 0.201 |
+| old strict VH | 1163 | 23 | 0.709 | 0.525 | 0.466 | 0.078 | 0.147 | 56 | 0.733 | 0.00665 | 0.225 |
+| base R=4 + lightproj | 2253 | 23 | 0.973 | 0.624 | 0.389 | 0.038 | 0.077 | 43 | 0.942 | 0.01423 | 0.624 |
+| base R=4 + proj015 | 1980 | 32 | 0.956 | 0.571 | 0.443 | 0.044 | 0.074 | 34 | 0.919 | 0.06048 | 0.446 |
+| base R=6 + proj015 | 1946 | 48 | 0.906 | 0.575 | 0.440 | 0.203 | 0.249 | 61 | 0.924 | 0.06642 | 0.542 |
+
+补充：`proj015` 的候选空间来自 stock sparse 邻域。
+
+| run | base radius | base coords | candidate coords | candidate ratio | filter keep |
+|---|---:|---:|---:|---:|---:|
+| R=4 + proj015 | 4.0 | 3097 | 22969 | 0.0876 | 0.483 |
+| R=6 + proj015 | 6.0 | 3097 | 33529 | 0.1279 | 0.475 |
+| R=4 + lightproj | 4.0 | 3097 | 22969 | 0.0876 | 0.550 |
+
+### 分析
+
+第一，`projection_support=0.15` 确实让 sparse 更符合 mask projection。
+相比 `base R=4 + lightproj`，`R=4 + proj015` 的 `outside event` 从 `0.624` 降到 `0.571`，visible support ratio 从 `0.389` 升到 `0.443`。
+
+但这个改善没有转化为更好的最终 mesh。`R=4 + proj015` 的 `prior norm chamfer` 是 `0.06048`，几乎退回到 stock_sparse 的 `0.0629`；而 `R=4 + lightproj` 是 `0.01423`。这说明只靠 projection support 不够，必须保留 `prior_radius` 这一类“靠近 AR point prior”的约束，否则 Stage2 会在 stock 邻域里选出 projection 上看起来合理、但和真实 AR 点云距离很远的结构。
+
+第二，`R=6 + proj015` 当前不值得作为默认。
+R=6 把候选空间从 `22969` 扩到 `33529`，理论上给了 Stage2 更多修正空间；但结果是 black ratio 从 R4 的 `0.044` 升到 `0.203`，mesh component 从 `34` 升到 `61`，prior norm chamfer 也变差到 `0.06642`。也就是说，在没有 `prior_radius` 的情况下，R=6 更容易重新放入 OOD / unsupported surface。
+
+第三，当前最平衡的手机 AR 分支仍然是：
+
+```text
+base R=4 + prior_radius + light projection_support
+```
+
+它的 prior norm chamfer 明显优于 projection-only，black/dark 又明显低于 base-guided only，同时 extent ratio 比 strict VH 更合理。
+
+### 是否需要 stock backbone / union
+
+需要，但不建议直接把 raw union 当最终默认。
+
+现在 stock_sparse 和 Stage2 的优缺点非常互补：
+
+```text
+stock_sparse:
+  拓扑、颜色、连通性很好；
+  black ratio 只有约 0.007；
+  mesh component 只有 2；
+  但 prior norm chamfer 很差，extent ratio 也偏薄。
+
+Stage2 lightproj:
+  明显更贴近 AR point prior；
+  extent ratio 更合理；
+  但仍有一定黑色区域和小组件风险。
+```
+
+因此后续值得做 stock backbone / union，目标不是简单“多加点”，而是：
+
+```text
+stock_sparse 提供 TRELLIS 原生拓扑骨架；
+Stage2 filtered sparse 提供 AR point prior correction；
+union 后再做轻量 component / projection sanity check。
+```
+
+两个 union 分支的优先级如下：
+
+```text
+第一优先级：
+  stock_sparse ∪ R4 lightproj
+
+原因：
+  R4 lightproj 已经证明能兼顾 prior alignment 和低黑色碎片；
+  union 有机会补回 stock 的稳定拓扑和颜色区域。
+
+第二优先级：
+  stock_sparse ∪ R4 projection-only
+
+原因：
+  projection-only 的黑色比例还可以，但 prior chamfer 几乎退回 stock；
+  这组更适合作诊断“stock backbone 能否单独拯救颜色/连通性”，不适合作默认候选。
+```
+
+暂时不建议优先做：
+
+```text
+stock_sparse ∪ R6 projection-only
+```
+
+因为 R6 projection-only 已经出现明显黑色和碎片回升。
+
+### 下一步建议
+
+第一优先级：实现 eval-time union sparse mode，不重训。建议先支持：
+
+```text
+stage2_union_stock:
+  final_coords = unique(stock_sparse ∪ filtered_stage2_coords)
+```
+
+并记录：
+
+```text
+union_coord_count
+stock_only_count
+stage2_only_count
+intersection_count
+artifact_black_vertex_ratio
+artifact_mesh_component_count
+prior_norm_chamfer
+extent_ratio
+```
+
+第二优先级：只在 dense phone AR session 上先跑两个 smoke：
+
+```text
+1. stock_sparse ∪ R4 lightproj
+2. stock_sparse ∪ R4 projection-only
+```
+
+如果 `stock ∪ R4 lightproj` 能保持 `prior_norm_chamfer < 0.02`，同时把 black ratio 压到接近 stock 或低于 `0.03`，它就可以成为真实 AR session 的默认 eval-time sparse selection。
+
+第三优先级：不要现在训练 slat flow。
+当前问题仍然主要是 sparse selection/topology 与 unsupported surface 控制。只有当 union / base-guided / projection sanity check 后，sparse topology 已经稳定但颜色仍失败，才需要训练 slat/texture downstream。
+
+## 五十三、2026-06-26 eval-time stock union 实测结果
+
+### 本轮测试内容
+
+本轮完成三组 eval-time union：
+
+```text
+1. 手机 AR dense session:
+   stock_sparse ∪ R4 lightproj
+
+2. 手机 AR dense session:
+   stock_sparse ∪ R4 projection-only 0.15
+
+3. synthetic val16:
+   stock_sparse ∪ R4 min_component_size=32
+```
+
+这里的 union 是最直接的：
+
+```text
+final_coords = unique(stock_sparse ∪ filtered_stage2_coords)
+```
+
+### 手机 AR dense session 结果
+
+样本：`20260624_011933_843`
+
+| run | coords | black | dark | mesh comp | mesh largest | prior norm chamfer | extent ratio | sparse comp | sparse largest | outside event | support ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 3097 | 0.007 | 0.018 | 2 | 0.988 | 0.0615 | 0.201 | - | - | - | - |
+| R4 lightproj | 2253 | 0.038 | 0.077 | 43 | 0.942 | 0.01423 | 0.624 | 23 | 0.973 | 0.624 | 0.389 |
+| stock ∪ R4 lightproj | 4961 | 0.0011 | 0.0129 | 9 | 0.988 | 0.04730 | 0.260 | 9 | 0.998 | 0.716 | 0.268 |
+| R4 proj015 | 1980 | 0.044 | 0.074 | 34 | 0.919 | 0.06048 | 0.446 | 32 | 0.956 | 0.571 | 0.443 |
+| stock ∪ R4 proj015 | 4759 | 0.00013 | 0.0032 | 12 | 0.994 | 0.04783 | 0.272 | 15 | 0.995 | 0.701 | 0.280 |
+
+union 统计：
+
+| run | stock count | stage2 count | intersection | stock-only | stage2-only | union count | intersection / stage2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| stock ∪ R4 lightproj | 3097 | 2253 | 389 | 2708 | 1864 | 4961 | 0.173 |
+| stock ∪ R4 proj015 | 3097 | 1980 | 318 | 2779 | 1662 | 4759 | 0.161 |
+
+### 手机 AR 结论
+
+raw union 成功解决了黑色碎片和拓扑破碎：
+
+```text
+stock ∪ R4 lightproj:
+  black: 0.038 -> 0.0011
+  mesh comp: 43 -> 9
+  mesh largest: 0.942 -> 0.988
+
+stock ∪ R4 proj015:
+  black: 0.044 -> 0.00013
+  mesh comp: 34 -> 12
+  mesh largest: 0.919 -> 0.994
+```
+
+但它没有保持 Stage2 对 AR point prior 的贴合：
+
+```text
+R4 lightproj prior_norm_chamfer:
+  0.01423 -> 0.04730
+
+R4 proj015 prior_norm_chamfer:
+  0.06048 -> 0.04783
+```
+
+也就是说，`stock ∪ R4 lightproj` 虽然颜色和连通性很好，但几何又明显被 stock backbone 拉回去了。它比 stock 稍微更贴 prior，但远不如单独的 R4 lightproj。
+
+原因可以从 union 统计看出来：
+
+```text
+R4 lightproj 只有 389 / 2253 个点与 stock 重合；
+union 里 stock-only 有 2708 个点，stage2-only 有 1864 个点。
+```
+
+这说明 stock sparse 和 Stage2 filtered sparse 的空间重合很低。直接 union 后，slat/mesh decoder 很可能更偏向 stock 的原生拓扑和颜色分布，因此 artifact 少了，但 AR correction 被稀释了。
+
+### synthetic val16 结果
+
+| run | sparse IoU | recall | precision | sparse comp | sparse largest | small64 | black | dark | mesh comp | mesh largest | mesh->target | target->mesh | chamfer | extent |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| stock_sparse | 0.0466 | 0.0779 | 0.1226 | 1.69 | 0.973 | 0.0019 | 0.0498 | 0.0715 | 5.75 | 0.911 | 0.0856 | 0.1250 | 0.0397 | 0.382 |
+| R4 min32 | 0.1596 | 0.1893 | 0.4864 | 4.94 | 0.832 | 0.0286 | 0.0324 | 0.1220 | 102.8 | 0.689 | 0.0292 | 0.0950 | 0.0204 | 0.473 |
+| stock ∪ R4 min32 | 0.1264 | 0.2254 | 0.2294 | 1.56 | 0.998 | 0.0018 | 0.1112 | 0.1856 | 103.4 | 0.901 | 0.0772 | 0.0982 | 0.0308 | 0.459 |
+| target_sparse | 1.000 | 1.000 | 1.000 | 2.19 | 0.9998 | 0.0002 | 0.1162 | 0.2284 | 17.5 | 0.942 | 0.0110 | 0.0147 | 0.00079 | 0.486 |
+
+synthetic union 统计：
+
+```text
+stock count mean: 6525
+stage2 count mean: 3860
+intersection mean: 893
+union count mean: 9492
+intersection / stage2: 0.228
+```
+
+### synthetic 结论
+
+synthetic 上 raw union 也不是更优方案：
+
+```text
+R4 min32 chamfer: 0.0204
+stock ∪ R4 min32 chamfer: 0.0308
+
+R4 min32 mesh->target: 0.0292
+stock ∪ R4 min32 mesh->target: 0.0772
+
+R4 min32 precision: 0.486
+stock ∪ R4 min32 precision: 0.229
+```
+
+union 的 sparse topology 很干净，`largest=0.998`，但 precision 明显下降，mesh 指标也退化。它更像是把 Stage2 的 correction 放进 stock 的完整拓扑里，结果变得更连通，但不再足够贴近 target。
+
+### 总结判断
+
+当前可以确认：
+
+```text
+raw stock union 是强 artifact repair，不是好的最终 sparse selection。
+```
+
+它适合证明：
+
+```text
+1. 黑色碎片和 mesh 小组件确实主要来自 Stage2 sparse 的 OOD / unsupported islands；
+2. stock sparse 的原生拓扑能显著稳定 frozen slat/mesh；
+3. 但直接 union 会稀释 AR point prior correction。
+```
+
+因此，下一步不应该继续扩大 raw union，也不应该立刻训练 slat flow。
+
+### 下一步建议
+
+第一优先级：实现 `union candidate rerank`，而不是 raw union。
+
+建议形式：
+
+```text
+candidate_set = stock_sparse ∪ filtered_stage2_coords
+final_coords = topk(candidate_set, score)
+```
+
+score 不应只用是否属于 stock，而应组合：
+
+```text
+score =
+  Stage2 logit
+  + stock topology bonus
+  + prior_radius bonus
+  + projection_support bonus
+  - outside / unsupported penalty
+```
+
+这样可以让 stock 提供候选空间和拓扑先验，但最终点数、几何位置仍由 Stage2 / AR prior 排序决定。
+
+第二优先级：实现 `stock anchor + Stage2 correction`。
+
+不要把所有 stock 点都并入 final sparse，而是保留一部分高置信 stock anchor：
+
+```text
+final = selected_stock_anchor ∪ selected_stage2_correction
+```
+
+例如：
+
+```text
+stock anchor: stock 中靠近 prior 或 projection support 较高的点
+stage2 correction: R4 lightproj 中 Stage2 logit 高、prior/projection support 高的点
+```
+
+第三优先级：补一个更小的 union cap。
+
+当前 union count 接近 5000，手机 AR 中明显被 stock 拖回。可以测试：
+
+```text
+stock ∪ R4 lightproj 后再 topk 3000 / 3500 / 4096
+```
+
+但这个 top-k 必须基于 score rerank，不能随机裁剪。
+
+第四优先级：暂时不要基于 raw union 做长训练，也不要直接训练 slat flow。
+
+raw union 的 artifact 很少，但它的几何目标不对。如果拿它训练下游，很可能让模型学到“更像 stock、但不贴 AR prior”的方向。
+
+## 五十四、2026-06-26 停止 coords 后处理，转向 latent inpainting 的路线
+
+### 当前阶段判断
+
+经过 fixed top-k、strict visual-hull、base-guided、min component、projection support、stock union 等多轮测试，结论已经足够明确：
+
+```text
+coords 层面的后处理可以修补 artifact，
+但不能从根本上解决 point-prior sparse 的结构生成问题。
+```
+
+具体表现是：
+
+```text
+1. Stage2 raw coords 更贴近 AR prior，但碎片多、黑色 mesh 多；
+2. strict VH / projection filter 能减少 unsupported coords，但容易删薄；
+3. stock union 能强力修复黑色和连通性，但几何又被 stock 拉回；
+4. synthetic 上 union 也会降低 precision 和 Chamfer 表现。
+```
+
+因此下一步主线不再继续修改最终 sparse coords：
+
+```text
+不再把 filter / union / top-k rerank 作为主要研究方向。
+```
+
+这些工具后续只保留为：
+
+```text
+1. 诊断 sparse 输出是否碎；
+2. 分析 unsupported surface；
+3. 做必要的安全阀 ablation。
+```
+
+### 为什么要转 latent
+
+从 Points-to-3D 的角度，正确范式不是：
+
+```text
+point prior -> condition -> decoder logits -> top-k coords 修修补补
+```
+
+而是：
+
+```text
+point prior -> voxelize -> SS encoder -> q_vis
+mask -> m_s
+q_comb = m_s * q_vis + (1 - m_s) * noise
+x_inp = concat(q_comb, m_s)
+inpainting flow -> q_pred
+decoder(q_pred) -> sparse structure
+```
+
+也就是说，point prior 应该进入 SS latent 初始化和 inpainting dynamics，而不是只在最终 coords 层做约束。
+
+当前碎片的根本原因也在这里：
+
+```text
+我们让模型在 64^3 coords/logits 空间里排序，
+但没有让 unknown latent 在 16^3 SS latent 空间里学会从 known latent 连续补全。
+```
+
+coords 后处理只能处理结果，不能让模型学会结构连续性。
+
+### 新主线：Stage2-Latent Inpainting
+
+下一阶段建议定义一个新的主线版本：
+
+```text
+pointprior_stage2_latent_v1
+```
+
+目标：
+
+```text
+直接训练和采样 SS latent q，
+让 observed latent 成为生成起点和硬约束，
+unknown region 由 flow inpaint，
+最终不再对 coords 做 union/filter/rerank。
+```
+
+### 数据构建
+
+保留当前 PixalV9 visible prior 构建，但输出重点从 coords 迁移到 latent：
+
+```text
+input:
+  prior_coords / prior_conf
+  target sparse latent q_gt
+  target_coords 仅作为评测 GT
+
+build:
+  M_vis = voxelize(prior_coords)
+  q_vis = SparseStructureEncoder(M_vis)
+  m_s = downsample / project prior support 到 16^3 latent grid
+  q_comb = m_s * q_vis + (1 - m_s) * noise
+
+output npz:
+  q_vis
+  m_s
+  q_gt
+  prior_coords
+  target_coords
+```
+
+注意：
+
+```text
+target_coords 后续只用于 metric；
+不参与最终 sparse coords 的后处理。
+```
+
+### 模型输入
+
+第一版不要再只把 point prior 当 condition token。建议直接改成：
+
+```text
+x_t_known = q_comb at timestep t
+model input = concat(x_t_known, m_s, optional confidence)
+condition = image condition
+target = q_gt
+```
+
+如果不想大改 TRELLIS flow 主干，可以先做最小改法：
+
+```text
+1. 保留 LoRA / adapter；
+2. 增加 latent input adapter，把 [q_comb, mask, confidence] 投影到 flow 输入通道；
+3. 每一步 sampling 对 known latent 做 re-injection；
+4. unknown latent 按 flow 正常更新。
+```
+
+关键点：
+
+```text
+known region 的 q_vis 不能再被 confidence 缩小两次；
+strict oracle 下 known_weight 应优先使用 mask，而不是 density confidence。
+```
+
+### 训练目标
+
+第一阶段训练目标保持简单：
+
+```text
+L = full_latent_flow_loss
+  + lambda_known * known_latent_consistency
+  + lambda_unknown * unknown_completion_loss
+  + lambda_boundary * boundary_smoothness_loss
+```
+
+这里的 `boundary_smoothness_loss` 不再是 coords 连通块后处理，而是在 latent mask 边界上约束：
+
+```text
+q_pred 在 known / unknown 边界不要出现突变；
+unknown latent 应该从 q_vis 周围连续扩展。
+```
+
+这比 coords 的 `min_component_size` 更接近论文里的 boundary refinement 思路。
+
+### 采样策略
+
+按 Points-to-3D 的思路改成两阶段：
+
+```text
+Stage A: structural inpainting
+  - known region hard reinjection
+  - unknown region flow sampling
+
+Stage B: boundary refinement
+  - 只在 boundary band / unknown-near-known 区域加少量 noise
+  - known core 继续固定
+  - 目标是修复 known/unknown 交界 holes 和断裂
+```
+
+暂定配置：
+
+```text
+total steps: 12 或 20
+inpaint steps: 8 / 14
+refine steps: 4 / 6
+known clamp: always on for known core
+boundary clamp: softer
+```
+
+### 评测方式
+
+下一阶段 eval 不再以 coords 后处理为主，而是看 latent-inpainting 是否自然产生正常 sparse：
+
+```text
+1. decoded sparse component count
+2. largest component ratio
+3. small64 ratio
+4. known-region recall / precision
+5. unknown-region completion
+6. target Chamfer / mesh eval
+7. phone AR black/dark ratio
+```
+
+允许统计 coords topology，但只作为诊断：
+
+```text
+不再用统计结果反过来修改 coords。
+```
+
+### 是否还需要 stock sparse
+
+stock sparse 后续不建议再 raw union。更合理的使用方式是 latent 级别的 soft prior：
+
+```text
+stock_sparse -> encode -> q_stock
+q_init = m_vis * q_vis
+       + m_stock_soft * alpha * q_stock
+       + remaining noise
+```
+
+也可以只把 stock latent 作为 condition，不进入最终 coords：
+
+```text
+condition = image condition + point latent condition + optional stock latent condition
+```
+
+这样 stock 提供全局 TRELLIS 拓扑倾向，但不会像 raw union 那样把最终几何硬拉回 stock。
+
+### 最小实验顺序
+
+第一步：实现 latent manifest / latent loader。
+
+```text
+build_point_prior_dataset.py 增加 q_vis / m_s / q_gt 保存；
+或新增 build_latent_inpaint_dataset.py，避免污染旧流程。
+```
+
+第二步：实现 `train_sparse_latent_inpaint_stage3.py`。
+
+```text
+不再训练 coords ranking；
+直接训练 q_comb -> q_gt 的 latent inpainting。
+```
+
+第三步：实现 `eval_sparse_latent_inpaint_stage3.py`。
+
+```text
+输出 decoded sparse coords；
+不做 filter/union/rerank；
+只记录 topology / mesh / prior alignment。
+```
+
+第四步：先跑 PixalV9 strict oracle。
+
+```text
+point_count=1500
+views=8
+dropout=0
+outlier=0
+jitter=0
+known_use_confidence=0
+```
+
+目标：
+
+```text
+证明 latent inpainting 在 oracle visible prior 下不会碎。
+```
+
+第五步：再跑 noisy prior。
+
+```text
+dropout <= 0.25
+outlier=0.03
+jitter=1
+```
+
+目标：
+
+```text
+验证真实 AR/SLAM prior 的鲁棒性。
+```
+
+第六步：最后接手机 AR session smoke。
+
+```text
+不做 coords filter；
+只看 latent path 是否能自然减少 black fragments。
+```
+
+### 是否现在训练 slat flow
+
+暂时不建议。
+
+原因：
+
+```text
+当前问题还在 sparse / SS latent 阶段。
+如果 q_pred 自然 decoded 后仍碎，训练 slat 只是在适配错误 sparse；
+如果 latent inpainting 后 sparse 已经连通，再评估 frozen slat 是否仍有颜色问题。
+```
+
+只有当：
+
+```text
+1. latent path 的 sparse topology 已经接近 stock/target；
+2. known-region / unknown-region sparse 指标正常；
+3. mesh 仍然黑色或 texture 错；
+```
+
+才进入 slat flow / texture adapter。
+
+### 当前推荐结论
+
+下一步主线应改为：
+
+```text
+Point prior -> SS latent inpainting -> decoded sparse -> frozen slat/mesh eval
+```
+
+而不是：
+
+```text
+Point prior -> Stage2 logits -> coords post-process -> frozen slat/mesh
+```
+
+当前 coords 层实验的价值已经完成：
+
+```text
+它证明了 point prior 有用；
+也证明了碎片主要来自 sparse topology / unsupported regions；
+同时证明 raw stock topology 可以修 artifact，但会牺牲 AR prior alignment。
+```
+
+因此继续在 coords 层调 filter / union 的边际收益已经很低，应该转向 latent formulation。

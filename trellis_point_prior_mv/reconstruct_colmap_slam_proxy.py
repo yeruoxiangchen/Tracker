@@ -179,6 +179,52 @@ def model_dir_candidates(work_dir: Path) -> list[Path]:
     return sorted(p for p in sparse.iterdir() if p.is_dir())
 
 
+def summarize_colmap_text_sparse(sparse_dir: Path) -> dict:
+    cameras_txt = sparse_dir / "cameras.txt"
+    images_txt = sparse_dir / "images.txt"
+    points_txt = sparse_dir / "points3D.txt"
+    camera_count = 0
+    registered_image_count = 0
+    points3d_count = 0
+    reproj_errors = []
+    if cameras_txt.exists():
+        for line in cameras_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                camera_count += 1
+    if images_txt.exists():
+        raw = images_txt.read_text(encoding="utf-8", errors="ignore").splitlines()
+        i = 0
+        while i < len(raw):
+            line = raw[i].strip()
+            i += 1
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 10:
+                registered_image_count += 1
+                if i < len(raw):
+                    i += 1
+    if points_txt.exists():
+        for line in points_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 8:
+                points3d_count += 1
+                try:
+                    reproj_errors.append(float(parts[7]))
+                except ValueError:
+                    pass
+    return {
+        "camera_count": int(camera_count),
+        "registered_image_count": int(registered_image_count),
+        "points3D_count": int(points3d_count),
+        "mean_reprojection_error": float(np.mean(reproj_errors)) if reproj_errors else 0.0,
+    }
+
+
 def convert_best_model(colmap_bin: str, work_dir: Path, output_sparse: Path, args: argparse.Namespace) -> Path:
     models = model_dir_candidates(work_dir)
     if not models:
@@ -288,6 +334,21 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace, colmap_bin: str
         ])
     run_cmd(mapper_cmd)
     best = convert_best_model(colmap_bin, work_dir, output_sparse, args)
+    sparse_model_count = len(model_dir_candidates(work_dir))
+    colmap_summary = summarize_colmap_text_sparse(output_sparse)
+    registered_ratio = float(colmap_summary["registered_image_count"]) / float(max(len(selected), 1))
+    colmap_summary["registered_ratio"] = registered_ratio
+    colmap_summary["sparse_model_count"] = int(sparse_model_count)
+    if colmap_summary["registered_image_count"] < int(args.min_registered_images):
+        raise ValueError(
+            f"{dataset_dir}: registered_image_count {colmap_summary['registered_image_count']} "
+            f"< min_registered_images {int(args.min_registered_images)}"
+        )
+    if colmap_summary["points3D_count"] < int(args.min_points3d):
+        raise ValueError(
+            f"{dataset_dir}: points3D_count {colmap_summary['points3D_count']} "
+            f"< min_points3d {int(args.min_points3d)}"
+        )
 
     row = {
         "dataset": str(dataset_dir),
@@ -303,6 +364,7 @@ def process_dataset(dataset_dir: Path, args: argparse.Namespace, colmap_bin: str
         "work_dir": str(work_dir),
         "best_binary_sparse": str(best),
         "output_sparse": str(output_sparse),
+        **colmap_summary,
     }
     return row
 
@@ -326,6 +388,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_features", type=int, default=4096)
     parser.add_argument("--mapper_min_num_matches", type=int, default=15)
     parser.add_argument("--ba_global_max_num_iterations", type=int, default=20)
+    parser.add_argument("--min_registered_images", type=int, default=8)
+    parser.add_argument("--min_points3d", type=int, default=100)
     parser.add_argument("--use_gpu", action="store_true")
     parser.add_argument("--use_masks", action="store_true", help="Use masks during feature extraction. Default uses full RGB for pose robustness.")
     parser.add_argument("--fix_intrinsics", action="store_true", help="Keep provided/loaded intrinsics fixed in COLMAP mapper.")

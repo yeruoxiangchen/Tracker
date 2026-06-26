@@ -75,6 +75,8 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
         ranking_observed_weight: float,
         ranking_wrong_support_weight: float,
         ranking_target_support_weight: float,
+        connectivity_loss_weight: float,
+        connectivity_neighbor_threshold: float,
     ):
         super().__init__()
         self.ss_flow_model = ss_flow_model
@@ -97,6 +99,8 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
         self.ranking_observed_weight = float(ranking_observed_weight)
         self.ranking_wrong_support_weight = float(ranking_wrong_support_weight)
         self.ranking_target_support_weight = float(ranking_target_support_weight)
+        self.connectivity_loss_weight = float(connectivity_loss_weight)
+        self.connectivity_neighbor_threshold = float(connectivity_neighbor_threshold)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         moved = {}
@@ -285,6 +289,20 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
             out[key] = torch.stack(vals).mean() if vals else zero
         return loss_rank, out
 
+    def connectivity_loss(self, logits: torch.Tensor, target_occ: torch.Tensor):
+        prob = torch.sigmoid(logits)
+        local_mean = F.avg_pool3d(prob, kernel_size=3, stride=1, padding=1)
+        outside_weight = (1.0 - target_occ).clamp(0.0, 1.0)
+        island_score = prob * F.relu(float(self.connectivity_neighbor_threshold) - local_mean)
+        loss = weighted_channel_mean(island_score, outside_weight)
+        with torch.no_grad():
+            island_rate = weighted_channel_mean((island_score > 0).to(torch.float32), outside_weight)
+            local_mean_outside = weighted_channel_mean(local_mean, outside_weight)
+        return loss, {
+            "connectivity_island_rate": island_rate,
+            "connectivity_local_mean_outside": local_mean_outside,
+        }
+
     def training_step(self, batch, batch_idx):
         t = torch.rand(1).item()
         targets, partial_latent, cond, clean_cond, latent_mask, confidence, stats = self.build_known_inputs(batch)
@@ -309,8 +327,10 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
         target_logit_mean = pred_x0.new_tensor(0.0)
         outside_occ_rate = pred_x0.new_tensor(0.0)
         loss_rank = pred_x0.new_tensor(0.0)
+        loss_connectivity = pred_x0.new_tensor(0.0)
+        connectivity_stats = {}
         rank_stats = {}
-        if self.anti_overfill_loss_weight > 0 or self.ranking_loss_weight > 0:
+        if self.anti_overfill_loss_weight > 0 or self.ranking_loss_weight > 0 or self.connectivity_loss_weight > 0:
             target_coords = batch["target_coords"].to(self.device, dtype=torch.long)
             target_occ = coords_to_batched_occ(
                 target_coords,
@@ -329,6 +349,8 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
                 outside_logit_mean = weighted_channel_mean(logits, outside_weight)
                 target_logit_mean = weighted_channel_mean(logits, target_occ)
                 outside_occ_rate = weighted_channel_mean((logits > 0).to(torch.float32), outside_weight)
+            if self.connectivity_loss_weight > 0:
+                loss_connectivity, connectivity_stats = self.connectivity_loss(logits, target_occ)
             if self.ranking_loss_weight > 0:
                 prior_coords = batch["prior_coords"].to(self.device, dtype=torch.long)
                 prior_conf = batch["prior_conf"].to(self.device, dtype=torch.float32)
@@ -348,6 +370,7 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
             + self.known_x0_loss_weight * loss_known_x0
             + self.anti_overfill_loss_weight * loss_anti_overfill
             + self.ranking_loss_weight * loss_rank
+            + self.connectivity_loss_weight * loss_connectivity
         )
 
         self.log("train_loss", loss_total, prog_bar=True, sync_dist=True)
@@ -357,7 +380,10 @@ class SparseInpaintStage2Trainer(pl.LightningModule):
         self.log("loss_known_x0", loss_known_x0, prog_bar=False, sync_dist=True)
         self.log("loss_anti_overfill", loss_anti_overfill, prog_bar=False, sync_dist=True)
         self.log("loss_rank", loss_rank, prog_bar=False, sync_dist=True)
+        self.log("loss_connectivity", loss_connectivity, prog_bar=False, sync_dist=True)
         for key, value in rank_stats.items():
+            self.log(key, value, prog_bar=False, sync_dist=True)
+        for key, value in connectivity_stats.items():
             self.log(key, value, prog_bar=False, sync_dist=True)
         self.log("outside_logit_mean", outside_logit_mean, prog_bar=False, sync_dist=True)
         self.log("target_logit_mean", target_logit_mean, prog_bar=False, sync_dist=True)
@@ -432,6 +458,8 @@ def build_model(args: argparse.Namespace, local_rank: int) -> SparseInpaintStage
         ranking_observed_weight=args.ranking_observed_weight,
         ranking_wrong_support_weight=args.ranking_wrong_support_weight,
         ranking_target_support_weight=args.ranking_target_support_weight,
+        connectivity_loss_weight=args.connectivity_loss_weight,
+        connectivity_neighbor_threshold=args.connectivity_neighbor_threshold,
     )
     if args.resume and os.path.isfile(args.resume):
         state = torch.load(args.resume, map_location="cpu")
@@ -474,6 +502,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ranking_observed_weight", type=float, default=1.0)
     parser.add_argument("--ranking_wrong_support_weight", type=float, default=1.0)
     parser.add_argument("--ranking_target_support_weight", type=float, default=0.0)
+    parser.add_argument("--connectivity_loss_weight", type=float, default=0.0)
+    parser.add_argument("--connectivity_neighbor_threshold", type=float, default=0.08)
     parser.add_argument("--lora_rank", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=128)
     parser.add_argument("--latent_channels", type=int, default=8)

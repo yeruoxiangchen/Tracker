@@ -76,11 +76,25 @@ COLMAP_USE_MASKS="${COLMAP_USE_MASKS:-0}"
 COLMAP_USE_GPU="${COLMAP_USE_GPU:-0}"
 COLMAP_WORK_SUBDIR="${COLMAP_WORK_SUBDIR:-colmap_arproxy_work}"
 COLMAP_BIN="${COLMAP_BIN:-colmap}"
+if [[ "${COLMAP_BIN}" == "colmap" ]] && ! command -v colmap >/dev/null 2>&1; then
+  for candidate in \
+    "/home/zjr/anaconda3/envs/foundpose/bin/colmap" \
+    "/usr/local/bin/colmap" \
+    "/usr/bin/colmap"; do
+    if [[ -x "${candidate}" ]]; then
+      COLMAP_BIN="${candidate}"
+      break
+    fi
+  done
+fi
+COLMAP_OVERWRITE="${COLMAP_OVERWRITE:-1}"
 COLMAP_INTRINSICS_SOURCE="${COLMAP_INTRINSICS_SOURCE:-auto}"
 COLMAP_INTRINSICS_SPARSE_SUBDIR="${COLMAP_INTRINSICS_SPARSE_SUBDIR:-sparse/0}"
 COLMAP_CAMERA_MODEL="${COLMAP_CAMERA_MODEL:-SIMPLE_RADIAL}"
 COLMAP_CAMERA_PARAMS="${COLMAP_CAMERA_PARAMS:-}"
 COLMAP_FIX_INTRINSICS="${COLMAP_FIX_INTRINSICS:-1}"
+COLMAP_MIN_REGISTERED_IMAGES="${COLMAP_MIN_REGISTERED_IMAGES:-8}"
+COLMAP_MIN_POINTS3D="${COLMAP_MIN_POINTS3D:-100}"
 
 TRI_MATCHER="${TRI_MATCHER:-sequential}"
 TRI_MAX_PAIR_GAP="${TRI_MAX_PAIR_GAP:-4}"
@@ -118,8 +132,35 @@ echo "[ar_like_streaming_slam] frame_select=${FRAME_SELECT} max_frames=${MAX_FRA
 echo "[ar_like_streaming_slam] run_reconstruct_pose=${RUN_RECONSTRUCT_POSE} pose_sparse=${TRI_INPUT_SPARSE_SUBDIR}"
 echo "[ar_like_streaming_slam] output=${OUT_ROOT}/${RUN_NAME}"
 
+if [[ "${RUN_TRIANGULATE}" == "1" && "${SPARSE_SUBDIR}" == "${TRI_INPUT_SPARSE_SUBDIR}" ]]; then
+  echo "[ar_like_streaming_slam][ERROR] RUN_TRIANGULATE would overwrite input sparse dir: ${SPARSE_SUBDIR}" >&2
+  echo "Set SPARSE_SUBDIR to a different output path, e.g. sparse_arproxy_streaming/0" >&2
+  exit 2
+fi
+
+if [[ "${PRIOR_BRANCH}" == "colmap_direct" && "${RUN_RECONSTRUCT_POSE}" != "1" && "${RUN_BUILD}" == "1" ]]; then
+  missing=0
+  for d in "${DATASET_ARGS[@]}"; do
+    if [[ ! -f "${d}/${SPARSE_SUBDIR}/points3D.txt" ]]; then
+      echo "[ar_like_streaming_slam][ERROR] colmap_direct requires existing ${d}/${SPARSE_SUBDIR}/points3D.txt or RUN_RECONSTRUCT_POSE=1" >&2
+      missing=1
+    fi
+  done
+  if [[ "${missing}" == "1" ]]; then
+    exit 2
+  fi
+fi
+
 if [[ "${RUN_RECONSTRUCT_POSE}" == "1" ]]; then
   COLMAP_EXTRA_ARGS=()
+  if ! command -v "${COLMAP_BIN}" >/dev/null 2>&1; then
+    echo "[ar_like_streaming_slam][ERROR] COLMAP executable not found: ${COLMAP_BIN}" >&2
+    echo "Install COLMAP or set COLMAP_BIN=/path/to/colmap. For existing AR/COLMAP sparse data, use RUN_RECONSTRUCT_POSE=0." >&2
+    exit 2
+  fi
+  if [[ "${COLMAP_OVERWRITE}" == "1" ]]; then
+    COLMAP_EXTRA_ARGS+=(--overwrite)
+  fi
   if [[ "${COLMAP_USE_MASKS}" == "1" ]]; then
     COLMAP_EXTRA_ARGS+=(--use_masks)
   fi
@@ -147,8 +188,9 @@ if [[ "${RUN_RECONSTRUCT_POSE}" == "1" ]]; then
     --intrinsics_source "${COLMAP_INTRINSICS_SOURCE}" \
     --intrinsics_sparse_subdir "${COLMAP_INTRINSICS_SPARSE_SUBDIR}" \
     --camera_model "${COLMAP_CAMERA_MODEL}" \
+    --min_registered_images "${COLMAP_MIN_REGISTERED_IMAGES}" \
+    --min_points3d "${COLMAP_MIN_POINTS3D}" \
     --colmap_bin "${COLMAP_BIN}" \
-    --overwrite \
     --output_report "${OUT_ROOT}/${RUN_NAME}/colmap_reconstruction_report.json" \
     "${COLMAP_EXTRA_ARGS[@]}"
 fi

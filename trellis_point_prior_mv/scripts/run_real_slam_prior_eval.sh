@@ -42,6 +42,19 @@ WEIGHTS="${WEIGHTS:-microsoft/TRELLIS-image-large}"
 SS_STEPS="${SS_STEPS:-12}"
 SLAT_STEPS="${SLAT_STEPS:-12}"
 MESH_EVAL_SAMPLES="${MESH_EVAL_SAMPLES:-6000}"
+STAGE2_BASE_GUIDANCE="${STAGE2_BASE_GUIDANCE:-none}"
+STAGE2_BASE_RADIUS="${STAGE2_BASE_RADIUS:-3.0}"
+STAGE2_BASE_MIN_CANDIDATES="${STAGE2_BASE_MIN_CANDIDATES:-512}"
+STAGE2_UNION_STOCK="${STAGE2_UNION_STOCK:-0}"
+STAGE2_SPARSE_FILTER="${STAGE2_SPARSE_FILTER:-none}"
+FILTER_PRIOR_RADIUS="${FILTER_PRIOR_RADIUS:-4.0}"
+FILTER_MIN_COMPONENT_SIZE="${FILTER_MIN_COMPONENT_SIZE:-64}"
+FILTER_MIN_SUPPORT_VIEWS="${FILTER_MIN_SUPPORT_VIEWS:-1}"
+FILTER_MIN_SUPPORT_RATIO="${FILTER_MIN_SUPPORT_RATIO:-0.0}"
+VISUAL_HULL_MIN_VISIBLE_VIEWS="${VISUAL_HULL_MIN_VISIBLE_VIEWS:-1}"
+VISUAL_HULL_MIN_SUPPORT_RATIO="${VISUAL_HULL_MIN_SUPPORT_RATIO:-0.0}"
+FILTER_MIN_COORDS="${FILTER_MIN_COORDS:-128}"
+FILTER_FALLBACK_UNFILTERED="${FILTER_FALLBACK_UNFILTERED:-0}"
 RUN_BUILD="${RUN_BUILD:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
 
@@ -116,6 +129,13 @@ fi
 
 if [[ "${RUN_EVAL}" == "1" ]]; then
   echo "[real_slam_prior_eval] mesh eval -> ${EVAL_DIR}"
+  EVAL_EXTRA_ARGS=()
+  if [[ "${STAGE2_UNION_STOCK}" == "1" ]]; then
+    EVAL_EXTRA_ARGS+=(--stage2_union_stock)
+  fi
+  if [[ "${FILTER_FALLBACK_UNFILTERED}" == "1" ]]; then
+    EVAL_EXTRA_ARGS+=(--filter_fallback_unfiltered)
+  fi
   CUDA_VISIBLE_DEVICES="${GPU}" \
   HF_HUB_OFFLINE=1 \
   TRANSFORMERS_OFFLINE=1 \
@@ -147,7 +167,19 @@ if [[ "${RUN_EVAL}" == "1" ]]; then
     --known_clamp_start_t 0.5 \
     --known_logit_boost 0.0 \
     --known_conf_power 1.0 \
-    --mesh_eval_samples "${MESH_EVAL_SAMPLES}"
+    --stage2_base_guidance "${STAGE2_BASE_GUIDANCE}" \
+    --stage2_base_radius "${STAGE2_BASE_RADIUS}" \
+    --stage2_base_min_candidates "${STAGE2_BASE_MIN_CANDIDATES}" \
+    --stage2_sparse_filter "${STAGE2_SPARSE_FILTER}" \
+    --filter_prior_radius "${FILTER_PRIOR_RADIUS}" \
+    --filter_min_component_size "${FILTER_MIN_COMPONENT_SIZE}" \
+    --filter_min_support_views "${FILTER_MIN_SUPPORT_VIEWS}" \
+    --filter_min_support_ratio "${FILTER_MIN_SUPPORT_RATIO}" \
+    --visual_hull_min_visible_views "${VISUAL_HULL_MIN_VISIBLE_VIEWS}" \
+    --visual_hull_min_support_ratio "${VISUAL_HULL_MIN_SUPPORT_RATIO}" \
+    --filter_min_coords "${FILTER_MIN_COORDS}" \
+    --mesh_eval_samples "${MESH_EVAL_SAMPLES}" \
+    "${EVAL_EXTRA_ARGS[@]}"
 fi
 
 echo "[real_slam_prior_eval] manifest=${MANIFEST}"
