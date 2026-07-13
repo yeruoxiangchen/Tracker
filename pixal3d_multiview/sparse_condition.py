@@ -43,6 +43,9 @@ class SparseMultiviewConditionBuilder:
         self.image_cond_model_ss = None
         self.view_aggregator = None
         self.geometry_adapter = None
+        self.pose_consistency_head = None
+        self.pose_consistency_alpha = 1.0
+        self.last_pose_consistency_tensors = None
 
     @property
     def device(self) -> torch.device:
@@ -187,9 +190,9 @@ class SparseMultiviewConditionBuilder:
             )
             view_tokens = None
             view_token_stats = None
-            if self.view_aggregator is not None:
+            if self.view_aggregator is not None or self.pose_consistency_head is not None:
                 if image_cond_model.use_naf_upsample:
-                    raise ValueError("view_aggregator currently supports the LR DINO projection path only")
+                    raise ValueError("view/pose aggregation currently supports the LR DINO projection path only")
                 sampled_views, support_weights, view_geom, view_token_stats = sample_view_features_for_aggregation(
                     z_patchtokens_spatial,
                     points_obj,
@@ -231,10 +234,33 @@ class SparseMultiviewConditionBuilder:
 
             z_global, global_stats = fuse_global_tokens(z_clstoken, z_regtokens, mode=global_fusion)
 
+        pose_consistency_stats = {"enabled": False}
+        self.last_pose_consistency_tensors = None
+        if self.pose_consistency_head is not None:
+            if view_tokens is None:
+                raise RuntimeError("pose_consistency_head requested but view tokens were not computed")
+            sampled_views, support_weights, view_geom = view_tokens
+            _, pose_consistency_stats, pose_tensors = self.pose_consistency_head(
+                sampled_views.detach(),
+                support_weights.detach(),
+                view_geom.detach(),
+            )
+            self.last_pose_consistency_tensors = pose_tensors
+
         aggregator_stats = {"enabled": False}
         if self.view_aggregator is not None:
             sampled_views, support_weights, view_geom = view_tokens
-            z_proj, aggregator_stats = self.view_aggregator(z_proj.detach(), sampled_views, support_weights, view_geom)
+            consistency_logits = None
+            if self.last_pose_consistency_tensors is not None:
+                consistency_logits = self.last_pose_consistency_tensors.get("logits")
+            z_proj, aggregator_stats = self.view_aggregator(
+                z_proj.detach(),
+                sampled_views,
+                support_weights,
+                view_geom,
+                consistency_logits=consistency_logits,
+                consistency_alpha=float(self.pose_consistency_alpha),
+            )
             aggregator_stats["view_tokens"] = view_token_stats
 
         geometry_stats = {"enabled": False, "mode": geometry_feature_mode}
@@ -293,6 +319,7 @@ class SparseMultiviewConditionBuilder:
             "geometry_features": geometry_stats,
             "geometry_adapter": geometry_adapter_stats,
             "view_aggregator": aggregator_stats,
+            "pose_consistency": pose_consistency_stats,
         }
         if hr_stats is not None:
             stats["hr_projection"] = hr_stats

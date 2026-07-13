@@ -23,6 +23,30 @@ public class PreprocessResponse
     public string session_id;
 }
 
+[System.Serializable]
+public class ServerStatusResponse
+{
+    public string status;
+    public string message;
+}
+
+[System.Serializable]
+public class SlamPointData
+{
+    public float x;
+    public float y;
+    public float z;
+    public float confidence;
+}
+
+[System.Serializable]
+public class SlamPointPayload
+{
+    public string schema = "arpose_tracker_frame_points_v1";
+    public int point_count;
+    public List<SlamPointData> points = new List<SlamPointData>();
+}
+
 public class SegClick
 {
     public float x;
@@ -43,6 +67,12 @@ public class ARPoseTracker : MonoBehaviour
     public Transform arCamera;
     public ARSession arSession;
     public ARCameraManager cameraManager;
+    public ARPointCloudManager pointCloudManager;
+
+    [Header("AR/SLAM 点云上传")]
+    public bool uploadSlamPoints = true;
+    public int maxSlamPointsPerFrame = 800;
+    public int slamPointStride = 1;
 
     [Header("主 UI")]
     public Text debugText;
@@ -461,8 +491,8 @@ public class ARPoseTracker : MonoBehaviour
         }
 
         reviewPanel.SetActive(false);
-        UpdateUI("分割已确认，服务器正在重建 Mesh (需耐心等待)！", Color.yellow);
-        StartCoroutine(SendGenerateFromAllFrames());
+        UpdateUI("分割已确认，正在检查采集视角覆盖...", Color.yellow);
+        StartCoroutine(CheckInputQcThenGenerate());
     }
 
     IEnumerator ApproveCurrentSeedFrame(int frameIndex)
@@ -540,6 +570,49 @@ public class ARPoseTracker : MonoBehaviour
         yield return StartCoroutine(SendGenerateCommand(jsonPayload));
     }
 
+    IEnumerator CheckInputQcThenGenerate()
+    {
+        SelectionData data = new SelectionData();
+        data.selected = new List<int>();
+        for (int i = 0; i < capturedFrameCount; i++)
+        {
+            data.selected.Add(i);
+        }
+
+        string jsonPayload = JsonUtility.ToJson(data);
+        UnityWebRequest qc = new UnityWebRequest(serverURL + "/input_qc", "POST");
+        byte[] bodyRaw = System.Text.Encoding.UTF8.GetBytes(jsonPayload);
+        qc.uploadHandler = new UploadHandlerRaw(bodyRaw);
+        qc.downloadHandler = new DownloadHandlerBuffer();
+        qc.SetRequestHeader("Content-Type", "application/json");
+        qc.timeout = 120;
+        yield return qc.SendWebRequest();
+
+        if (qc.result != UnityWebRequest.Result.Success)
+        {
+            UpdateUI("输入检查失败: " + ExtractServerMessage(qc), Color.red);
+            recordButton.gameObject.SetActive(true);
+            buttonText.text = "开始新录制";
+            buttonText.color = Color.white;
+            yield break;
+        }
+
+        string responseText = qc.downloadHandler.text;
+        ServerStatusResponse response = JsonUtility.FromJson<ServerStatusResponse>(responseText);
+        if (response != null && response.status == "warning")
+        {
+            string msg = string.IsNullOrEmpty(response.message) ? "输入视角覆盖不足，请补采或重拍。" : response.message;
+            UpdateUI(msg, Color.red);
+            recordButton.gameObject.SetActive(true);
+            buttonText.text = "重新录制";
+            buttonText.color = Color.white;
+            yield break;
+        }
+
+        UpdateUI("输入检查通过，服务器正在重建 Mesh (需耐心等待)！", Color.yellow);
+        yield return StartCoroutine(SendGenerateCommand(jsonPayload));
+    }
+
     IEnumerator SendGenerateCommand(string json)
     {
         UnityWebRequest www = new UnityWebRequest(serverURL + "/generate", "POST");
@@ -554,14 +627,15 @@ public class ARPoseTracker : MonoBehaviour
 
         if (www.result == UnityWebRequest.Result.Success)
         {
-            UpdateUI("重建完成！请在服务器 output 文件夹查看 Mesh", Color.green);
+            string msg = ExtractServerMessage(www);
+            UpdateUI(string.IsNullOrEmpty(msg) ? "重建完成！请在服务器 output 文件夹查看 Mesh" : msg, Color.green);
             recordButton.gameObject.SetActive(true);
             buttonText.text = "开始新录制";
             buttonText.color = Color.white;
         }
         else
         {
-            UpdateUI("生成失败: " + www.error, Color.red);
+            UpdateUI("生成失败: " + ExtractServerMessage(www), Color.red);
             recordButton.gameObject.SetActive(true);
             buttonText.text = "开始新录制";
             buttonText.color = Color.white;
@@ -620,6 +694,12 @@ public class ARPoseTracker : MonoBehaviour
             form.AddField("intrinsic_width", IntString(intrinsics.resolution.x));
             form.AddField("intrinsic_height", IntString(intrinsics.resolution.y));
         }
+        string slamPointsJson = BuildSlamPointsJson();
+        if (!string.IsNullOrEmpty(slamPointsJson))
+        {
+            form.AddField("slam_points_schema", "arpose_tracker_frame_points_v1");
+            form.AddField("slam_points_json", slamPointsJson);
+        }
         form.AddBinaryData("image", imageBytes, "frame.jpg", "image/jpeg");
 
         using (UnityWebRequest www = UnityWebRequest.Post(serverURL + "/upload", form))
@@ -627,6 +707,47 @@ public class ARPoseTracker : MonoBehaviour
             yield return www.SendWebRequest();
         }
         isSending = false;
+    }
+
+    string BuildSlamPointsJson()
+    {
+        if (!uploadSlamPoints || pointCloudManager == null || maxSlamPointsPerFrame <= 0)
+            return "";
+
+        SlamPointPayload payload = new SlamPointPayload();
+        int stride = Mathf.Max(1, slamPointStride);
+        int seen = 0;
+
+        foreach (ARPointCloud cloud in pointCloudManager.trackables)
+        {
+            if (!cloud.positions.HasValue)
+                continue;
+
+            NativeArray<Vector3> positions = cloud.positions.Value;
+            for (int i = 0; i < positions.Length; i++)
+            {
+                if ((seen % stride) == 0)
+                {
+                    Vector3 p = positions[i];
+                    payload.points.Add(new SlamPointData
+                    {
+                        x = p.x,
+                        y = p.y,
+                        z = p.z,
+                        confidence = 1.0f
+                    });
+                    if (payload.points.Count >= maxSlamPointsPerFrame)
+                        break;
+                }
+                seen++;
+            }
+
+            if (payload.points.Count >= maxSlamPointsPerFrame)
+                break;
+        }
+
+        payload.point_count = payload.points.Count;
+        return payload.point_count > 0 ? JsonUtility.ToJson(payload) : "";
     }
 
     IEnumerator SendCommand(string endpoint)
@@ -648,5 +769,25 @@ public class ARPoseTracker : MonoBehaviour
     static string IntString(int value)
     {
         return value.ToString(CultureInfo.InvariantCulture);
+    }
+
+    static string ExtractServerMessage(UnityWebRequest request)
+    {
+        if (request == null) return "";
+        string body = request.downloadHandler != null ? request.downloadHandler.text : "";
+        if (!string.IsNullOrEmpty(body))
+        {
+            try
+            {
+                ServerStatusResponse response = JsonUtility.FromJson<ServerStatusResponse>(body);
+                if (response != null && !string.IsNullOrEmpty(response.message))
+                    return response.message;
+            }
+            catch
+            {
+                // Fall back to Unity's transport error below.
+            }
+        }
+        return string.IsNullOrEmpty(request.error) ? body : request.error;
     }
 }

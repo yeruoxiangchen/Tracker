@@ -17,5 +17,6 @@ if str(VGGT_WHEEL_ROOT) not in sys.path:
 
 from .condition import ARDinoRayCond
 from .pipeline import TrellisARPoseTo3DPipeline
+from .projected_condition import ARProjectedSparseCond
 
-__all__ = ["ARDinoRayCond", "TrellisARPoseTo3DPipeline"]
+__all__ = ["ARDinoRayCond", "ARProjectedSparseCond", "TrellisARPoseTo3DPipeline"]

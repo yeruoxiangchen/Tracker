@@ -1,0 +1,332 @@
+目录：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon
+
+作用：
+这个目录是独立的 pose-guided ReconViaGen 测试流程，不改 CoarseModel/connect/server.py、ReconViaGen/run_local.py 或 CoarseModel 原有估计代码。
+
+当前流程：
+1. 从手机 AR 数据集或 COLMAP 数据集读取 RGB、mask、相机位姿。
+2. 用 mask 中心射线估计物体中心。
+3. 按 mask 面积、图像清晰度、相机方位/俯仰覆盖贪心选择 ReconViaGen 输入帧。
+4. ReconViaGen 按 seed 顺序生成 mesh。
+5. 用 AR/COLMAP pose 将候选 mesh 投影回 mask，做 sanity check/rerank，选择 best mesh。
+6. 可选做保守 visual hull face filter。默认关闭，因为先看 rerank 是否稳定。
+
+输出：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/
+
+关键结果文件：
+frame_selection_report.json
+object_center_report.json
+candidate_scores/candidate_*.json
+pose_guided_summary.json
+selected/selected_reconviagen_mesh.glb
+selected/selected_visual_hull_filtered.obj  （仅 APPLY_VISUAL_HULL_FILTER=1 时生成）
+
+
+一、手机 AR：已整理成 CoarseModel/datasets 的数据集
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_073549 \
+CASE_NAME=reconviagen_20260617_073549_phone_pose_guided_s0 \
+RUN_RECON=1 \
+SEEDS=0 \
+MAX_INPUT_FRAMES=18 \
+SCORE_ALL_FRAMES=1 \
+bash CoarseModel/pose_guided_recon/scripts/run_phone_ar_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/reconviagen_20260617_073549_phone_pose_guided_s0/pose_guided_summary.json
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/reconviagen_20260617_073549_phone_pose_guided_s0/frame_selection_report.json
+
+
+二、手机 AR：直接使用 ReconViaGen/ar_tracker 原始采集 session
+
+假设：
+RGB 在 /home/zjr/Tracker/ReconViaGen/ar_tracker/images/<SESSION>
+mask 在 /home/zjr/Tracker/ReconViaGen/ar_tracker/masks/<SESSION>
+poses.txt 在 /home/zjr/Tracker/ReconViaGen/ar_tracker/images/<SESSION>/poses.txt
+
+cd /home/zjr/Tracker
+
+SESSION=20260617_073549
+
+GPU=1 \
+INPUT_TYPE=phone_ar_session \
+PHONE_DATA_DIR=/home/zjr/Tracker/ReconViaGen/ar_tracker/images/$SESSION \
+PHONE_MASK_DIR=/home/zjr/Tracker/ReconViaGen/ar_tracker/masks/$SESSION \
+CASE_NAME=${SESSION}_phone_session_pose_guided_s0 \
+RUN_RECON=1 \
+SEEDS=0 \
+MAX_INPUT_FRAMES=18 \
+SCORE_ALL_FRAMES=1 \
+bash CoarseModel/pose_guided_recon/scripts/run_phone_ar_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/${SESSION}_phone_session_pose_guided_s0/pose_guided_summary.json
+
+
+三、COLMAP：heimei 数据集
+
+要求数据集中至少有：
+rgb/ 或 images/
+masks/
+sparse/0/cameras.txt
+sparse/0/images.txt
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+CASE_NAME=heimei_colmap_pose_guided_s0 \
+RUN_RECON=1 \
+SEEDS=0 \
+MAX_INPUT_FRAMES=24 \
+SCORE_ALL_FRAMES=1 \
+bash CoarseModel/pose_guided_recon/scripts/run_colmap_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_colmap_pose_guided_s0/pose_guided_summary.json
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_colmap_pose_guided_s0/frame_selection_report.json
+
+
+四、只对已有 mesh 做 pose/mask sanity check，不重新跑 ReconViaGen
+
+这个命令不会占用大显存，适合先验证评分和投影是否正常。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_073549 \
+CASE_NAME=reconviagen_20260617_073549_existing_mesh_score \
+RUN_RECON=0 \
+EXISTING_MESHES=/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_073549/reconviagen_output/reconstructed_object.glb \
+MAX_INPUT_FRAMES=18 \
+MAX_SCORE_POINTS=5000 \
+YAW_STEPS=12 \
+SCORE_ALL_FRAMES=1 \
+bash CoarseModel/pose_guided_recon/scripts/run_phone_ar_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/reconviagen_20260617_073549_existing_mesh_score/pose_guided_summary.json
+
+
+五、多 seed 候选选择
+
+先确认 s0 正常，再跑多 seed。流程会顺序运行，不会并发占显存。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_073549 \
+CASE_NAME=reconviagen_20260617_073549_phone_pose_guided_s01 \
+RUN_RECON=1 \
+SEEDS=0,1 \
+MAX_INPUT_FRAMES=18 \
+SCORE_ALL_FRAMES=1 \
+bash CoarseModel/pose_guided_recon/scripts/run_phone_ar_pose_guided.sh
+
+
+六、打开保守 visual hull face filter
+
+只有在 pose/mask rerank 结果看起来稳定后再开。它会额外输出 selected_visual_hull_filtered.obj。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/reconviagen_20260617_073549 \
+CASE_NAME=reconviagen_20260617_073549_phone_pose_guided_s0_vh \
+RUN_RECON=1 \
+SEEDS=0 \
+MAX_INPUT_FRAMES=18 \
+SCORE_ALL_FRAMES=1 \
+APPLY_VISUAL_HULL_FILTER=1 \
+VH_INSIDE_RATIO_THRESHOLD=0.45 \
+VH_MIN_VISIBLE_VIEWS=3 \
+VH_MASK_DILATION=7 \
+bash CoarseModel/pose_guided_recon/scripts/run_phone_ar_pose_guided.sh
+
+
+七、建议先跑顺序
+
+1. 先跑“四、只对已有 mesh 做 pose/mask sanity check”。
+2. 若 summary 里 iou/recall/precision 不是全零，再跑“一、手机 AR s0”或“三、heimei COLMAP s0”。
+3. s0 的 selected mesh 可用后，再跑“五、多 seed 候选选择”。
+4. 多 seed 能稳定选出更好 mesh 后，再尝试“六、visual hull filter”。
+
+
+八、只有 RGB + mask：自动调用 COLMAP 计算 pose，再接 pose-guided ReconViaGen
+
+新增脚本：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/scripts/run_rgbmask_colmap_pose_guided.sh
+
+输入数据要求任选一种：
+1. SOURCE_DATASET_DIR 指向一个目录，目录下有 rgb/ 或 images/ 或 color/，以及 masks/
+2. 或直接显式传 RGB_DIR 和 MASK_DIR
+
+输出目录：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/
+
+COLMAP 标准化数据集会生成在：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/colmap_dataset
+
+COLMAP 结果：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/colmap_dataset/sparse/0/cameras.txt
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/colmap_dataset/sparse/0/images.txt
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/prepare_colmap_report.json
+
+默认 COLMAP 路径：
+/home/zjr/anaconda3/envs/foundpose/bin/colmap
+
+如果你要换 COLMAP，设置：
+COLMAP_BIN=/your/path/to/colmap
+
+
+八-1、只准备标准化数据并运行 COLMAP，不跑 ReconViaGen
+
+这个适合先确认 COLMAP 是否能注册出相机，不占 ReconViaGen 显存。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+SOURCE_DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+CASE_NAME=heimei_rgbmask_colmap_only \
+RUN_COLMAP=1 \
+RUN_POSE_GUIDED=0 \
+MAX_COLMAP_IMAGES=120 \
+COLMAP_USE_MASKS=1 \
+COLMAP_MATCHER=exhaustive \
+COLMAP_USE_GPU=0 \
+bash CoarseModel/pose_guided_recon/scripts/run_rgbmask_colmap_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_only/prepare_colmap_report.json
+ls -lh /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_only/colmap_dataset/sparse/0
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_only/colmap_dataset/colmap_logs/03_mapper.log
+
+重点先看 prepare_colmap_report.json 里的：
+colmap.registered_image_count
+colmap.registered_image_names
+
+如果 registered_image_count 太少，优先尝试：
+1. MAX_COLMAP_IMAGES=0 使用全部图；
+2. COLMAP_USE_MASKS=0 不用 mask 限制 SIFT；
+3. COLMAP_MATCHER=sequential 针对视频顺序采集。
+
+
+八-2、RGB_DIR + MASK_DIR 显式输入，只运行 COLMAP
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+RGB_DIR=/path/to/rgb \
+MASK_DIR=/path/to/masks \
+CASE_NAME=my_rgbmask_colmap_only \
+RUN_COLMAP=1 \
+RUN_POSE_GUIDED=0 \
+MAX_COLMAP_IMAGES=120 \
+COLMAP_USE_MASKS=1 \
+COLMAP_MATCHER=exhaustive \
+COLMAP_USE_GPU=0 \
+bash CoarseModel/pose_guided_recon/scripts/run_rgbmask_colmap_pose_guided.sh
+
+
+八-3、COLMAP pose + 已有 mesh 做 sanity check，不重新跑 ReconViaGen
+
+这个命令用于验证 COLMAP pose 是否和 mask/mesh 对得上。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+SOURCE_DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+CASE_NAME=heimei_rgbmask_colmap_existing_mesh_score \
+RUN_COLMAP=1 \
+RUN_POSE_GUIDED=1 \
+RUN_RECON=0 \
+EXISTING_MESHES=/home/zjr/Tracker/CoarseModel/datasets/heimei/models/heimei.obj \
+MAX_COLMAP_IMAGES=120 \
+MAX_INPUT_FRAMES=24 \
+MAX_SCORE_POINTS=5000 \
+YAW_STEPS=12 \
+COLMAP_USE_MASKS=1 \
+COLMAP_MATCHER=exhaustive \
+COLMAP_USE_GPU=0 \
+bash CoarseModel/pose_guided_recon/scripts/run_rgbmask_colmap_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_existing_mesh_score/pose_guided_summary.json
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_existing_mesh_score/frame_selection_report.json
+
+
+八-4、一步到位：RGB+mask -> COLMAP pose -> ReconViaGen mesh -> pose/mask rerank
+
+先跑 seed=0。确认正常后再把 SEEDS 改成 0,1。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+SOURCE_DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+CASE_NAME=heimei_rgbmask_colmap_recon_s0 \
+RUN_COLMAP=1 \
+RUN_POSE_GUIDED=1 \
+RUN_RECON=1 \
+SEEDS=0 \
+MAX_COLMAP_IMAGES=120 \
+MAX_INPUT_FRAMES=24 \
+SCORE_ALL_FRAMES=1 \
+COLMAP_USE_MASKS=1 \
+COLMAP_MATCHER=exhaustive \
+COLMAP_USE_GPU=0 \
+bash CoarseModel/pose_guided_recon/scripts/run_rgbmask_colmap_pose_guided.sh
+
+查看结果：
+cat /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_recon_s0/pose_guided_summary.json
+ls -lh /home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/heimei_rgbmask_colmap_recon_s0/selected
+
+
+八-5、复用已有 COLMAP，不重复算 pose，只重新跑 ReconViaGen/rerank
+
+如果前一次 COLMAP 已经成功，后续调 ReconViaGen seed 或 scoring 参数时建议这样跑。
+
+cd /home/zjr/Tracker
+
+GPU=1 \
+SOURCE_DATASET_DIR=/home/zjr/Tracker/CoarseModel/datasets/heimei \
+CASE_NAME=heimei_rgbmask_colmap_recon_s0 \
+RUN_COLMAP=0 \
+REUSE_COLMAP=1 \
+RUN_POSE_GUIDED=1 \
+RUN_RECON=1 \
+SEEDS=0,1 \
+MAX_INPUT_FRAMES=24 \
+SCORE_ALL_FRAMES=1 \
+bash CoarseModel/pose_guided_recon/scripts/run_rgbmask_colmap_pose_guided.sh
+
+注意：
+这里的 REUSE_COLMAP=1 复用的是同一个 CASE_NAME 下的：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/colmap_dataset/sparse/0
+如果换了 CASE_NAME，就需要重新 RUN_COLMAP=1。
+
+
+八-6、COLMAP 参数建议
+
+COLMAP_USE_MASKS=1：
+默认使用 masks 限制 SIFT 特征，适合物体占画面比例适中、mask 准确的情况。
+如果 COLMAP 注册图像很少，试试 COLMAP_USE_MASKS=0，因为过紧或不稳定 mask 可能导致匹配不足。
+
+COLMAP_FALLBACK_WITHOUT_MASKS=1：
+默认打开。若带 mask 的 COLMAP 在 feature/matcher/mapper 任一步失败，会自动用同一批 RGB 不带 mask 再跑一次 COLMAP。
+注意：这只影响 COLMAP 位姿估计；后续 mesh sanity check/rerank 仍然使用 masks。
+fallback 记录在：
+/home/zjr/Tracker/CoarseModel/pose_guided_recon/outputs/<CASE_NAME>/colmap_dataset/colmap_logs/00_fallback_without_masks.txt
+
+COLMAP_MATCHER=exhaustive：
+适合几十到一百多张图，稳但慢。
+
+COLMAP_MATCHER=sequential：
+适合明显视频顺序采集，快，但大环绕闭环可能不如 exhaustive 稳。
+
+MAX_COLMAP_IMAGES=120：
+默认先限制 COLMAP 输入，避免几百张图 exhaustive 太慢。若数据很完整可以改成 0 使用全部图。

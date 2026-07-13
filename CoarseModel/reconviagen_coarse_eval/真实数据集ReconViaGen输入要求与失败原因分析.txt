@@ -1,0 +1,217 @@
+ReconViaGen 真实 AR 采集输入的失败原因与处理建议
+时间：2026-06-17
+
+一、当前观察
+
+这次比较的重点是两个真实数据集：
+
+1. CoarseModel/datasets/GOOD_MESH_TEST
+2. CoarseModel/datasets/reconviagen_20260520_021556
+
+肉眼看两组图像都是同一个 Snoopy 红盒物体，而且 mask-crop 后的前景大小、裁剪尺度、mask 面积差别并不大。但 mesh 结果一个明显可用，一个明显偏差。这说明问题不主要在“是否是同一个物体”或“mask 面积是否相近”，而在输入视角分布、候选选择和 image-only 生成模型的隐含假设。
+
+二、关键数字
+
+fresh ReconViaGen 输入统计：
+
+GOOD_MESH_TEST_fresh_recon_s0_1：
+- selected frame 数量：18
+- mask-crop coverage mean：0.474
+- bbox coverage mean：0.712
+- crop size mean：约 278 px
+- selected candidate score：0.76
+- mesh bbox extent：0.750, 0.545, 0.695
+- 粗略相机方位覆盖 azimuth span：约 246.6 度
+- 平均俯仰 elevation：约 47.4 度
+- 平均相机距离：约 0.364
+- CoarseModel 好结果 kept frames：15，dropped frames：3
+- CoarseModel 4stage final cost：约 6.17e3 -> 5.93e3
+
+reconviagen_20260520_021556_fresh_recon_s0_1：
+- selected frame 数量：18
+- mask-crop coverage mean：0.459
+- bbox coverage mean：0.719
+- crop size mean：约 275 px
+- selected candidate score：0.76
+- mesh bbox extent：0.737, 0.342, 0.604
+- 粗略相机方位覆盖 azimuth span：约 67.7 度
+- 平均俯仰 elevation：约 17.9 度
+- 平均相机距离：约 0.733
+- CoarseModel kept frames：8，dropped frames：10
+- CoarseModel 4stage final cost：约 8.42e3，其他 reconviagen_2026 批次可到 4e4、9e4、1e5 级
+
+最关键的差异不是 mask 面积，而是相机覆盖：
+
+GOOD_MESH_TEST 的 selected camera position z 范围约为 -0.092 到 0.346，说明覆盖跨过了物体前后侧；
+reconviagen_20260520_021556 的 selected camera position z 范围约为 -0.775 到 -0.336，基本都在同一侧。
+
+换句话说，缩略图看起来像“转了很多角度”，但 3D 轨迹并没有真正绕物体形成足够覆盖。ReconViaGen 当前主流程没有把真实 AR pose 作为生成条件使用，因此它只能从图像外观里猜 3D。视角覆盖不足时，它会更依赖 Trellis/Image prior，结果就会不稳定。
+
+三、为什么候选选择没有救回来
+
+当前 ReconViaGen 的 candidate score 基本不是 image-pose 一致性分数。
+
+从 ReconViaGen/run_local.py 的 score_mesh_candidate 看：
+- 分数主要来自 mesh 自身 bbox extent balance；
+- face count；
+- mesh 自己渲染出来的 silhouette coverage；
+- 不直接比较输入 mask；
+- 不直接比较输入 RGB；
+- 不使用 AR 相机位姿做多视图一致性检查。
+
+这次两个真实数据集里 candidate score 都是 0.76，silhouette_score 都是 0.2。seed0、seed1 的选择并没有真正区分“哪个 mesh 更符合输入图像”。因此同一个物体，只要输入分布稍微偏，坏 mesh 也可能拿到同样分数。
+
+四、ReconViaGen 对输入图像的隐含要求
+
+当前路线本质上更像“多张 object-centric RGB/mask 图像给 Trellis 做 image-conditioned 生成”，而不是严格几何重建。因此它有一些隐含要求：
+
+1. 视角必须真的覆盖物体，而不是只在一侧摆动
+
+建议 selected frames 的粗略方位覆盖至少超过 180 度，更稳的是 220-240 度以上。对于这种有明显正面、侧面、背面、顶部差异的物体，最好包含：
+- 正面或主视觉面；
+- 左右两个侧面；
+- 顶部或斜上视角；
+- 适量背面/端面；
+- 避免 18 张里大部分都是同一个侧面或同一个俯仰带。
+
+2. 视角数量不是越多越好，重复视角会稀释有效条件
+
+如果 18 张里有 8 张都是同一侧、同一俯仰、只是图像内旋转或远近变化，那么对 image-only 模型来说不是 18 个有效视角，而是重复证据。更好的做法是选 12-18 张高质量、覆盖均匀的帧。
+
+3. 前景应居中、不过满、不能贴边
+
+mask-crop 后建议：
+- object coverage 大致在 0.30-0.65；
+- bbox coverage 大致在 0.55-0.85；
+- 物体到 crop 边界至少留 5%-8% margin；
+- 避免头部、盒角、底面被 mask/crop 截断。
+
+4. 光照和材质反光会显著影响结果
+
+这个红盒物体有强反光，白色角色区域也容易过曝。Trellis 可能把高光、阴影、贴纸当成形状证据。建议：
+- 固定曝光；
+- 避免强反光角度；
+- 保持漫反射软光；
+- 不要让高光跨多帧稳定出现为一条“结构线”。
+
+5. 背景必须被稳定去除
+
+虽然当前输入已经 mask-crop 到白底，但如果 mask 边缘有黑边、背景残留、缺口、透明/白色前景被误删，都会影响模型。尤其白色角色和白背景接近时，mask 不能吃掉轮廓。
+
+6. 图像内旋转不是根本问题，但极端 roll 会增加难度
+
+GOOD 和坏例都有手机 roll，但 image-only 模型没有真实相机约束时，它需要自己把这些图像解释成同一个 3D 物体。roll、重复视角、低覆盖叠加时会更不稳。
+
+五、为什么加 pose 可能有帮助，但不能单独解决
+
+你的直觉“是不是使用相机位姿 pose 会好一点”是合理的，但要分两层：
+
+1. 用 pose 做输入筛选/质量控制：很有必要，优先级最高
+
+先不要直接训练 pose-conditioned 生成模型。更稳的第一步是用 AR pose 约束输入选择：
+- 检查 selected frames 的方位覆盖；
+- 检查俯仰覆盖；
+- 去掉重复视角；
+- 保证每个角度 bin 只保留最清晰、mask 最好的帧；
+- 如果覆盖不足，直接提示重新采集，而不是把坏输入送进 ReconViaGen。
+
+2. 用 pose 做生成/重建条件：有潜在收益，但不能补不存在的视角
+
+如果输入只有 60-70 度方位覆盖，pose-conditioned 模型也不能凭空知道背面。pose 能帮助模型少混淆视图对应关系，但不能替代采集覆盖。也就是说：
+- pose 可以提高多视图融合的几何一致性；
+- pose 可以帮助 rerank/reject；
+- pose 不能保证从局部视角恢复完整正确 mesh。
+
+六、建议的输入处理流程
+
+建议前端采集或离线处理时加一个强制 QC：
+
+1. Pose coverage 诊断
+
+每次采集后计算 selected frames 的相机位置覆盖：
+- azimuth span < 180 度：拒绝或提示继续绕物体拍；
+- azimuth span 180-220 度：可跑，但标记为风险；
+- azimuth span > 220 度：较好；
+- elevation 过窄或全是极高/极低：标记风险；
+- distance max/min 过大：标记风险。
+
+2. Frame selection
+
+用 pose 分 bin，而不是只按图像质量选帧：
+- 12-18 张；
+- 每个方位 bin 选 sharpness 高、mask 完整、前景不贴边的帧；
+- 去掉近重复帧；
+- 保留一到两张顶部/端面视角，但不要让它们占多数。
+
+3. Mask/crop 规范化
+
+统一把输入变成：
+- 白底或透明底 object crop；
+- 方形 crop；
+- 10%-20% padding；
+- 518 或模型指定分辨率；
+- 前景居中；
+- 严格过滤空 mask、贴边 mask、mask 断裂帧。
+
+4. ReconViaGen 生成后做 pose-based sanity check
+
+生成 mesh 后，不应该只看 candidate score。应该把 mesh 用 AR camera pose 渲染回 selected views，和输入 mask 比：
+- silhouette IoU；
+- mask recall；
+- mask precision；
+- 每帧投影 bbox 是否一致；
+- 多帧中是否有大面积漂移。
+
+这个 check 可以作为 reranker：
+- seed0/seed1/seed2 中选 mask IoU 更高的；
+- 如果所有 seed 都低，则判定输入不合格或 mesh 不可用；
+- 再进入 CoarseModel。
+
+七、当前最实际的下一步
+
+第一优先级不是继续改生成模型，而是先补输入 QC 和 pose-based rerank。
+
+建议新增两个轻量工具：
+
+1. real_input_qc.py
+
+输入：
+- CoarseModel dataset dir；
+- selected frames；
+- poses.txt；
+- masks/rgb。
+
+输出：
+- azimuth span；
+- elevation range；
+- distance range；
+- mask coverage；
+- bbox coverage；
+- border-touch ratio；
+- sharpness；
+- contact sheet；
+- pass/warn/fail。
+
+2. recon_mesh_pose_rerank.py
+
+输入：
+- ReconViaGen 多个 seed 输出 mesh；
+- dataset poses/intrinsics；
+- masks。
+
+输出：
+- 每个 mesh 的 silhouette IoU/recall/precision；
+- best seed；
+- fail reason。
+
+这两个工具比继续盲目加 AR pose 训练更直接，因为当前失败首先是“输入是否适合 image-only 生成”和“坏 mesh 是否能被自动识别”的问题。
+
+八、结论
+
+是的，ReconViaGen 对 AR 采集图像存在隐藏要求。它不是任意一组同物体 RGB/mask 都能稳定出好 mesh。它需要干净、居中、覆盖充分、视角均匀、反光少、重复少的 object-centric 输入。
+
+当前 GOOD_MESH_TEST 好，很大程度上不是因为物体本身更容易，而是 selected views 覆盖更合理；reconviagen_20260520_021556 坏，核心风险是 selected camera 只覆盖约 67.7 度，且距离更远、俯仰更窄。其他 reconviagen_2026 批次也存在不同程度的覆盖不足、俯仰极端或后端匹配成本偏高。
+
+因此，短期最有效路线：
+
+先用 AR pose 做采集质量控制和帧选择，再用 ReconViaGen 生成；生成后用 AR pose 做 mask projection rerank/sanity check。只有这两步仍不能把结果稳定下来，再考虑训练 pose-conditioned 生成模型。

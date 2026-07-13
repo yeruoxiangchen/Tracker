@@ -318,6 +318,16 @@ def run_sparse_generation(
         cmd.append("--pose_only")
     if args.image_only:
         cmd.append("--image_only")
+    if args.condition_mode != "ray":
+        cmd.extend(["--condition_mode", args.condition_mode])
+    if args.projected_grid_resolution != 16:
+        cmd.extend(["--projected_grid_resolution", str(args.projected_grid_resolution)])
+    if args.projected_min_support != 0.5:
+        cmd.extend(["--projected_min_support", str(args.projected_min_support)])
+    if args.projected_min_support_ratio != 0.15:
+        cmd.extend(["--projected_min_support_ratio", str(args.projected_min_support_ratio)])
+    if args.projected_grid_transform != "identity":
+        cmd.extend(["--projected_grid_transform", args.projected_grid_transform])
     if args.absolute_pose_condition:
         cmd.append("--absolute_pose_condition")
     if float(args.visual_hull_prior_weight) != 0.0:
@@ -355,6 +365,11 @@ def build_inprocess_pipeline(args: argparse.Namespace):
         use_image_features=not args.pose_only,
         use_pose_features=not args.image_only,
         cond_fp16=args.cond_fp16,
+        condition_mode=args.condition_mode,
+        projected_grid_resolution=args.projected_grid_resolution,
+        projected_min_support=args.projected_min_support,
+        projected_min_support_ratio=args.projected_min_support_ratio,
+        projected_grid_transform=args.projected_grid_transform,
         apply_lora=True,
     )
     return pipeline
@@ -500,6 +515,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_crop", action="store_true")
     parser.add_argument("--pose_only", action="store_true")
     parser.add_argument("--image_only", action="store_true")
+    parser.add_argument(
+        "--condition_mode",
+        choices=["ray", "projected"],
+        default="ray",
+        help="Sparse condition type for the AR-pose pipeline.",
+    )
+    parser.add_argument("--projected_grid_resolution", type=int, default=16)
+    parser.add_argument("--projected_min_support", type=float, default=0.5)
+    parser.add_argument("--projected_min_support_ratio", type=float, default=0.15)
+    parser.add_argument("--projected_grid_transform", choices=["identity", "pixal3d_rotation"], default="identity")
     parser.add_argument("--absolute_pose_condition", action="store_true")
     parser.add_argument("--visual_hull_prior_weight", type=float, default=0.0)
     parser.add_argument("--visual_hull_mask_threshold", type=float, default=0.5)

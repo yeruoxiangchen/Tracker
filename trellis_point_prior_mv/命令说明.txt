@@ -5387,3 +5387,1628 @@ bash trellis_point_prior_mv/scripts/run_mesh_frozen_topk_sweep.sh
 3. synthetic val64；
 4. 再决定是否训练 slat flow。
 ```
+
+## 四十八、2026-06-26 sparse-structure VAE encode/decode sanity check
+
+本节不训练，只验证：
+
+```text
+prior_coords -> occupancy -> TRELLIS sparse-structure encoder -> decoder -> coords
+```
+
+是否能得到合理 sparse coords。
+
+对每个样本会比较三种 source：
+
+```text
+prior_coords_vae:
+  点云先验本身 encode/decode。
+  这是最关键的检查，用来判断 point prior 经 VAE 后是否天然碎、是否偏离 target。
+
+target_coords_vae:
+  GT target coords 重新 encode/decode。
+  用来判断 sparse-structure VAE 自身对完整结构的重建能力。
+
+target_latent_npz:
+  直接 decode 已保存的 target latent z。
+  这是当前 ss_latent 文件和 decoder 的上限/一致性检查。
+```
+
+输出：
+
+```text
+report.json
+report.csv
+每个 sample/source 下的 latent.npz
+每个 decode 设置下的 coords npz
+```
+
+重点字段：
+
+```text
+decoded_vs_target_iou
+decoded_vs_target_target_recall
+decoded_vs_target_pred_precision
+decoded_component_count
+decoded_largest_component_ratio
+decoded_small_component_coord_ratio_lt64
+decoded_to_prior_within_radius_ratio
+```
+
+### 1. 最小 smoke
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=sparse_vae_sanity_smoke \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+TOPK_SPECS=4096,8192,target_unique \
+THRESHOLD=0.0 \
+bash trellis_point_prior_mv/scripts/run_sparse_vae_sanity.sh
+```
+
+查看摘要：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/sparse_vae_sanity/sparse_vae_sanity_smoke/report.json
+```
+
+快速表格：
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+p = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/sparse_vae_sanity/sparse_vae_sanity_smoke/report.json')
+d = json.loads(p.read_text())
+for name, row in d['summary']['by_source_decode'].items():
+    print(
+        name,
+        'iou=', row.get('decoded_vs_target_iou_mean'),
+        'recall=', row.get('decoded_vs_target_target_recall_mean'),
+        'precision=', row.get('decoded_vs_target_pred_precision_mean'),
+        'comp=', row.get('decoded_component_count_mean'),
+        'largest=', row.get('decoded_largest_component_ratio_mean'),
+        'small64=', row.get('decoded_small_component_coord_ratio_lt64_mean'),
+    )
+PY
+```
+
+### 2. val8 sanity
+
+如果 smoke 正常，再跑 8 个样本：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+RUN_NAME=sparse_vae_sanity_val8 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+TOPK_SPECS=4096,8192,target_unique \
+THRESHOLD=0.0 \
+bash trellis_point_prior_mv/scripts/run_sparse_vae_sanity.sh
+```
+
+### 3. 判断标准
+
+如果：
+
+```text
+target_coords_vae / target_latent_npz:
+  decoded component 少、largest ratio 高、target IoU/recall 正常；
+
+prior_coords_vae:
+  decoded component 很多、largest ratio 低、target precision/recall 差；
+```
+
+说明碎片不是 decoder 普遍问题，而是点云先验太稀疏/局部/noisy，直接 encode 后 latent 支撑不足。
+
+如果：
+
+```text
+target_coords_vae 也碎；
+```
+
+说明 sparse-structure VAE 的 encode/decode 对 occupancy 输入本身存在分布问题，需要先处理 latent construction，而不是直接训练 inpainting flow。
+
+如果：
+
+```text
+target_latent_npz 正常，但 target_coords_vae 异常；
+```
+
+说明训练集里保存的 latent z 并不等价于“重新 encode occupancy”，后续 latent inpainting 不能简单用 occ encoder 产物当 q_vis，需要检查 encoder setting / posterior mean / normalization。
+
+## 四十九、2026-06-26 Step 1 + Step 1.5 latent inpaint sanity
+
+本节开始转向 latent，不训练。
+
+目标：
+
+```text
+Step 1:
+  构建 latent inpaint manifest，保存 q_gt / q_vis / m_s_base。
+
+Step 1.5:
+  latent splice sanity:
+  q_splice = m_s * q_vis + (1 - m_s) * q_gt
+  D_s(q_splice) -> coords
+```
+
+这一步用于训练前验证：
+
+```text
+1. q_vis 能不能作为 observed latent anchor；
+2. m_s 边界是否合理；
+3. q_vis 和 q_gt 能不能在 latent 空间拼接；
+4. 如果 q_splice 都碎，则直接训练 G_inp 大概率失败。
+```
+
+### 1. Step 1：构建 latent inpaint smoke manifest
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=latent_inpaint_smoke \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+bash trellis_point_prior_mv/scripts/run_build_latent_inpaint_dataset.sh
+```
+
+输出：
+
+```text
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke/manifest.json
+/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke/build_report.json
+```
+
+每个 latent npz 包含：
+
+```text
+q_gt
+q_vis
+m_s
+prior_coords
+prior_conf
+target_coords
+```
+
+### 2. Step 1.5：latent splice smoke
+
+先扫建议的 dilation：
+
+```text
+mask_dilate64 = 0,1,2
+mask_dilate16 = 0,1
+```
+
+命令：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=latent_splice_sanity_smoke \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+MASK_DILATE64=0,1,2 \
+MASK_DILATE16=0,1 \
+TOPK_SPECS=4096,8192,target_unique \
+THRESHOLD=0.0 \
+bash trellis_point_prior_mv/scripts/run_latent_splice_sanity.sh
+```
+
+查看结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_splice_sanity/latent_splice_sanity_smoke/report.json
+```
+
+快速摘要：
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+p = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_splice_sanity/latent_splice_sanity_smoke/report.json')
+d = json.loads(p.read_text())
+for name, row in d['summary']['by_source_decode'].items():
+    if not name.endswith('/topk_target_unique'):
+        continue
+    print(
+        name,
+        'iou=', row.get('decoded_vs_target_iou_mean'),
+        'recall=', row.get('decoded_vs_target_target_recall_mean'),
+        'precision=', row.get('decoded_vs_target_pred_precision_mean'),
+        'comp=', row.get('decoded_component_count_mean'),
+        'largest=', row.get('decoded_largest_component_ratio_mean'),
+        'small64=', row.get('decoded_small_component_coord_ratio_lt64_mean'),
+        'mask=', row.get('mask_cell_count_mean'),
+        'mask_ratio=', row.get('mask_cell_ratio_mean'),
+        'saved_m_s_l1=', row.get('saved_m_s_vs_recomputed_mask_l1_mean'),
+    )
+PY
+```
+
+### 3. val8 latent manifest
+
+如果 smoke 正常，再构建 val8：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+RUN_NAME=latent_inpaint_val8 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+bash trellis_point_prior_mv/scripts/run_build_latent_inpaint_dataset.sh
+```
+
+### 4. val8 latent splice
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val8 \
+RUN_NAME=latent_splice_sanity_val8 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val8 \
+MASK_DILATE64=0,1,2 \
+MASK_DILATE16=0,1 \
+TOPK_SPECS=4096,8192,target_unique \
+THRESHOLD=0.0 \
+bash trellis_point_prior_mv/scripts/run_latent_splice_sanity.sh
+```
+
+### 5. 判断标准
+
+优先看 `topk_target_unique`：
+
+```text
+q_gt:
+  应该接近 target_latent_npz decode 上限。
+
+q_vis:
+  允许不完整，但不应出现极端碎片。
+
+q_splice:
+  如果 mask 边界合理，应接近 q_gt，至少不能比 q_vis 更碎。
+```
+
+判断组合：
+
+```text
+1. q_splice component_count 是否明显升高；
+2. q_splice largest_component_ratio 是否明显下降；
+3. q_splice small64 ratio 是否上升；
+4. decoded_vs_target precision/recall 是否接近 q_gt；
+5. mask_cell_count 是否过大，导致 q_vis 覆盖了不该覆盖的 unknown region。
+6. q_splice_d64_0_d16_0 的 saved_m_s_vs_recomputed_mask_l1 是否为 0 或接近 0。
+```
+
+如果：
+
+```text
+saved_m_s_vs_recomputed_mask_l1 在 d64=0,d16=0 不接近 0：
+  说明 build_latent_inpaint_dataset.py 保存的 m_s 和 eval_latent_splice_sanity.py 重算 mask 不一致；
+  先不要判断 q_splice 质量，应该先修 mask 构造。
+
+mask_dilate64=0, mask_dilate16=0 最稳：
+  说明 observed mask 应保持保守，后续训练先不要扩大 known region。
+
+mask_dilate64=1 或 2 更稳：
+  说明 64^3 point prior 太稀疏，需要在进入 latent mask 前补邻域。
+
+mask_dilate16=1 更稳：
+  说明 known/unknown latent 边界需要更宽的 anchor band。
+
+所有 q_splice 都碎：
+  不要训练 G_inp；
+  先检查 q_vis 与 q_gt latent distribution 是否不兼容，或 m_s 边界构造是否错误。
+```
+
+## 五十、2026-06-26 Masked latent inpainting flow 训练与测试命令
+
+### 结论背景
+
+`latent_splice_sanity_val32_d16off` 已完成。val32 的关键结论：
+
+```text
+q_gt/topk_target_unique:
+  IoU=0.99996, component=2.81, largest=0.9985
+
+q_vis/topk_target_unique:
+  IoU=0.45639, recall=0.62059, component=51.0
+
+q_splice d64=0,d16=0:
+  IoU=0.66385, recall=0.79293, component=24.66, largest=0.9850
+
+q_splice d64=1,d16=0:
+  IoU=0.64274, recall=0.77577, component=18.91, largest=0.9884
+
+q_splice d64=2,d16=0:
+  IoU=0.58411, recall=0.73017, component=36.72
+```
+
+因此第一版 masked latent inpainting 训练默认用：
+
+```text
+MASK_DILATE64=0
+MASK_DILATE16=0
+```
+
+`d64=1,d16=0` 保留为 ablation：它 component 更少，但 val32 IoU/recall 低于 d64=0。
+
+本轮新增代码：
+
+```text
+trellis_point_prior_mv/train_latent_inpaint_flow.py
+trellis_point_prior_mv/eval_latent_inpaint_flow.py
+trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+训练目标：
+
+```text
+target = (1 - m_s) * q_gt + m_s * q_vis
+
+unknown region:
+  学 q_gt，作为主损失。
+
+known region:
+  轻量保持 q_vis anchor。
+```
+
+评估先只看 sparse latent decode，不直接进 mesh。
+
+### 1. 构建 train64 / val32 latent manifest
+
+如果已经有以下目录，可以跳过：
+
+```text
+trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_train64
+trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32
+```
+
+构建命令：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=train64 \
+RUN_NAME=latent_inpaint_train64 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+bash trellis_point_prior_mv/scripts/run_build_latent_inpaint_dataset.sh
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=val32 \
+RUN_NAME=latent_inpaint_val32 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/pointprior_pixal_v9_stage2_antioverfill_rank_w0005_ws05_s200_seed42 \
+bash trellis_point_prior_mv/scripts/run_build_latent_inpaint_dataset.sh
+```
+
+### 2. d64=0 smoke 训练 + eval
+
+第一优先级，验证代码和 loss 是否正常。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=latent_inpaint_flow_d64_0_smoke \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.25 \
+UNKNOWN_X0_LOSS_WEIGHT=0.25 \
+KNOWN_X0_LOSS_WEIGHT=0.10 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_d64_0_smoke/eval/report.json
+```
+
+### 3. d64=1 smoke 对照
+
+只作为 ablation，不作为默认。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=latent_inpaint_flow_d64_1_smoke \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+MASK_DILATE64=1 \
+MASK_DILATE16=0 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.25 \
+UNKNOWN_X0_LOSS_WEIGHT=0.25 \
+KNOWN_X0_LOSS_WEIGHT=0.10 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+### 4. d64=0 s200 训练 + val32 eval
+
+smoke 正常后再跑。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=s200 \
+RUN_NAME=latent_inpaint_flow_d64_0_s200 \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+TRAIN_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_train64 \
+VAL_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.25 \
+UNKNOWN_X0_LOSS_WEIGHT=0.25 \
+KNOWN_X0_LOSS_WEIGHT=0.10 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+### 5. d64=1 s200 对照
+
+如果 d64=0 s200 正常，再跑这组比较 component / IoU tradeoff。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=s200 \
+RUN_NAME=latent_inpaint_flow_d64_1_s200 \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+TRAIN_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_train64 \
+VAL_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+MASK_DILATE64=1 \
+MASK_DILATE16=0 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.25 \
+UNKNOWN_X0_LOSS_WEIGHT=0.25 \
+KNOWN_X0_LOSS_WEIGHT=0.10 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+### 6. 快速摘要脚本
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+for run in [
+    'latent_inpaint_flow_d64_0_smoke',
+    'latent_inpaint_flow_d64_1_smoke',
+    'latent_inpaint_flow_d64_0_s200',
+    'latent_inpaint_flow_d64_1_s200',
+]:
+    p = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow') / run / 'eval/report.json'
+    if not p.exists():
+        continue
+    d = json.loads(p.read_text())
+    print('\n====', run)
+    for name, row in d['summary']['by_source_decode'].items():
+        if not name.endswith('/topk_target_unique'):
+            continue
+        print(
+            name,
+            'iou=', row.get('decoded_vs_target_iou_mean'),
+            'recall=', row.get('decoded_vs_target_target_recall_mean'),
+            'precision=', row.get('decoded_vs_target_pred_precision_mean'),
+            'comp=', row.get('decoded_component_count_mean'),
+            'largest=', row.get('decoded_largest_component_ratio_mean'),
+            'small64=', row.get('decoded_small_component_coord_ratio_lt64_mean'),
+            'unknown_l1=', row.get('q_pred_unknown_vs_q_gt_l1_mean'),
+            'known_l1=', row.get('q_pred_known_vs_q_vis_l1_mean'),
+        )
+PY
+```
+
+### 7. 判断标准
+
+优先看 `q_pred/topk_target_unique`，并与 `q_vis`、`q_splice` 比较：
+
+```text
+必须满足：
+  q_pred 明显优于 q_vis。
+
+理想情况：
+  q_pred 接近 q_splice。
+
+如果 q_pred 不如 q_vis：
+  说明 flow 训练目标或采样 clamp 有问题，不进入 mesh。
+
+如果 q_pred IoU 提升但 component/碎片明显升高：
+  先调 known clamp / loss 权重，不训练 slat flow。
+
+如果 q_pred 在 val32 稳定优于 q_vis，且 component 接近 q_splice：
+  再接 frozen stock slat/mesh 做 end-to-end 检查。
+```
+
+### 8. strict clamp 诊断注意事项
+
+如果只想重新 eval，必须显式设置 `MODE=s200` 和独立 `EVAL_DIR`，避免默认 `MODE=smoke` 只评估 sample 0，并覆盖原来的 s200 eval。
+
+正确命令：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=s200 \
+RUN_TRAIN=0 \
+RUN_EVAL=1 \
+RUN_NAME=latent_inpaint_flow_d64_0_s200 \
+EVAL_DIR=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_d64_0_s200/eval_strict_clamp_s25_val32 \
+TRAIN_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_train64 \
+VAL_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+KNOWN_CLAMP_START_T=1.0 \
+CLAMP_INITIAL_NOISE=1 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+EVAL_STEPS=25 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+本轮已经跑过一条未显式 `MODE=s200` 的命令，因此实际是：
+
+```text
+s200 checkpoint + latent_inpaint_smoke manifest + sample 0
+steps=25, clamp_start_t=1.0, clamp_initial_noise=1
+```
+
+该 sample0 strict clamp 结果仍低于 q_vis：
+
+```text
+q_vis/topk_target_unique:
+  IoU=0.3342, recall=0.5009
+
+q_splice/topk_target_unique:
+  IoU=0.5640, recall=0.7212
+
+q_pred/topk_target_unique:
+  IoU=0.2644, recall=0.4183
+```
+
+说明强制全程 known clamp 和更多 sampling steps 没有修复问题。
+
+## 五十一、2026-06-26 Teacher-forced x0 诊断命令
+
+目的：
+
+```text
+区分问题来自多步 sampling，还是单步 x0 预测本身。
+```
+
+诊断方法：
+
+```text
+给定 q_splice target；
+采样 t；
+构造 x_t；
+模型预测 pred_v；
+转 pred_x0；
+hard splice known region；
+D_s(pred_x0) -> sparse coords。
+```
+
+建议先测：
+
+```text
+t = 0.25,0.5,0.75
+```
+
+判断：
+
+```text
+teacher-forced 好，sampling 差：
+  先修采样 steps / clamp / guidance。
+
+teacher-forced 也差：
+  再修训练目标 / condition。
+```
+
+### 1. d64=0 s200 teacher-forced val32
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=latent_inpaint_flow_d64_0_s200_teacher_forced_val32 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_d64_0_s200 \
+INDICES=0-31 \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_teacher_forced.sh
+```
+
+### 2. full q_vis condition teacher-forced 对照
+
+如果第一条 teacher-forced 差，再跑 full q_vis condition，判断是否是 `q_vis * m_s` condition 信息不足：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=latent_inpaint_flow_d64_0_s200_teacher_forced_fullqvis_val32 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_d64_0_s200 \
+INDICES=0-31 \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+T_VALUES=0.25,0.5,0.75 \
+COND_USE_FULL_Q_VIS=1 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_teacher_forced.sh
+```
+
+### 3. 快速摘要
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+for run in [
+    'latent_inpaint_flow_d64_0_s200_teacher_forced_val32',
+    'latent_inpaint_flow_d64_0_s200_teacher_forced_fullqvis_val32',
+]:
+    p = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow') / run / 'report.json'
+    if not p.exists():
+        continue
+    d = json.loads(p.read_text())
+    print('\n====', run)
+    for name, row in d['summary']['by_source_decode'].items():
+        if not name.endswith('/topk_target_unique'):
+            continue
+        print(
+            name,
+            'iou=', row.get('decoded_vs_target_iou_mean'),
+            'recall=', row.get('decoded_vs_target_target_recall_mean'),
+            'precision=', row.get('decoded_vs_target_pred_precision_mean'),
+            'comp=', row.get('decoded_component_count_mean'),
+            'largest=', row.get('decoded_largest_component_ratio_mean'),
+            'tf_v_mse=', row.get('teacher_pred_v_mse_mean'),
+            'tf_x0_l1=', row.get('teacher_hard_x0_vs_q_splice_l1_mean'),
+        )
+PY
+```
+
+### 4. 后续路线更新
+
+如果 teacher-forced 也不超过 q_vis：
+
+```text
+下一步优先接 image condition：
+condition = image_cond + point_cond(q_vis, m_s)
+```
+
+这一步应放在大量 decoder-aware loss 之前。原因是 Points-to-3D 不是只靠 visible point cloud 补全 unknown，而是用 image condition 提供语义和全局形状先验，用 q_vis/m_s 提供 observed geometry anchor。
+
+如果 teacher-forced 明显好于 sampling：
+
+```text
+先修 sampling / clamp / steps；
+暂时不改训练目标。
+```
+
+## 五十二、2026-06-26 Image condition + point condition latent inpaint 命令
+
+### 结论背景
+
+`latent_inpaint_flow_d64_0_s200_teacher_forced_val32` 已完成。`topk_target_unique` 关键结果：
+
+```text
+q_vis:
+  IoU=0.456389, recall=0.620594, component=51.00, largest=0.946188
+
+q_splice:
+  IoU=0.663849, recall=0.792927, component=24.66, largest=0.984959
+
+teacher-forced t=0.25:
+  IoU=0.651137, recall=0.783926, component=20.91, largest=0.991392
+
+teacher-forced t=0.50:
+  IoU=0.615112, recall=0.756463, component=18.97, largest=0.992783
+
+teacher-forced t=0.75:
+  IoU=0.476419, recall=0.635829, component=42.09, largest=0.955924
+```
+
+判断：
+
+```text
+1. 单步 teacher-forced 在 t=0.25/0.50 已经明显好于 q_vis，接近 q_splice；
+2. 多步 sampling 仍然差，说明当前不只是 loss 没学，而是从 noise 生成 unknown 时缺少全局条件；
+3. 纯 q_vis/m_s condition 没有 image condition，不符合 Points-to-3D 的完整设定；
+4. 下一轮改为 condition = mean(image_cond_4views) concat point_cond(q_vis,m_s)。
+```
+
+本轮新增参数：
+
+```text
+USE_IMAGE_COND=1
+IMAGE_MAX_VIEWS=4
+IMAGE_FRAME_SELECT=uniform
+IMAGE_COND_AGGREGATION=mean
+COND_FUSION=concat
+```
+
+默认仍然 `USE_IMAGE_COND=0`，旧实验可复现。
+
+### 1. image condition smoke 训练 + eval
+
+先跑 20 steps，确认 image+point condition 不会直接破坏 q_vis / q_splice 基线。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=smoke \
+RUN_NAME=latent_inpaint_flow_img4_d64_0_smoke \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+TRAIN_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_train64 \
+VAL_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+USE_IMAGE_COND=1 \
+IMAGE_MAX_VIEWS=4 \
+IMAGE_FRAME_SELECT=uniform \
+IMAGE_COND_AGGREGATION=mean \
+COND_FUSION=concat \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.25 \
+UNKNOWN_X0_LOSS_WEIGHT=0.25 \
+KNOWN_X0_LOSS_WEIGHT=0.10 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=20 \
+SAVE_EVERY=20 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_smoke/eval/report.json
+```
+
+### 2. image condition smoke teacher-forced
+
+如果 smoke eval 没有崩，再做 teacher-forced，判断 image condition 是否改善单步 unknown 补全。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=latent_inpaint_flow_img4_d64_0_smoke_teacher_forced \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_smoke \
+INDICES=0 \
+USE_IMAGE_COND=1 \
+IMAGE_MAX_VIEWS=4 \
+IMAGE_FRAME_SELECT=uniform \
+IMAGE_COND_AGGREGATION=mean \
+COND_FUSION=concat \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_teacher_forced.sh
+```
+
+### 3. image condition s200 训练 + val32 eval
+
+smoke 正常后再跑。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=s200 \
+RUN_NAME=latent_inpaint_flow_img4_d64_0_s200 \
+RUN_BUILD=0 \
+RUN_TRAIN=1 \
+RUN_EVAL=1 \
+TRAIN_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_train64 \
+VAL_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+USE_IMAGE_COND=1 \
+IMAGE_MAX_VIEWS=4 \
+IMAGE_FRAME_SELECT=uniform \
+IMAGE_COND_AGGREGATION=mean \
+COND_FUSION=concat \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.25 \
+UNKNOWN_X0_LOSS_WEIGHT=0.25 \
+KNOWN_X0_LOSS_WEIGHT=0.10 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=0.5 \
+CLAMP_INITIAL_NOISE=0 \
+MAX_STEPS=200 \
+SAVE_EVERY=100 \
+EVAL_STEPS=12 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_flow.sh
+```
+
+### 4. image condition s200 teacher-forced val32
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=latent_inpaint_flow_img4_d64_0_s200_teacher_forced_val32 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_s200 \
+INDICES=0-31 \
+USE_IMAGE_COND=1 \
+IMAGE_MAX_VIEWS=4 \
+IMAGE_FRAME_SELECT=uniform \
+IMAGE_COND_AGGREGATION=mean \
+COND_FUSION=concat \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_teacher_forced.sh
+```
+
+### 5. image-only 对照
+
+如果 image+point 明显改善，再跑一个 image-only teacher-forced 对照，用来判断 point anchor 是否仍然必要。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+RUN_NAME=latent_inpaint_flow_img4_d64_0_s200_teacher_forced_imageonly_val32 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_val32 \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_s200 \
+INDICES=0-31 \
+USE_IMAGE_COND=1 \
+IMAGE_MAX_VIEWS=4 \
+IMAGE_FRAME_SELECT=uniform \
+IMAGE_COND_AGGREGATION=mean \
+COND_FUSION=image_only \
+MASK_DILATE64=0 \
+MASK_DILATE16=0 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_teacher_forced.sh
+```
+
+## 五十三、2026-06-26 Image condition 失败后的 A/B/C 诊断命令
+
+### 结论背景
+
+已完成：
+
+```text
+latent_inpaint_flow_img4_d64_0_smoke
+latent_inpaint_flow_img4_d64_0_overfit1_s500
+```
+
+sample0 / `topk_target_unique`：
+
+```text
+q_vis:
+  IoU=0.334169, recall=0.500940, component=263
+
+q_splice:
+  IoU=0.564009, recall=0.721235, component=68
+
+img4 concat smoke20 q_pred:
+  IoU=0.232965, recall=0.377894, component=71
+
+img4 concat overfit s500 q_pred:
+  IoU=0.261938, recall=0.415136, component=289
+
+point-only s200 strict clamp q_pred:
+  IoU=0.264426, recall=0.418254, component=364
+```
+
+结论：
+
+```text
+image+point mean concat 当前没有改善 free sampling；
+不能继续盲目长训；
+先跑 A/B/C 诊断。
+```
+
+本节新增 wrapper：
+
+```text
+trellis_point_prior_mv/scripts/run_latent_inpaint_imgcond_diagnostics.sh
+```
+
+### A. image_only overfit
+
+目的：
+
+```text
+确认原始 image condition 本身是否能支持当前 sample 的 sparse latent 补全。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=image_only_overfit \
+SMOKE_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+MAX_STEPS=500 \
+SAVE_EVERY=100 \
+EVAL_STEPS=25 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_imgcond_diagnostics.sh
+```
+
+结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_imageonly_overfit1_s500/eval/report.json
+```
+
+### B. concat overfit checkpoint teacher-forced
+
+目的：
+
+```text
+判断 img4 concat overfit 的单步 x0 是否已经学会；
+如果 teacher-forced 好但 free sampling 差，优先修 sampler；
+如果 teacher-forced 也差，优先修 condition/fusion/target。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=concat_teacher_forced \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_overfit1_s500 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_imgcond_diagnostics.sh
+```
+
+### C. first-view aggregation overfit
+
+目的：
+
+```text
+对照 IMAGE_COND_AGGREGATION=mean 是否把多视角信息平均坏了。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=first_overfit \
+SMOKE_LATENT_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+MAX_STEPS=500 \
+SAVE_EVERY=100 \
+EVAL_STEPS=25 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_imgcond_diagnostics.sh
+```
+
+### D. image_only teacher-forced
+
+如果 A 跑完，再补：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=image_only_teacher_forced \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_img4_d64_0_imageonly_overfit1_s500 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_imgcond_diagnostics.sh
+```
+
+### E. first-view teacher-forced
+
+如果 C 跑完，再补：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=first_teacher_forced \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+POINT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_flow_imgfirst_d64_0_concat_overfit1_s500 \
+T_VALUES=0.25,0.5,0.75 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_imgcond_diagnostics.sh
+```
+
+### 快速摘要
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+runs = [
+    'latent_inpaint_flow_img4_d64_0_overfit1_s500',
+    'latent_inpaint_flow_img4_d64_0_imageonly_overfit1_s500',
+    'latent_inpaint_flow_imgfirst_d64_0_concat_overfit1_s500',
+    'latent_inpaint_flow_img4_d64_0_overfit1_s500_teacher_forced',
+    'latent_inpaint_flow_img4_d64_0_imageonly_overfit1_s500_teacher_forced',
+    'latent_inpaint_flow_imgfirst_d64_0_concat_overfit1_s500_teacher_forced',
+]
+
+root = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow')
+for run in runs:
+    p = root / run / 'eval' / 'report.json'
+    if not p.exists():
+        p = root / run / 'report.json'
+    if not p.exists():
+        continue
+    d = json.loads(p.read_text())
+    print('\\n====', run)
+    for name, row in d['summary']['by_source_decode'].items():
+        if not name.endswith('/topk_target_unique'):
+            continue
+        if not (name.startswith('q_vis/') or name.startswith('q_splice/') or name.startswith('q_pred/') or name.startswith('tf_t')):
+            continue
+        print(
+            name,
+            'iou=', row.get('decoded_vs_target_iou_mean'),
+            'recall=', row.get('decoded_vs_target_target_recall_mean'),
+            'comp=', row.get('decoded_component_count_mean'),
+            'largest=', row.get('decoded_largest_component_ratio_mean'),
+            'tf_l1=', row.get('teacher_hard_x0_vs_q_splice_l1_mean'),
+        )
+PY
+```
+
+### 判断
+
+```text
+image_only > concat:
+  point_cond concat 干扰 image condition，下一步做 gated fusion / adapter fusion。
+
+image_only 也差:
+  image condition 取图/聚合/训练方式没对齐 TRELLIS，需要先修 image 条件路径。
+
+teacher-forced 好、free sampling 差:
+  修 sampler / high-t schedule / known clamp。
+
+teacher-forced 也差:
+  修 condition / fusion / target，不继续加长训练。
+```
+
+## 五十四、2026-06-26 Stock / native sampler 等价性诊断命令
+
+### 结论背景
+
+`COND_FUSION=image_only` 不是 stock TRELLIS。它实际是：
+
+```text
+latent-inpaint LoRA + image_cond-only + masked clamp sampling
+```
+
+当前最可疑的问题之一是：
+
+```text
+eval_latent_inpaint_flow.py 之前默认 guidance_strength=1.0，
+会覆盖 TRELLIS 原生 sparse_structure_sampler_params 里的 cfg_strength。
+```
+
+因此下一步不是直接继续训练，而是先证明：
+
+```text
+no-LoRA / no-clamp / image-only / native CFG
+```
+
+在自写 `sample_latent()` 里能接近 TRELLIS 原生 sparse sampling。
+
+本节新增：
+
+```text
+trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+代码新增 eval 参数：
+
+```text
+--no_lora
+--use_native_ss_cfg
+--add_native_sampler_pred
+--guidance_rescale
+--steps 0    # 使用 TRELLIS 原生 sparse steps
+```
+
+report 会记录：
+
+```text
+native_ss_cfg_strength
+effective_ss_cfg_strength
+native_ss_steps
+effective_ss_steps
+q_pred
+q_pred_native_sampler
+```
+
+### 1. stock/no-LoRA/no-clamp/image-only/native CFG
+
+第一优先级。确认自写 sample loop 和 native sampler API 是否一致。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=stock_imageonly_native \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+INDICES=0 \
+EVAL_STEPS=0 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_sampler_stock_imageonly_native/report.json
+```
+
+判断：
+
+```text
+如果 q_pred 和 q_pred_native_sampler 不一致：
+  自写 sample_latent() 与 native sampler API 不等价，先修 sampler。
+
+如果二者一致但都差：
+  继续做 CFG sweep。
+```
+
+### 2. stock/no-LoRA/no-clamp/image-only CFG sweep
+
+只有第 1 步二者一致后再跑。这里不用 native cfg，显式扫 CFG。
+
+```bash
+cd /home/zjr/Tracker
+
+for CFG in 1.0 3.0 7.5 12.0; do
+  SAFE_CFG=${CFG//./p}
+  GPU=4 \
+  DIAG=stock_imageonly_cfg \
+  RUN_NAME=latent_inpaint_sampler_stock_imageonly_cfg${SAFE_CFG} \
+  LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+  INDICES=0 \
+  EVAL_STEPS=0 \
+  GUIDANCE_STRENGTH=$CFG \
+  bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+done
+```
+
+### 3. LoRA image-only no-clamp native CFG
+
+目的：
+
+```text
+在不启用 clamp 的情况下，判断 latent-inpaint LoRA 是否破坏 image prior。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=lora_imageonly_native_noclamp \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+INDICES=0 \
+EVAL_STEPS=0 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+### 4. LoRA image-only + clamp native CFG
+
+目的：
+
+```text
+在相同 LoRA / image-only 下，只打开 known clamp，判断 clamp 是否破坏 trajectory。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=lora_imageonly_native_clamp \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+INDICES=0 \
+EVAL_STEPS=0 \
+KNOWN_LATENT_CLAMP_STRENGTH=1.0 \
+KNOWN_CLAMP_START_T=1.0 \
+CLAMP_INITIAL_NOISE=1 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+### 5. LoRA concat no-clamp native CFG
+
+目的：
+
+```text
+在不启用 clamp 的情况下，判断 point_cond concat 是否干扰 image prior。
+```
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=lora_concat_native_noclamp \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+INDICES=0 \
+EVAL_STEPS=0 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+### 6. 快速摘要
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+runs = [
+    'latent_inpaint_sampler_stock_imageonly_native',
+    'latent_inpaint_sampler_lora_imageonly_native_noclamp',
+    'latent_inpaint_sampler_lora_imageonly_native_clamp',
+    'latent_inpaint_sampler_lora_concat_native_noclamp',
+]
+for cfg in ['1p0', '3p0', '7p5', '12p0']:
+    runs.append(f'latent_inpaint_sampler_stock_imageonly_cfg{cfg}')
+
+root = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow')
+for run in runs:
+    p = root / run / 'report.json'
+    if not p.exists():
+        continue
+    d = json.loads(p.read_text())
+    args = d.get('args', {})
+    print('\\n====', run)
+    print(
+        'native_cfg=', args.get('use_native_ss_cfg'),
+        'no_lora=', args.get('no_lora'),
+        'fusion=', args.get('cond_fusion'),
+    )
+    for name, row in d['summary']['by_source_decode'].items():
+        if not name.endswith('/topk_target_unique'):
+            continue
+        if not (name.startswith('q_vis/') or name.startswith('q_splice/') or name.startswith('q_pred/')):
+            if not name.startswith('q_pred_native_sampler/'):
+                continue
+        print(
+            name,
+            'iou=', row.get('decoded_vs_target_iou_mean'),
+            'recall=', row.get('decoded_vs_target_target_recall_mean'),
+            'comp=', row.get('decoded_component_count_mean'),
+            'largest=', row.get('decoded_largest_component_ratio_mean'),
+            'native_cfg=', row.get('native_ss_cfg_strength_mean'),
+            'effective_cfg=', row.get('effective_ss_cfg_strength_mean'),
+            'steps=', row.get('effective_ss_steps_mean'),
+        )
+PY
+```
+
+### 7. 判断顺序
+
+```text
+1. q_pred vs q_pred_native_sampler：
+   不一致则先修 sampler。
+
+2. stock/no-LoRA/no-clamp/native CFG：
+   如果不合理，先修 image preprocessing / native cfg / sampler path。
+
+3. CFG sweep：
+   如果高 CFG 明显改善，之前 CFG=1.0 是主要问题。
+
+4. LoRA no-clamp：
+   如果 stock 好、LoRA 差，LoRA 破坏 image prior。
+
+5. clamp：
+   如果 no-clamp 好、clamp 差，known-region hard clamp 破坏 trajectory。
+
+6. concat：
+   如果 image-only 好、concat 差，再做 gated fusion / adapter fusion。
+```
+
+## 五十五、2026-06-26 Stock image-only 诊断修正后重跑命令
+
+### 背景
+
+上一节已跑的 `latent_inpaint_sampler_stock_imageonly_native` 结果不能作为 stock TRELLIS flow 错误的证据。
+
+原因是旧版 latent image condition 直接把整张 RGB 输入 `pipeline.encode_image()`，没有使用 source mask 做 TRELLIS 风格的对象 alpha、bbox crop、方形 padding 和 518 resize。这个输入路径和 `mesh_frozen_downstream.py` 里的 `stock_sparse` 不一致。
+
+已修正默认行为：
+
+```text
+IMAGE_USE_SOURCE_MASK=1
+IMAGE_MASK_CROP_RESOLUTION=518
+```
+
+并校验：
+
+```text
+latent_inpaint_image_condition.apply_mask_and_crop
+vs
+eval_mesh_frozen_downstream.apply_mask_and_crop
+
+maxdiff=0
+mode=RGBA
+size=(518, 518)
+```
+
+因此需要用新的 run name 重跑，避免覆盖旧结果。
+
+### 1. stock/no-LoRA/no-clamp/image-only/native CFG，单视角 first，mask-crop v2
+
+这是第一优先级。它用于重新判断 stock image-only 在正确对象裁剪输入下是否正常。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=stock_imageonly_native \
+RUN_NAME=latent_inpaint_sampler_stock_imageonly_native_first_maskcrop_v2 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+INDICES=0 \
+IMAGE_MAX_VIEWS=1 \
+IMAGE_FRAME_SELECT=first \
+IMAGE_COND_AGGREGATION=first \
+IMAGE_USE_SOURCE_MASK=1 \
+IMAGE_MASK_CROP_RESOLUTION=518 \
+EVAL_STEPS=0 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+结果：
+
+```bash
+cat /home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow/latent_inpaint_sampler_stock_imageonly_native_first_maskcrop_v2/report.json
+```
+
+### 2. stock/no-LoRA/no-clamp/image-only/native CFG，默认 4 视角 mean，mask-crop v2
+
+用于判断多视角 mean image condition 是否比单视角 first 更稳。
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+DIAG=stock_imageonly_native \
+RUN_NAME=latent_inpaint_sampler_stock_imageonly_native_img4_maskcrop_v2 \
+LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+INDICES=0 \
+IMAGE_USE_SOURCE_MASK=1 \
+IMAGE_MASK_CROP_RESOLUTION=518 \
+EVAL_STEPS=0 \
+bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+```
+
+### 3. 如果 v2 仍然明显低于 q_vis
+
+再跑显式 CFG sweep，但仍然保持 mask-crop。
+
+```bash
+cd /home/zjr/Tracker
+
+for CFG in 1.0 3.0 7.5 12.0; do
+  SAFE_CFG=${CFG//./p}
+  GPU=4 \
+  DIAG=stock_imageonly_cfg \
+  RUN_NAME=latent_inpaint_sampler_stock_imageonly_maskcrop_cfg${SAFE_CFG}_v2 \
+  LATENT_RUN_ROOT=/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint/latent_inpaint_smoke \
+  INDICES=0 \
+  IMAGE_MAX_VIEWS=1 \
+  IMAGE_FRAME_SELECT=first \
+  IMAGE_COND_AGGREGATION=first \
+  IMAGE_USE_SOURCE_MASK=1 \
+  IMAGE_MASK_CROP_RESOLUTION=518 \
+  EVAL_STEPS=0 \
+  GUIDANCE_STRENGTH=$CFG \
+  bash trellis_point_prior_mv/scripts/run_latent_inpaint_sampler_equivalence.sh
+done
+```
+
+### 4. 快速摘要 v2
+
+```bash
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+runs = [
+    'latent_inpaint_sampler_stock_imageonly_native_first_maskcrop_v2',
+    'latent_inpaint_sampler_stock_imageonly_native_img4_maskcrop_v2',
+]
+for cfg in ['1p0', '3p0', '7p5', '12p0']:
+    runs.append(f'latent_inpaint_sampler_stock_imageonly_maskcrop_cfg{cfg}_v2')
+
+root = Path('/home/zjr/Tracker/trellis_point_prior_mv/outputs/latent_inpaint_flow')
+for run in runs:
+    p = root / run / 'report.json'
+    if not p.exists():
+        continue
+    d = json.loads(p.read_text())
+    args = d.get('args', {})
+    print('\\n====', run)
+    print(
+        'mask_count=', d.get('rows', [{}])[0].get('image_cond_mask_count'),
+        'use_mask=', args.get('image_use_source_mask'),
+        'native_cfg=', args.get('use_native_ss_cfg'),
+        'no_lora=', args.get('no_lora'),
+        'fusion=', args.get('cond_fusion'),
+    )
+    for name, row in d['summary']['by_source_decode'].items():
+        if not name.endswith('/topk_target_unique'):
+            continue
+        if not (
+            name.startswith('q_vis/')
+            or name.startswith('q_splice/')
+            or name.startswith('q_pred/')
+            or name.startswith('q_pred_native_sampler/')
+        ):
+            continue
+        print(
+            name,
+            'iou=', row.get('decoded_vs_target_iou_mean'),
+            'recall=', row.get('decoded_vs_target_target_recall_mean'),
+            'comp=', row.get('decoded_component_count_mean'),
+            'largest=', row.get('decoded_largest_component_ratio_mean'),
+            'native_cfg=', row.get('native_ss_cfg_strength_mean'),
+            'effective_cfg=', row.get('effective_ss_cfg_strength_mean'),
+            'steps=', row.get('effective_ss_steps_mean'),
+        )
+PY
+```
+
+### 5. 判断
+
+```text
+如果 v2 明显恢复：
+  旧问题主要是 image preprocessing 没对齐，不是 stock flow 错。
+
+如果 v2 仍然很差：
+  先不要继续训练 latent inpaint；
+  下一步检查 latent target canonical frame 和 stock TRELLIS sparse output 是否同坐标系。
+
+如果 q_pred 和 q_pred_native_sampler 仍然一致：
+  sampler wrapper 本身不是主要嫌疑，重点查 image/latent 对齐。
+```
+
+## 五十六、2026-06-27 Points-to-3D strict reproduction 分支
+
+已新建独立目录：
+
+```text
+/home/zjr/Tracker/points_to_3d_strict
+```
+
+这个分支用于严格按 `/home/zjr/Tracker/2603.18782v1.pdf` 的 sparse structure inpainting 形式做最小复现，不使用之前探索过的 condition-only、ranking、anti-overfill、base-guided、filter、union 等改动。
+
+完整命令见：
+
+```bash
+cat /home/zjr/Tracker/points_to_3d_strict/命令说明.txt
+```
+
+第一优先级 overfit1 sparse eval：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=overfit1 \
+RUN_NAME=points_to_3d_strict_overfit1_s500_cfg1_noboundary \
+MAX_STEPS=500 \
+SAVE_EVERY=100 \
+LR=1e-5 \
+ADAM_EPS=1e-4 \
+FINITE_CHECK_EVERY=1 \
+IMAGE_MAX_VIEWS=1 \
+IMAGE_FRAME_SELECT=first \
+IMAGE_COND_AGGREGATION=first \
+CFG_DROP_PROB=0.0 \
+NO_GRAD_SCALER=1 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.1 \
+EVAL_STEPS=25 \
+BOUNDARY_REFINE_STEPS=0 \
+CFG_STRENGTH=1.0 \
+bash points_to_3d_strict/run_strict_points_to_3d.sh
+```
+
+如果 sparse eval 有效，再接 mesh：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=overfit1 \
+RUN_NAME=points_to_3d_strict_overfit1_s500_cfg1_noboundary \
+RUN_TRAIN=0 \
+RUN_EVAL=0 \
+RUN_MESH=1 \
+CKPT=/home/zjr/Tracker/points_to_3d_strict/outputs/points_to_3d_strict_overfit1_s500_cfg1_noboundary/checkpoints/last.ckpt \
+MESH_MODES=q_pred,q_splice \
+COORD_DECODE=threshold \
+BOUNDARY_REFINE_STEPS=0 \
+CFG_STRENGTH=1.0 \
+bash points_to_3d_strict/run_strict_points_to_3d.sh
+```
+
+如果 overfit1 证明机制有效，再跑 train64 -> val32：
+
+```bash
+cd /home/zjr/Tracker
+
+GPU=4 \
+MODE=train64_val32 \
+RUN_NAME=points_to_3d_strict_train64_s1000_val32_cfg1_noboundary \
+MAX_STEPS=1000 \
+SAVE_EVERY=200 \
+LR=1e-5 \
+ADAM_EPS=1e-4 \
+FINITE_CHECK_EVERY=1 \
+IMAGE_MAX_VIEWS=1 \
+IMAGE_FRAME_SELECT=first \
+IMAGE_COND_AGGREGATION=first \
+CFG_DROP_PROB=0.0 \
+NO_GRAD_SCALER=1 \
+UNKNOWN_FLOW_LOSS_WEIGHT=1.0 \
+KNOWN_FLOW_LOSS_WEIGHT=0.1 \
+EVAL_STEPS=25 \
+BOUNDARY_REFINE_STEPS=0 \
+CFG_STRENGTH=1.0 \
+bash points_to_3d_strict/run_strict_points_to_3d.sh
+```

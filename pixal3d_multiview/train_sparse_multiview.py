@@ -37,7 +37,16 @@ IMAGE_COND_CONFIG = {
     "grid_resolution": 16,
 }
 
-POSE_MODES = ("correct", "shuffle", "reverse", "noise", "large_noise", "identity")
+POSE_MODES = (
+    "correct",
+    "shuffle",
+    "reverse",
+    "cyclic_shift1",
+    "cyclic_shift2",
+    "noise",
+    "large_noise",
+    "identity",
+)
 
 
 def _resolve(root: Optional[str], path: str) -> str:
@@ -105,6 +114,7 @@ def build_view_aggregator(args: argparse.Namespace, image_cond_model, device: to
         hidden_dim=int(args.view_aggregator_hidden_dim),
         dropout=float(args.view_aggregator_dropout),
         residual_scale=float(args.view_aggregator_residual_scale),
+        geom_mode=str(getattr(args, "view_aggregator_geom_mode", "full")),
     ).to(device)
 
 
@@ -274,6 +284,18 @@ def apply_pose_mode(batch: dict, pose_mode: str, seed: int) -> dict:
         perm = torch.arange(num_views - 1, -1, -1)
         extrinsics = extrinsics[perm]
         out["pose_permutation"] = perm.tolist()
+    elif pose_mode in {"cyclic_shift1", "cyclic_shift2"}:
+        num_views = int(extrinsics.shape[0])
+        shift = 1 if pose_mode == "cyclic_shift1" else 2
+        if num_views > 1:
+            shift = shift % num_views
+            if shift == 0:
+                shift = 1
+            perm = torch.roll(torch.arange(num_views), shifts=shift)
+            extrinsics = extrinsics[perm]
+            out["pose_permutation"] = perm.tolist()
+        else:
+            out["pose_permutation"] = [0]
     elif pose_mode in {"noise", "large_noise"}:
         c2w = extrinsics if extrinsics_type == "c2w" else torch.linalg.inv(extrinsics)
         rot_deg = 35.0 if pose_mode == "noise" else 90.0
@@ -349,6 +371,20 @@ def parse_sample_indices(spec: str, dataset_size: int) -> list[int]:
     if bad:
         raise IndexError(f"sample_indices out of range for dataset size {dataset_size}: {bad}")
     return indices
+
+
+def parse_pose_mode_list(spec: str, *, allow_correct: bool = False) -> list[str]:
+    modes: list[str] = []
+    for part in str(spec).split(","):
+        mode = part.strip().lower()
+        if not mode:
+            continue
+        if mode not in POSE_MODES:
+            raise ValueError(f"Unknown pose mode {mode!r}; valid modes: {POSE_MODES}")
+        if mode == "correct" and not allow_correct:
+            raise ValueError("wrong-pose ranking modes should not include 'correct'")
+        modes.append(mode)
+    return modes
 
 
 def configure_trainable(model: torch.nn.Module, mode: str) -> int:
@@ -490,6 +526,7 @@ def save_checkpoint(
             "hidden_dim": getattr(args, "view_aggregator_hidden_dim", None),
             "dropout": getattr(args, "view_aggregator_dropout", None),
             "residual_scale": getattr(args, "view_aggregator_residual_scale", None),
+            "geom_mode": getattr(args, "view_aggregator_geom_mode", "full"),
         }
     if geometry_adapter is not None:
         payload["geometry_adapter"] = geometry_adapter.state_dict()
@@ -657,6 +694,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view_aggregator_dropout", type=float, default=0.0)
     parser.add_argument("--view_aggregator_residual_scale", type=float, default=1.0)
     parser.add_argument(
+        "--view_aggregator_geom_mode",
+        choices=["full", "no_xyz", "uv_depth_only", "support_only"],
+        default="full",
+        help="Filter view_geom channels before the gated view aggregator. Use no_xyz/uv_depth_only to avoid canonical xyz prior.",
+    )
+    parser.add_argument(
         "--freeze_view_aggregator",
         action="store_true",
         help="Use the loaded view aggregator as a frozen conditioner while training sparse flow parameters.",
@@ -671,6 +714,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load but do not train the explicit geometry adapter.",
     )
+    parser.add_argument(
+        "--pose_ranking_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for wrong-pose ranking loss. If >0, each step also evaluates one or more wrong-pose "
+            "conditions and penalizes cases where loss(correct)+margin is not below loss(wrong)."
+        ),
+    )
+    parser.add_argument("--pose_ranking_margin", type=float, default=0.02)
+    parser.add_argument("--pose_ranking_modes", default="reverse,noise,large_noise,identity")
+    parser.add_argument("--pose_ranking_num_wrong", type=int, default=1)
     return parser.parse_args()
 
 
@@ -688,6 +743,16 @@ def main() -> None:
         raise ValueError("--freeze_geometry_adapter requires --geometry_adapter mlp.")
     if args.freeze_geometry_adapter and not (args.init_weights or args.resume):
         raise ValueError("--freeze_geometry_adapter requires --init_weights or --resume to avoid freezing a fresh random adapter.")
+    if args.pose_ranking_weight < 0:
+        raise ValueError("--pose_ranking_weight should be non-negative.")
+    if args.pose_ranking_margin < 0:
+        raise ValueError("--pose_ranking_margin should be non-negative.")
+    if args.pose_ranking_num_wrong < 1:
+        raise ValueError("--pose_ranking_num_wrong should be >= 1.")
+    pose_ranking_modes = parse_pose_mode_list(args.pose_ranking_modes, allow_correct=False)
+    if args.pose_ranking_weight > 0 and not pose_ranking_modes:
+        raise ValueError("--pose_ranking_weight > 0 requires at least one --pose_ranking_modes entry.")
+    args.pose_ranking_modes_parsed = pose_ranking_modes
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -767,9 +832,14 @@ def main() -> None:
     print(
         f"[train_sparse_multiview] sparse_flow_trainable={trainable_count:,} mode={args.trainable} "
         f"view_aggregator_trainable={view_aggregator_count:,} type={args.view_aggregator} "
+        f"view_aggregator_geom_mode={args.view_aggregator_geom_mode} "
         f"freeze_view_aggregator={args.freeze_view_aggregator} "
         f"geometry_adapter_trainable={geometry_adapter_count:,} type={args.geometry_adapter} "
-        f"freeze_geometry_adapter={args.freeze_geometry_adapter}"
+        f"freeze_geometry_adapter={args.freeze_geometry_adapter} "
+        f"pose_ranking_weight={args.pose_ranking_weight} "
+        f"pose_ranking_margin={args.pose_ranking_margin} "
+        f"pose_ranking_modes={pose_ranking_modes} "
+        f"pose_ranking_num_wrong={args.pose_ranking_num_wrong}"
     )
     from pixal3d_multiview.sparse_condition import SparseMultiviewConditionBuilder
 
@@ -839,7 +909,30 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 pred = denoiser(x_t, t * 1000.0, cond)
-                loss = F.mse_loss(pred.float(), target.float())
+                correct_loss = F.mse_loss(pred.float(), target.float())
+
+            rank_loss = correct_loss.new_zeros(())
+            wrong_modes_used: list[str] = []
+            if args.pose_ranking_weight > 0:
+                num_wrong = min(int(args.pose_ranking_num_wrong), len(pose_ranking_modes))
+                if num_wrong >= len(pose_ranking_modes):
+                    selected_wrong_modes = list(pose_ranking_modes)
+                else:
+                    selected_wrong_modes = random.sample(pose_ranking_modes, k=num_wrong)
+                rank_terms = []
+                for wrong_idx, wrong_mode in enumerate(selected_wrong_modes):
+                    wrong_seed = int(args.seed + global_step * 104729 + wrong_idx * 9176 + 37)
+                    wrong_batch = apply_pose_mode(batch, wrong_mode, wrong_seed)
+                    wrong_cond = make_multiview_condition(condition_builder, image_cond_model, wrong_batch, args, device)
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                        wrong_pred = denoiser(x_t, t * 1000.0, wrong_cond)
+                        wrong_loss = F.mse_loss(wrong_pred.float(), target.float())
+                        rank_terms.append(F.relu(correct_loss + float(args.pose_ranking_margin) - wrong_loss))
+                    wrong_modes_used.append(wrong_mode)
+                if rank_terms:
+                    rank_loss = torch.stack(rank_terms).mean()
+
+            loss = correct_loss + float(args.pose_ranking_weight) * rank_loss
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -851,6 +944,9 @@ def main() -> None:
                     {
                         "epoch": epoch,
                         "loss": f"{float(loss.detach().cpu().item()):.4g}",
+                        "mse": f"{float(correct_loss.detach().cpu().item()):.4g}",
+                        "rank": f"{float(rank_loss.detach().cpu().item()):.4g}",
+                        "wrong": ",".join(wrong_modes_used) if wrong_modes_used else "-",
                         "lr": f"{float(optimizer.param_groups[0]['lr']):.2e}",
                         "uid": str(batch["uid"])[:10],
                         "steps/s": f"{global_step / elapsed:.2f}",

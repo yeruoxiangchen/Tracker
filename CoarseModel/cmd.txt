@@ -7,3 +7,11 @@ python CoarseModel/estimation.py
 
 
 python CoarseModel/estimation_4stage_defo.py 3.12最佳
+
+python CoarseModel/core/gen_repre_auto.py \
+    --dataset-name GOOD_MESH_TEST \
+    --config-path CoarseModel/configs/gen_repre/GOOD_MESH_TEST_gray.json
+
+python CoarseModel/estimation_4stage_defo_fin.py \
+    --dataset_name GOOD_MESH_TEST \
+    --opts-path CoarseModel/configs/infer/GOOD_MESH_TEST/GOOD_MESH_TEST_gray.json

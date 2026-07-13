@@ -182,6 +182,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view_aggregator_hidden_dim", type=int, default=256)
     parser.add_argument("--view_aggregator_dropout", type=float, default=0.0)
     parser.add_argument("--view_aggregator_residual_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--view_aggregator_geom_mode",
+        choices=["full", "no_xyz", "uv_depth_only", "support_only"],
+        default="full",
+    )
     parser.add_argument("--geometry_adapter", choices=["none", "mlp"], default="none")
     parser.add_argument("--geometry_adapter_dim", type=int, default=0)
     parser.add_argument("--geometry_adapter_hidden_dim", type=int, default=256)
@@ -227,6 +232,7 @@ def main() -> None:
         "geometry_feature_mode": args.geometry_feature_mode,
         "geometry_feature_scale": args.geometry_feature_scale,
         "view_aggregator": args.view_aggregator,
+        "view_aggregator_geom_mode": args.view_aggregator_geom_mode,
         "geometry_adapter": args.geometry_adapter,
     }
     if args.checkpoint:

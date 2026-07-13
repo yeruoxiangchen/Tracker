@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=${ROOT:-/home/zjr/Tracker}
+PY=${PY:-/home/zjr/anaconda3/envs/reconviagen/bin/python}
+GPU=${GPU:-1}
+
+SOURCE_DATASET_DIR=${SOURCE_DATASET_DIR:-$ROOT/CoarseModel/datasets/heimei}
+RGB_DIR=${RGB_DIR:-}
+MASK_DIR=${MASK_DIR:-}
+CASE_NAME=${CASE_NAME:-$(basename "$SOURCE_DATASET_DIR")_rgbmask_colmap_pose_guided}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/CoarseModel/pose_guided_recon/outputs}
+
+COLMAP_BIN=${COLMAP_BIN:-/home/zjr/anaconda3/envs/foundpose/bin/colmap}
+RUN_COLMAP=${RUN_COLMAP:-1}
+REUSE_COLMAP=${REUSE_COLMAP:-0}
+COLMAP_USE_MASKS=${COLMAP_USE_MASKS:-1}
+COLMAP_MATCHER=${COLMAP_MATCHER:-exhaustive}
+COLMAP_USE_GPU=${COLMAP_USE_GPU:-0}
+COLMAP_SINGLE_CAMERA=${COLMAP_SINGLE_CAMERA:-1}
+COLMAP_MAX_IMAGE_SIZE=${COLMAP_MAX_IMAGE_SIZE:-2000}
+COLMAP_FALLBACK_WITHOUT_MASKS=${COLMAP_FALLBACK_WITHOUT_MASKS:-1}
+MAX_COLMAP_IMAGES=${MAX_COLMAP_IMAGES:-120}
+
+RUN_POSE_GUIDED=${RUN_POSE_GUIDED:-1}
+RUN_RECON=${RUN_RECON:-1}
+SEEDS=${SEEDS:-0}
+EXISTING_MESHES=${EXISTING_MESHES:-}
+MAX_INPUT_FRAMES=${MAX_INPUT_FRAMES:-24}
+MIN_INPUT_FRAMES=${MIN_INPUT_FRAMES:-10}
+SCORE_ALL_FRAMES=${SCORE_ALL_FRAMES:-1}
+MAX_SCORE_POINTS=${MAX_SCORE_POINTS:-12000}
+YAW_STEPS=${YAW_STEPS:-24}
+SCALE_FACTORS=${SCALE_FACTORS:-0.75,0.9,1.0,1.1,1.25}
+POINT_DILATION=${POINT_DILATION:-9}
+APPLY_VISUAL_HULL_FILTER=${APPLY_VISUAL_HULL_FILTER:-0}
+VH_INSIDE_RATIO_THRESHOLD=${VH_INSIDE_RATIO_THRESHOLD:-0.45}
+VH_MIN_VISIBLE_VIEWS=${VH_MIN_VISIBLE_VIEWS:-3}
+VH_MASK_DILATION=${VH_MASK_DILATION:-7}
+
+PREP_CMD=(
+  "$PY" -u "$ROOT/CoarseModel/pose_guided_recon/prepare_colmap_rgb_mask_dataset.py"
+  --case_name "$CASE_NAME"
+  --output_root "$OUTPUT_ROOT"
+  --run_colmap "$RUN_COLMAP"
+  --reuse_colmap "$REUSE_COLMAP"
+  --colmap_bin "$COLMAP_BIN"
+  --colmap_use_masks "$COLMAP_USE_MASKS"
+  --colmap_matcher "$COLMAP_MATCHER"
+  --colmap_use_gpu "$COLMAP_USE_GPU"
+  --colmap_single_camera "$COLMAP_SINGLE_CAMERA"
+  --colmap_max_image_size "$COLMAP_MAX_IMAGE_SIZE"
+  --colmap_fallback_without_masks "$COLMAP_FALLBACK_WITHOUT_MASKS"
+  --max_colmap_images "$MAX_COLMAP_IMAGES"
+)
+
+if [[ -n "$RGB_DIR" || -n "$MASK_DIR" ]]; then
+  if [[ -z "$RGB_DIR" || -z "$MASK_DIR" ]]; then
+    echo "RGB_DIR and MASK_DIR must be provided together." >&2
+    exit 2
+  fi
+  PREP_CMD+=(--rgb_dir "$RGB_DIR" --mask_dir "$MASK_DIR")
+else
+  PREP_CMD+=(--dataset_dir "$SOURCE_DATASET_DIR")
+fi
+
+cd "$ROOT"
+"${PREP_CMD[@]}"
+
+if [[ "$RUN_POSE_GUIDED" == "0" ]]; then
+  echo "[rgbmask_colmap] RUN_POSE_GUIDED=0, stop after COLMAP prepare."
+  echo "[rgbmask_colmap] dataset: $OUTPUT_ROOT/$CASE_NAME/colmap_dataset"
+  exit 0
+fi
+
+DATASET_DIR="$OUTPUT_ROOT/$CASE_NAME/colmap_dataset" \
+CASE_NAME="$CASE_NAME" \
+OUTPUT_ROOT="$OUTPUT_ROOT" \
+GPU="$GPU" \
+RUN_RECON="$RUN_RECON" \
+SEEDS="$SEEDS" \
+EXISTING_MESHES="$EXISTING_MESHES" \
+MAX_INPUT_FRAMES="$MAX_INPUT_FRAMES" \
+MIN_INPUT_FRAMES="$MIN_INPUT_FRAMES" \
+SCORE_ALL_FRAMES="$SCORE_ALL_FRAMES" \
+MAX_SCORE_POINTS="$MAX_SCORE_POINTS" \
+YAW_STEPS="$YAW_STEPS" \
+SCALE_FACTORS="$SCALE_FACTORS" \
+POINT_DILATION="$POINT_DILATION" \
+APPLY_VISUAL_HULL_FILTER="$APPLY_VISUAL_HULL_FILTER" \
+VH_INSIDE_RATIO_THRESHOLD="$VH_INSIDE_RATIO_THRESHOLD" \
+VH_MIN_VISIBLE_VIEWS="$VH_MIN_VISIBLE_VIEWS" \
+VH_MASK_DILATION="$VH_MASK_DILATION" \
+bash "$ROOT/CoarseModel/pose_guided_recon/scripts/run_colmap_pose_guided.sh"

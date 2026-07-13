@@ -27,6 +27,7 @@ from pixal3d_multiview.eval_sparse_sampling_batch import (  # noqa: E402
 )
 from pixal3d_multiview.sample_sparse_checkpoint import load_target_coords, make_preview, write_ply  # noqa: E402
 from pixal3d_multiview.sparse_condition import SparseMultiviewConditionBuilder  # noqa: E402
+from pixal3d_multiview.pose_consistency_head import load_pose_consistency_head  # noqa: E402
 from pixal3d_multiview.train_sparse_multiview import (  # noqa: E402
     MultiviewSparseManifestDataset,
     POSE_MODES,
@@ -332,7 +333,9 @@ def write_markdown_report(path: Path, aggregate: dict, pairwise_rows: list[dict]
             f"condition: `empty_policy={aggregate['empty_policy']}`, "
             f"`global_fusion={aggregate['global_fusion']}`, "
             f"`view_aggregator={aggregate['view_aggregator']}`, "
-            f"`geometry_adapter={aggregate.get('geometry_adapter', 'none')}`"
+            f"`geometry_adapter={aggregate.get('geometry_adapter', 'none')}`, "
+            f"`pose_consistency_head={aggregate.get('pose_consistency_head') or 'none'}`, "
+            f"`pose_consistency_alpha={aggregate.get('pose_consistency_alpha', 1.0)}`"
         ),
         "",
         "## Pose Summary",
@@ -457,11 +460,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view_aggregator_hidden_dim", type=int, default=256)
     parser.add_argument("--view_aggregator_dropout", type=float, default=0.0)
     parser.add_argument("--view_aggregator_residual_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--view_aggregator_geom_mode",
+        choices=["full", "no_xyz", "uv_depth_only", "support_only"],
+        default="full",
+    )
     parser.add_argument("--geometry_adapter", choices=["none", "mlp"], default="none")
     parser.add_argument("--geometry_adapter_dim", type=int, default=0)
     parser.add_argument("--geometry_adapter_hidden_dim", type=int, default=256)
     parser.add_argument("--geometry_adapter_dropout", type=float, default=0.0)
     parser.add_argument("--geometry_adapter_residual_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--pose_consistency_head",
+        default="",
+        help="Optional pose-consistency head checkpoint. If set, its logits are added to view-gated aggregator logits.",
+    )
+    parser.add_argument(
+        "--pose_consistency_alpha",
+        type=float,
+        default=1.0,
+        help="Scale for adding pose-consistency logits to view-gated aggregator logits.",
+    )
     parser.add_argument("--ablation_name", default="")
     parser.add_argument("--save_previews", action="store_true")
     return parser.parse_args()
@@ -496,6 +515,14 @@ def main() -> None:
     if view_aggregator is not None:
         view_aggregator.eval()
     condition_builder.view_aggregator = view_aggregator
+    if args.pose_consistency_head:
+        feature_dim = int(getattr(image_cond_model, "embed_dim", image_cond_model.model.config.hidden_size))
+        condition_builder.pose_consistency_head = load_pose_consistency_head(
+            args.pose_consistency_head,
+            feature_dim=feature_dim,
+            device=device,
+        ).eval()
+        condition_builder.pose_consistency_alpha = float(args.pose_consistency_alpha)
     geometry_adapter = build_geometry_adapter(args, image_cond_model, device)
     if geometry_adapter is not None:
         geometry_adapter.eval()
@@ -575,6 +602,7 @@ def main() -> None:
                     "checkpoint_epoch": checkpoint_info.get("checkpoint_epoch"),
                     "pose_mode": pose_mode,
                     "view_aggregator": args.view_aggregator,
+                    "view_aggregator_geom_mode": args.view_aggregator_geom_mode,
                     "geometry_adapter": args.geometry_adapter,
                 },
                 summary,
@@ -601,7 +629,10 @@ def main() -> None:
         "geometry_feature_mode": args.geometry_feature_mode,
         "geometry_feature_scale": args.geometry_feature_scale,
         "view_aggregator": args.view_aggregator,
+        "view_aggregator_geom_mode": args.view_aggregator_geom_mode,
         "geometry_adapter": args.geometry_adapter,
+        "pose_consistency_head": args.pose_consistency_head,
+        "pose_consistency_alpha": args.pose_consistency_alpha,
         "summaries": summaries,
     }
     checkpoint_tags = [checkpoint_tag(path) for path in checkpoints if path.exists()]

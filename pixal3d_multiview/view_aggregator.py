@@ -25,6 +25,7 @@ class ViewGatedAggregator(nn.Module):
         hidden_dim: int = 256,
         dropout: float = 0.0,
         residual_scale: float = 1.0,
+        geom_mode: str = "full",
     ):
         super().__init__()
         self.feature_dim = int(feature_dim)
@@ -32,6 +33,9 @@ class ViewGatedAggregator(nn.Module):
         self.reduced_dim = int(reduced_dim)
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
+        self.geom_mode = str(geom_mode)
+        if self.geom_mode not in {"full", "no_xyz", "uv_depth_only", "support_only"}:
+            raise ValueError(f"Unknown view aggregator geom_mode: {self.geom_mode}")
 
         self.feature_reduce = nn.Linear(self.feature_dim, self.reduced_dim)
         self.gate = nn.Sequential(
@@ -49,12 +53,31 @@ class ViewGatedAggregator(nn.Module):
         nn.init.zeros_(self.delta_proj.weight)
         nn.init.zeros_(self.delta_proj.bias)
 
+    def _filter_geom(self, view_geom: torch.Tensor) -> torch.Tensor:
+        mode = self.geom_mode
+        geom = view_geom.float()
+        if mode == "full":
+            return geom
+        filtered = torch.zeros_like(geom)
+        if mode == "no_xyz":
+            filtered[..., :8] = geom[..., :8]
+            return filtered
+        if mode == "uv_depth_only":
+            filtered[..., 5:8] = geom[..., 5:8]
+            return filtered
+        if mode == "support_only":
+            filtered[..., :5] = geom[..., :5]
+            return filtered
+        raise ValueError(f"Unknown view aggregator geom_mode: {mode}")
+
     def forward(
         self,
         base_agg: torch.Tensor,
         sampled_features: torch.Tensor,
         support_weights: torch.Tensor,
         view_geom: torch.Tensor,
+        consistency_logits: Optional[torch.Tensor] = None,
+        consistency_alpha: float = 1.0,
     ) -> tuple[torch.Tensor, dict]:
         if base_agg.ndim != 3 or base_agg.shape[0] != 1:
             raise ValueError(f"base_agg should be [1,N,C], got {tuple(base_agg.shape)}")
@@ -68,16 +91,33 @@ class ViewGatedAggregator(nn.Module):
             raise ValueError(f"feature dim mismatch: got {sampled_features.shape[-1]}, expected {self.feature_dim}")
         if view_geom.shape[-1] != self.geom_dim:
             raise ValueError(f"geometry dim mismatch: got {view_geom.shape[-1]}, expected {self.geom_dim}")
+        if consistency_logits is not None and consistency_logits.shape != support_weights.shape:
+            raise ValueError(
+                "consistency_logits should be [V,N] and match support_weights, "
+                f"got {tuple(consistency_logits.shape)} vs {tuple(support_weights.shape)}"
+            )
 
         base_dtype = base_agg.dtype
         features = sampled_features.float()
-        geom = view_geom.float()
+        geom = self._filter_geom(view_geom)
         weights = support_weights.float()
         valid = weights > 0
 
         reduced = self.feature_reduce(features)
         gate_input = torch.cat([reduced, geom], dim=-1)
         score = self.gate(gate_input).squeeze(-1)
+        consistency_stats = {"enabled": False}
+        if consistency_logits is not None and float(consistency_alpha) != 0.0:
+            prior = consistency_logits.to(device=score.device, dtype=score.dtype)
+            score = score + float(consistency_alpha) * prior
+            valid_prior = prior[valid]
+            consistency_stats = {
+                "enabled": True,
+                "alpha": float(consistency_alpha),
+                "logit_mean": float(valid_prior.detach().mean().cpu().item()) if valid_prior.numel() else 0.0,
+                "logit_min": float(valid_prior.detach().min().cpu().item()) if valid_prior.numel() else 0.0,
+                "logit_max": float(valid_prior.detach().max().cpu().item()) if valid_prior.numel() else 0.0,
+            }
         score = score.masked_fill(~valid, -1.0e4)
         attn = torch.softmax(score, dim=0) * valid.float()
         attn = attn / attn.sum(dim=0, keepdim=True).clamp_min(1e-6)
@@ -94,12 +134,14 @@ class ViewGatedAggregator(nn.Module):
             "type": "gated",
             "feature_dim": self.feature_dim,
             "geom_dim": self.geom_dim,
+            "geom_mode": self.geom_mode,
             "reduced_dim": self.reduced_dim,
             "hidden_dim": self.hidden_dim,
             "residual_scale": float(self.residual_scale.detach().cpu().item()),
             "valid_voxel_ratio": float(has_support.float().mean().detach().cpu().item()) if has_support.numel() else 0.0,
             "support_weight_mean": float(weights.mean().detach().cpu().item()) if weights.numel() else 0.0,
             "attention_entropy_mean": float(entropy[has_support].mean().detach().cpu().item()) if has_support.any() else 0.0,
+            "consistency_logit_prior": consistency_stats,
         }
         return out, stats
 

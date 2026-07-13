@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
@@ -11,6 +12,7 @@ from trellis.pipelines.trellis_image_to_3d import TrellisImageTo3DPipeline
 
 from .camera import crop_resize_with_intrinsics, ensure_resized_with_intrinsics
 from .condition import ARDinoRayCond
+from .projected_condition import ARProjectedSparseCond
 from .visual_hull import visual_hull_logit_bias
 
 
@@ -49,7 +51,7 @@ class TrellisARPoseTo3DPipeline:
     SLAT generation reuses TRELLIS DINO multi-image conditioning.
     """
 
-    def __init__(self, base_pipeline: TrellisImageTo3DPipeline, ss_cond: ARDinoRayCond, low_vram: bool = False):
+    def __init__(self, base_pipeline: TrellisImageTo3DPipeline, ss_cond: torch.nn.Module, low_vram: bool = False):
         self.base = base_pipeline
         self.ss_cond = ss_cond
         self.low_vram = low_vram
@@ -81,6 +83,11 @@ class TrellisARPoseTo3DPipeline:
         use_image_features: bool = True,
         use_pose_features: bool = True,
         cond_fp16: bool = False,
+        condition_mode: str = "ray",
+        projected_grid_resolution: int = 16,
+        projected_min_support: float = 0.5,
+        projected_min_support_ratio: float = 0.15,
+        projected_grid_transform: str = "identity",
         lora_rank: int = 64,
         lora_alpha: int = 128,
         apply_lora: bool = True,
@@ -95,17 +102,43 @@ class TrellisARPoseTo3DPipeline:
             )
             base.sparse_structure_flow_model = base.models["sparse_structure_flow_model"]
 
-        ss_cond = ARDinoRayCond(
-            use_image_features=use_image_features,
-            use_pose_features=use_pose_features,
-            use_fp16=cond_fp16,
-        ).to(device).eval()
+        if condition_mode == "projected":
+            if not use_pose_features:
+                raise ValueError("Projected sparse condition requires pose/extrinsics; do not disable pose features.")
+            ss_cond = ARProjectedSparseCond(
+                use_image_features=use_image_features,
+                use_mask_features=True,
+                grid_resolution=projected_grid_resolution,
+                min_support_sum=projected_min_support,
+                min_support_ratio=projected_min_support_ratio,
+                grid_transform=projected_grid_transform,
+                use_fp16=cond_fp16,
+            ).to(device).eval()
+        elif condition_mode == "ray":
+            ss_cond = ARDinoRayCond(
+                use_image_features=use_image_features,
+                use_pose_features=use_pose_features,
+                use_fp16=cond_fp16,
+            ).to(device).eval()
+        else:
+            raise ValueError(f"Unsupported condition_mode={condition_mode!r}")
         pipe = cls(base, ss_cond, low_vram=low_vram)
         if checkpoint_path is not None:
             pipe.load_ar_checkpoint(checkpoint_path, strict=False)
         return pipe
 
     def load_ar_checkpoint(self, checkpoint_path: str, strict: bool = False):
+        checkpoint = Path(checkpoint_path)
+        if not checkpoint.is_file():
+            siblings = []
+            if checkpoint.parent.exists():
+                siblings = sorted(checkpoint.parent.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+            hint = ""
+            if siblings:
+                hint = " Available ckpts: " + ", ".join(str(path) for path in siblings)
+            raise FileNotFoundError(
+                f"AR checkpoint not found: {checkpoint}. Run training first or pass an existing .ckpt.{hint}"
+            )
         state = torch.load(checkpoint_path, map_location="cpu")
         if "state_dict" in state:
             state = state["state_dict"]
@@ -187,10 +220,47 @@ class TrellisARPoseTo3DPipeline:
         sampler_params: dict | None = None,
         threshold: float = 0.0,
         min_coords: int = 0,
+        fixed_topk: int | None = None,
         logit_prior: torch.Tensor | None = None,
         logit_prior_stats: dict | None = None,
     ) -> torch.Tensor:
         """Sample sparse structure and avoid empty-coordinate crashes during experiments."""
+        logits, logit_stats = self.sample_sparse_logits(
+            cond,
+            num_samples=num_samples,
+            sampler_params=sampler_params,
+            logit_prior=logit_prior,
+            logit_prior_stats=logit_prior_stats,
+        )
+        coords, select_stats = self.sparse_coords_from_logits(
+            logits,
+            threshold=threshold,
+            min_coords=min_coords,
+            fixed_topk=fixed_topk,
+        )
+        self.last_sparse_stats = {**select_stats, **logit_stats}
+        print(
+            "[ARPosePipeline] sparse coords="
+            f"{self.last_sparse_stats['num_coords']} "
+            f"selection={self.last_sparse_stats['selection_mode']} "
+            f"threshold={threshold:.4f} "
+            f"fixed_topk={self.last_sparse_stats['fixed_topk']} "
+            f"logits=[{self.last_sparse_stats['logits_min']:.4f}, "
+            f"{self.last_sparse_stats['logits_max']:.4f}] "
+            f"topk_fallback={self.last_sparse_stats['used_topk_fallback']}"
+        )
+        return coords
+
+    @torch.no_grad()
+    def sample_sparse_logits(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        sampler_params: dict | None = None,
+        logit_prior: torch.Tensor | None = None,
+        logit_prior_stats: dict | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Run sparse flow and decoder once, returning post-prior occupancy logits."""
         sampler_params = sampler_params or {}
         flow_model = self.base.models["sparse_structure_flow_model"]
         decoder = self.base.models["sparse_structure_decoder"]
@@ -236,12 +306,41 @@ class TrellisARPoseTo3DPipeline:
                 raise ValueError(f"logit_prior shape {tuple(prior.shape)} does not match logits {tuple(logits.shape)}")
             logits = logits + prior
 
-        coords = torch.argwhere(logits > float(threshold))[:, [0, 2, 3, 4]].int()
-        used_topk = False
-        if min_coords > 0 and coords.shape[0] < min_coords:
+        stats = {
+            "logits_min": float(logits.min().detach().cpu()),
+            "logits_max": float(logits.max().detach().cpu()),
+            "logits_mean": float(logits.mean().detach().cpu()),
+        }
+        if logit_prior_stats:
+            stats.update(logit_prior_stats)
+        if getattr(self.base, "low_vram", False):
+            decoder.cpu()
+            torch.cuda.empty_cache()
+        return logits, stats
+
+    @staticmethod
+    def sparse_coords_from_logits(
+        logits: torch.Tensor,
+        *,
+        threshold: float = 0.0,
+        min_coords: int = 0,
+        fixed_topk: int | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Convert decoder logits to sparse coords.
+
+        fixed_topk selects exactly top-k voxels per sample from logits and bypasses
+        thresholding/fallback. This is intended for ranking diagnostics where the
+        predicted coordinate count must be controlled across pose modes.
+        """
+        if logits.ndim != 5:
+            raise ValueError(f"Expected sparse decoder logits [B,C,D,H,W], got {tuple(logits.shape)}")
+
+        def topk_coords(k: int) -> tuple[torch.Tensor, int]:
             b, _, d, h, w = logits.shape
             flat = logits.reshape(b, -1)
-            per_sample_k = max(1, min(int(min_coords), flat.shape[1]))
+            per_sample_k = max(0, min(int(k), flat.shape[1]))
+            if per_sample_k == 0:
+                return torch.zeros((0, 4), device=logits.device, dtype=torch.int32), 0
             _, flat_idx = torch.topk(flat, k=per_sample_k, dim=1)
             spatial = d * h * w
             flat_idx = flat_idx % spatial
@@ -249,32 +348,35 @@ class TrellisARPoseTo3DPipeline:
             y = (flat_idx % (h * w)) // w
             x = flat_idx % w
             batch_idx = torch.arange(b, device=logits.device, dtype=torch.int64)[:, None].expand_as(x)
-            coords = torch.stack([batch_idx, z, y, x], dim=-1).reshape(-1, 4).int()
-            used_topk = True
+            coords_t = torch.stack([batch_idx, z, y, x], dim=-1).reshape(-1, 4).int()
+            return coords_t, per_sample_k
 
-        self.last_sparse_stats = {
+        used_topk = False
+        selection_mode = "threshold"
+        effective_topk = 0
+        requested_topk = int(fixed_topk) if fixed_topk is not None else 0
+        if fixed_topk is not None:
+            if int(fixed_topk) < 0:
+                raise ValueError(f"fixed_topk must be >= 0, got {fixed_topk}")
+            coords, effective_topk = topk_coords(int(fixed_topk))
+            selection_mode = "fixed_topk"
+        else:
+            coords = torch.argwhere(logits > float(threshold))[:, [0, 2, 3, 4]].int()
+            if min_coords > 0 and coords.shape[0] < min_coords:
+                coords, effective_topk = topk_coords(int(min_coords))
+                used_topk = True
+                selection_mode = "threshold_topk_fallback"
+
+        stats = {
             "threshold": float(threshold),
             "min_coords": int(min_coords),
+            "fixed_topk": requested_topk,
+            "effective_topk": int(effective_topk),
+            "selection_mode": selection_mode,
             "num_coords": int(coords.shape[0]),
             "used_topk_fallback": bool(used_topk),
-            "logits_min": float(logits.min().detach().cpu()),
-            "logits_max": float(logits.max().detach().cpu()),
-            "logits_mean": float(logits.mean().detach().cpu()),
         }
-        if logit_prior_stats:
-            self.last_sparse_stats.update(logit_prior_stats)
-        print(
-            "[ARPosePipeline] sparse coords="
-            f"{self.last_sparse_stats['num_coords']} "
-            f"threshold={threshold:.4f} "
-            f"logits=[{self.last_sparse_stats['logits_min']:.4f}, "
-            f"{self.last_sparse_stats['logits_max']:.4f}] "
-            f"topk_fallback={used_topk}"
-        )
-        if getattr(self.base, "low_vram", False):
-            decoder.cpu()
-            torch.cuda.empty_cache()
-        return coords
+        return coords, stats
 
     @torch.no_grad()
     def run(
@@ -296,6 +398,7 @@ class TrellisARPoseTo3DPipeline:
         slat_mode: str = "multidiffusion",
         sparse_threshold: float = 0.0,
         min_sparse_coords: int = 0,
+        fixed_sparse_topk: int | None = None,
         visual_hull_prior_weight: float = 0.0,
         visual_hull_mask_threshold: float = 0.5,
         visual_hull_min_visible_views: int = 1,
@@ -365,6 +468,7 @@ class TrellisARPoseTo3DPipeline:
                 sparse_structure_sampler_params,
                 threshold=sparse_threshold,
                 min_coords=min_sparse_coords,
+                fixed_topk=fixed_sparse_topk,
                 logit_prior=logit_prior,
                 logit_prior_stats=logit_prior_stats,
             )

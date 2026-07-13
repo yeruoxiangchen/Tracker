@@ -55,6 +55,10 @@ current_seed_frames = set()
 for path in [COARSEMODEL_DIR, COARSE_CORE_DIR]:
     if path not in sys.path:
         sys.path.insert(0, path)
+if RECONVIAGEN_DIR not in sys.path:
+    sys.path.insert(0, RECONVIAGEN_DIR)
+
+import ar_pose_quality as arq
 
 def clean_environment():
     # data / previews / output 都按 session 保留；只清理运行态 flag。
@@ -248,7 +252,17 @@ def _point_to_pixel(point, image_size):
 
 def _write_fullsize_mask_preview(image_path, mask_path, preview_path, points=None):
     image = Image.open(image_path).convert("RGB")
-    mask = Image.open(mask_path).convert("L")
+    last_exc = None
+    mask = None
+    for _ in range(5):
+        try:
+            mask = Image.open(mask_path).convert("L")
+            break
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.08)
+    if mask is None:
+        raise RuntimeError(f"Mask file is not readable after write: {mask_path}; {last_exc}")
     if mask.size != image.size:
         mask = mask.resize(image.size, Image.Resampling.NEAREST)
 
@@ -959,7 +973,7 @@ def upload():
                 f"{upload_image_width or image_width},{upload_image_height or image_height},"
                 f"{cpu_image_width},{cpu_image_height},{image_transform}\n"
             )
-        
+
         frame_counter += 1
         return jsonify({"status": "success"}), 200
     except Exception as e:
@@ -1107,6 +1121,36 @@ def run_segmentation():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(exc)}), 500
 
+
+@app.route('/input_qc', methods=['POST'])
+def input_qc():
+    try:
+        _load_current_session()
+        payload = request.get_json(silent=True) or {}
+        image_files = _list_session_images()
+        selected_indices = payload.get("selected")
+        if selected_indices is None:
+            selected_indices = list(range(len(image_files)))
+        selected_indices = [int(i) for i in selected_indices]
+        filtered_indices, report = arq.select_frames_for_reconstruction(
+            selected_indices,
+            image_files,
+            current_data_dir,
+            current_preview_dir,
+        )
+        return jsonify({
+            "status": "ok" if report.get("qc_pass") else "warning",
+            "message": "input qc passed" if report.get("qc_pass") else (
+                "输入帧覆盖不足: " + "; ".join(report.get("fail_reasons") or ["unknown reason"])
+            ),
+            "selected_indices": filtered_indices,
+            "input_qc": report,
+        }), 200
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
 @app.route('/get_preview/<int:img_id>', methods=['GET'])
 def get_preview(img_id):
     _load_current_session()
@@ -1148,9 +1192,43 @@ def generate():
     _load_current_session()
     selected_indices = [int(i) for i in request.json.get('selected', [])]
     print(f"\n>>> [调度] 收到手机发来的保留序号 {selected_indices}，通知后台筛选并生成...", flush=True)
+    image_files = _list_session_images()
+    filtered_indices, input_qc_report = arq.select_frames_for_reconstruction(
+        selected_indices,
+        image_files,
+        current_data_dir,
+        current_preview_dir,
+    )
+    print(
+        ">>> [调度] 输入帧 QC: "
+        f"pass={input_qc_report.get('qc_pass')} "
+        f"selected={filtered_indices} "
+        f"coverage={input_qc_report.get('coverage', {})}",
+        flush=True,
+    )
+    if arq.enforce_input_qc_from_env() and not input_qc_report.get("qc_pass", True):
+        message = "输入帧覆盖不足，建议继续绕物体采集后重试: " + "; ".join(
+            input_qc_report.get("fail_reasons") or ["unknown reason"]
+        )
+        return jsonify({
+            "status": "error",
+            "message": message,
+            "client_selected_indices": selected_indices,
+            "filtered_selected_indices": filtered_indices,
+            "frame_filter": input_qc_report,
+            "input_qc": input_qc_report,
+        }), 400
     
     with open(FLAG_START_GENERATE, 'w') as f:
-        json.dump({"selected": selected_indices}, f, indent=4)
+        json.dump(
+            {
+                "selected": filtered_indices,
+                "client_selected": selected_indices,
+                "input_qc": input_qc_report,
+            },
+            f,
+            indent=4,
+        )
         
     for _ in range(600):
         if os.path.exists(FLAG_GENERATE_DONE):
@@ -1202,6 +1280,7 @@ def generate():
                 "client_selected_indices": selected_indices,
                 "filtered_selected_indices": filtered_selected_indices,
                 "frame_filter": frame_filter,
+                "input_qc": input_qc_report,
                 "recon_output_dir": recon_output_dir,
                 "pose_source": "unity_ar_pose",
                 "colmap_dir": colmap_dir,

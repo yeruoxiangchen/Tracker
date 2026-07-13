@@ -1,0 +1,314 @@
+Stock-preserving Physical-aware Bridge 下一阶段分析
+====================================================
+
+一、当前结论
+------------
+
+当前 s200 不是完整的 image + mesh + sparse point + pose 联合训练，而是：
+
+  image
+    -> frozen VGGT / image encoder
+    -> frozen sparse_structure_vggt_cond
+    -> cond_stock
+
+  sparse point + confidence + pose + K + mask
+    -> 14-channel physical grid
+    -> trainable PointPoseConditionNet
+    -> post-bridge cond residual
+
+  cond_stock + residual
+    -> SS Flow attention LoRA
+    -> mesh-derived SS latent flow-matching supervision
+
+当前训练了 PointPoseConditionNet 和 SS Flow LoRA，没有训练原 ReconViaGen
+sparse_structure_vggt_cond/get_ss_cond。Mesh 只用于产生训练目标，没有作为部署时输入。
+
+s200 已经证明：
+
+  数值稳定、DDP、梯度路径、Flow LoRA 和 physical branch 可训练：PASS；
+  stock rollout 等价审计：PASS；
+  correct physical 稳定优于 stock/image-only/zero：FAIL；
+  correct physical 稳定优于 shuffled physical：FAIL；
+  precision、coord count 和 component preservation：FAIL。
+
+其中 zero physical 仍产生约 0.099 condition delta，说明旧 physical branch 学到了明显的
+object-independent residual。继续给同一结构增加步数或扩大 sweep 没有充分解释价值。
+
+
+二、下一阶段的准确名称
+----------------------
+
+下一阶段不应只是普通的：
+
+  trainable bridge + Flow LoRA
+
+而应限定为：
+
+  stock-preserving physical-aware bridge
+  + physical-gated SS Flow LoRA
+
+原因是：普通解冻 bridge 尾部后，即使 physical 输入关闭，修改后的 bridge 也不再严格等于
+stock bridge；同样，只要 Flow LoRA 仍开启，即使 condition 等于 stock，velocity 也不再严格等于
+stock flow。
+
+
+三、严格 stock-preserving 路由
+-----------------------------
+
+推荐保留不可训练的 stock 路径：
+
+                         +-> frozen stock bridge -> cond_stock
+  VGGT + image tokens ---+
+                         +-> gated physical adapter -> cond_fused
+                                      ^
+                                      |
+                              physical tokens
+
+condition 路径：
+
+  if physical_present == 0:
+      cond = cond_stock
+  else:
+      cond = cond_stock + effective_gate * delta_cond
+
+Flow 路径：
+
+  if physical_present == 0:
+      disable Flow LoRA
+      v = frozen stock flow(x_t, t, cond_stock)
+  else:
+      enable Flow LoRA
+      v = adapted flow(x_t, t, cond_fused)
+
+必须通过硬路由保证 off 状态，而不能只依赖：
+
+  physical_grid = 0
+  或
+  L_zero = ||cond_zero - cond_stock||^2
+
+损失只能提供近似约束，硬路由才能保证 condition、velocity、rollout 和 decoded coordinate set
+严格退化到 stock。
+
+
+四、physical missing 与空 point prior 必须区分
+---------------------------------------------
+
+14-channel physical grid 中包含 x/y/z、visibility、mask support 和 depth statistics。因此即使 AR point
+prior 为空，grid 也不一定全零。
+
+至少区分三种状态：
+
+  1. full physical：point + pose + mask 全部存在；
+  2. pose/mask only：point prior 缺失，但相机和轮廓证据可用；
+  3. physical disabled：完全关闭 physical，严格走 stock 路径。
+
+显式保存 physical_present/modal_state，不能用 physical_grid.abs().sum()==0 推断状态。
+
+
+五、bridge 内部融合结构
+----------------------
+
+第一版不建议复制并完整训练 bridge 最后两层。当前 train split 只有约 897 个对象，完整 tail 更容易
+记忆训练集。
+
+优先实现：
+
+  frozen original bridge
+    + physical cross-attention adapter in last1 block
+    + optional conditional LoRA/adapter
+
+形式为：
+
+  h_stock = frozen_bridge(...)
+  p_centered = E(physical_grid) - E(reference_grid)
+  delta_h = physical_adapter(h_stock, p_centered)
+  h_fused = h_stock + effective_gate * alpha * delta_h
+
+其中 alpha 和 output projection 从零初始化。
+
+注意：E(g)-E(0) 只能减少 encoder bias，不能独立保证 zero input 输出为零。后续 LayerNorm、attention
+projection 和 adapter bias 仍可产生非零输出。因此必须保留作用在最终 residual 上的显式 gate 和 off
+状态硬分支。
+
+只有 bridge-last1 已经证明 correct physical 被使用后，才测试：
+
+  bridge-last2 adapter；
+  或从 stock 权重复制的 trainable fused tail。
+
+
+六、对齐门控优先于“故意破坏 shuffled”
+--------------------------------------
+
+直接使用：
+
+  relu(margin + L_correct - L_shuffled)
+
+数学方向没有错误，但如果对两边同时反向传播，模型可以通过增加 L_shuffled 满足排序，而不是真正改善
+L_correct。
+
+更稳妥的第一版是学习 image-physical compatibility gate：
+
+  alignment_gate(image/VGGT condition, physical tokens)
+
+  correct pair  -> target 1
+  shuffled pair -> target 0
+  missing pair  -> target 0
+
+  effective_gate = physical_present * alignment_gate
+
+这样 shuffled physical 的目标是回退 stock，而不是比 stock 更差。
+
+hard negative 应满足：
+
+  不同 object_uid；
+  point/voxel count、occupancy ratio、bbox scale相近；
+  最好类别或粗形体接近；
+  但 GT sparse IoU 不能过高，避免把几何兼容对象错误标成负样本。
+
+
+七、建议训练目标
+----------------
+
+第一阶段：
+
+  L = L_fm_correct
+    + lambda_align * BCE(alignment_gate, pair_is_aligned)
+    + lambda_delta * relative_delta_norm
+
+其中：
+
+  L_fm_correct = MSE(v_correct, v_gt)
+
+  relative_delta_norm =
+      RMS(cond_fused - cond_stock) / (RMS(cond_stock) + eps)
+
+correct-vs-stock flow loss先作为准入指标。需要时再加入弱 gain loss：
+
+  relu(margin_stock + L_correct - stopgrad(L_stock))
+
+不在第一阶段加入 occupancy/precision loss。先证明 teacher-forced 条件下 correct physical 相对
+stock、image-only 和 shuffled 都有稳定收益，再处理体素膨胀和碎片化。
+
+
+八、teacher-forced 评估协议
+--------------------------
+
+在昂贵的 30-step rollout 前，固定：
+
+  t = 0.1, 0.3, 0.5, 0.7, 0.9
+  seeds = 42, 43, 44
+  每个 comparison 共用相同 target latent、noise 和 x_t
+
+比较：
+
+  stock native；
+  image-only / Flow LoRA only；
+  correct physical；
+  shuffled physical；
+  pose-mask-only；
+  physical disabled。
+
+报告：
+
+  correct-stock flow MSE delta；
+  correct-image-only flow MSE delta；
+  correct-shuffled flow MSE delta；
+  每个 t 的 mean/median/p25/p75；
+  对象级 win rate；
+  alignment gate 的正负分布；
+  condition delta RMS、delta/stock RMS；
+  off 状态 bit-exact 审计。
+
+不能只看总体均值。多个 t 区间和多数对象都成立后，才进入 rollout。
+
+
+九、推荐阶段顺序
+----------------
+
+J0：使用当前 stock/s200 checkpoint 建立多 t teacher-forced 基线。
+
+J1a：
+  zero-centered physical encoder；
+  bridge-last1 gated physical adapter；
+  Flow LoRA 暂时关闭；
+  验证 bridge 融合本身是否利用 correct physical。
+
+J1b：
+  加入 physical-gated SS Flow LoRA；
+  off 状态必须 disable LoRA 并严格等价 stock。
+
+J1c：
+  加入 alignment gate 和 correct/shuffled compatibility supervision；
+  第一版不通过增大 shuffled flow loss制造排序。
+
+J2：
+  只有 last1 通过后才测试 last2；
+  不同时改变 bridge 深度、LoRA rank、loss 和训练步数。
+
+J3：
+  overfit64 机制通过后，在完整 train split 训练；
+  只使用 val 做模型、checkpoint、scale选择。
+
+J4：
+  最后加入弱 occupancy、precision、component/smoothness proxy，修复过生成和碎片化。
+
+Final：
+  所有设计冻结后，holdout 只运行一次；
+  holdout 不参与 candidate 或 checkpoint选择。
+
+
+十、旧 residual 路线是否继续
+----------------------------
+
+旧的 post-get_ss_cond residual 路线不再作为主线继续：
+
+  不继续增加 s200 后的训练步数；
+  不继续扩大 residual scale sweep；
+  不在当前结构上直接启动 full-train 长训；
+  不因为个别 seed 或个别对象正收益继续调参。
+
+理由是完整 64 objects x 3 seeds x 30 steps 已经显示：
+
+  correct-stock mean/median均为负；
+  correct-image-only mean/median均为负；
+  correct-shuffled没有多数对象稳定优势；
+  zero physical residual不为零；
+  coord count与component count恶化。
+
+旧路线仍有三项保留价值：
+
+  1. 作为论文消融：post-bridge residual vs bridge-internal fusion；
+  2. 作为工程回归测试：stock equivalence、五路eval和数值审计代码继续复用；
+  3. step100/150 checkpoint可选做一次低成本teacher-forced诊断，用于说明训练进程中何时开始
+     object-independent residual，但它不再决定是否延续旧路线。
+
+因此裁决是：
+
+  停止旧 residual 主线训练；
+  保留其结果、checkpoint、评估协议与失败分析；
+  将研发资源转向 stock-preserving bridge-internal fusion。
+
+
+十一、论文创新点表述
+--------------------
+
+下一阶段不应只表述为“把 Point/Pose token 加入 get_cond”，更准确的模型贡献是：
+
+  一种 stock-preserving、physical-aware 的条件桥接机制，在保持无先验时严格回退预训练
+  ReconViaGen 的前提下，将 AR sparse point、pose、mask support 和多视图可见性注入 SS condition；
+  并通过 object-aligned / shuffled physical 配对监督显式学习图像与物理证据的一致性。
+
+必须包含以下消融：
+
+  stock ReconViaGen；
+  post-bridge residual；
+  bridge-internal gated fusion；
+  without alignment supervision；
+  without stock-preserving routing；
+  bridge-last1 vs last2；
+  Flow LoRA off vs on；
+  correct vs shuffled vs pose-mask-only vs disabled；
+  teacher-forced multi-t 与完整 rollout。
+
+同时必须保证 physical 输入仅来自部署时可获得的 AR/AR-like 观测。Mesh-derived信息只用于 SS target，
+不能泄漏到 physical输入。

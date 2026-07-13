@@ -1,0 +1,405 @@
+当前 reconvggt_ar_adapter_a 的 adapter 接入位置与先验作用说明
+============================================================
+
+一、adapter 接在哪里
+-------------------
+
+当前使用的是：
+
+  ProjectionAwareSpatialTokenAdapter
+
+代码位置：
+
+  reconvggt_ar_adapter_a/token_adapter.py
+
+它不是接在 VGGT backbone 内部，也不是接在 TRELLIS sparse flow / SLAT flow 内部。
+
+当前路径是：
+
+  images
+    -> pipeline.vggt_feat(images)
+    -> aggregated_tokens_list
+    -> ProjectionAwareSpatialTokenAdapter(aggregated_tokens_list, projection_features)
+    -> adapted aggregated_tokens_list
+    -> pipeline.get_ss_cond(...)
+    -> TRELLIS sparse_structure_flow_model sampling
+
+如果开启 --run_slat，则后续还有：
+
+  adapted aggregated_tokens_list
+    -> pipeline.get_slat_cond(...)
+    -> pipeline.sample_slat(...)
+    -> mesh decode
+
+也就是说，adapter 当前接在：
+
+  VGGT 输出的 aggregated tokens 和 ReconViaGen/TRELLIS condition 构建之间。
+
+它影响的是 condition，不直接修改：
+
+  1. VGGT 模型参数；
+  2. sparse_structure_flow_model 参数；
+  3. slat_flow_model 参数；
+  4. decoder 参数。
+
+
+二、adapter 改哪些 token
+----------------------
+
+VGGT 输出的 aggregated_tokens_list 每层 token 形状近似为：
+
+  [B, V, T, C]
+
+其中：
+
+  B = batch
+  V = views
+  T = prefix tokens + spatial tokens
+  C = channel dim
+
+当前默认使用的层是：
+
+  4, 11, 17, 23
+
+当前默认 prefix tokens 是：
+
+  patch_start_idx = 5
+
+adapter 只改 spatial tokens：
+
+  x[:, :, 5:, :]
+
+不改 prefix/global/register tokens：
+
+  x[:, :, :5, :]
+
+核心公式是：
+
+  bias = MLP(projection_features)
+  bias = gate * bias
+  adapted_spatial_tokens = original_spatial_tokens + bias
+
+最终：
+
+  adapted_tokens = concat(prefix_tokens_unchanged, adapted_spatial_tokens)
+
+因此当前 adapter 是一种：
+
+  spatial-token residual bias adapter
+
+不是 cross-attention，也不是直接替换 VGGT token。
+
+
+三、zero-init 的含义
+------------------
+
+adapter 最后一层 Linear 是 zero-init：
+
+  weight = 0
+  bias = 0
+
+所以未训练时：
+
+  bias = 0
+  adapted_tokens = original_tokens
+
+这保证了 A/B 阶段可以做 zero-diff sanity：
+
+  不加载训练 adapter 时，ReconViaGen 原始行为不变。
+
+训练后 adapter 才会产生非零 bias。
+
+
+四、pose 先验如何发挥作用
+------------------------
+
+pose 先验由：
+
+  reconvggt_ar_adapter_a/projection_token_features.py
+  build_pose_token_features()
+
+构建。
+
+每个 view、每个 spatial token 都会有一组 pose/ray feature。
+
+主要包括：
+
+  1. token 中心的归一化 2D 坐标；
+  2. token 中心对应的 camera ray；
+  3. quaternion 旋转后的 world ray；
+  4. camera position；
+  5. camera quaternion；
+  6. resized intrinsics；
+  7. view index；
+  8. valid flag。
+
+这些 pose feature 本身不会直接生成 geometry。
+
+它们的作用是给 adapter 提供：
+
+  这个 view 的这个 spatial token 对应什么相机射线、什么相机位姿、什么图像位置。
+
+然后 adapter 学习：
+
+  在某些 view / 某些 spatial token 上，对 VGGT token 加什么 residual bias。
+
+
+五、point 先验如何发挥作用
+-------------------------
+
+point 先验来源可以是三类之一：
+
+  1. --colmap_sparse_dir
+     使用 COLMAP sparse points3D.txt / cameras.txt / images.txt。
+
+  2. --points3d_txt
+     使用普通 points3D.txt。
+
+  3. --point_prior_npz
+     使用已有 point prior npz。
+
+当前 AR session 主要使用：
+
+  --colmap_sparse_dir ${DATASET}/sparse_ar_streaming/0
+
+point 先验会被投影到 VGGT spatial token grid。
+
+当前 token grid 默认是：
+
+  image_resolution = 518
+  token_grid_side = 37
+  spatial token count = 37 * 37 = 1369
+
+对每个 view，每个 token cell，构建 point projection feature：
+
+  1. hit:
+     该 token cell 是否有 point 投影命中。
+
+  2. log_count:
+     命中点数量的 log-normalized count。
+
+  3. mean_conf:
+     命中点平均 confidence。
+
+  4. mean_inv_depth:
+     平均 inverse depth。
+
+  5. max/min inv_depth:
+     depth 相关局部几何提示。
+
+  6. mean_u_norm / mean_v_norm:
+     命中点在图像中的归一化位置。
+
+这些 point feature 和 pose feature 拼接后形成：
+
+  projection_features = concat(pose_features, point_projection_features, optional token_mask_features)
+
+然后输入 adapter MLP。
+
+因此 point 先验当前不是直接作为 3D sparse latent clamp。
+
+它的作用是：
+
+  通过投影后的 per-view per-token feature，引导 VGGT spatial tokens 发生小的 residual 偏移。
+
+这个偏移再影响 ReconViaGen/TRELLIS 的 condition。
+
+
+六、mask 如何发挥作用
+--------------------
+
+当前有三层 mask 机制。
+
+1. image mask apply
+
+命令里：
+
+  --mask_mode apply
+  --mask_background black
+
+会把输入图像背景置黑，但保持 full-frame geometry，不 crop。
+
+这影响：
+
+  VGGT image tokens
+  image_cond
+
+2. per-view point mask filter
+
+命令里：
+
+  --mask_projection_mode filter_points_token_mask
+
+会把 point 投影到每个 view 后，只保留落在该 view object mask 内的投影点。
+
+这影响：
+
+  point_projection_features
+
+3. token mask gate
+
+命令里：
+
+  --token_mask_min_ratio
+  --adapter_gate_feature_index -2
+  --adapter_gate_power 2.0 或 3.0
+
+会根据 token cell 内前景 mask ratio 作为 gate。
+
+adapter 输出 bias 后：
+
+  bias = bias * foreground_ratio^gate_power
+
+因此背景 token 上的 adapter bias 会被压小。
+
+
+七、B4.2 新增的 point-level 多视图 support filter
+------------------------------------------------
+
+最新新增参数：
+
+  --point_mask_support_min_views
+  --point_mask_support_min_ratio
+
+它解决的是 B4.1 的问题：
+
+  B4.1 只是在每个 view 内做 mask filter / token gate。
+  但一个 3D point 本身是否属于 object，没有先用多视图一致性确认。
+
+B4.2 的逻辑是：
+
+  1. 对每个 3D point，投影到所有 selected views；
+  2. 统计它在多少个 view 内可见；
+  3. 统计它在多少个 view 内落在 object mask 内；
+  4. 计算 mask support ratio；
+  5. 只保留满足：
+
+       mask_hit_views >= point_mask_support_min_views
+       mask_hit_views / visible_views >= point_mask_support_min_ratio
+
+     的 3D point；
+  6. 再把保留下来的 point 投影到 token grid。
+
+这一步比 per-view token gate 更严格，因为它先在 3D point 级别过滤：
+
+  多视图一致 object-supported points
+
+而不是：
+
+  某个 view 内碰巧落在 mask 内的投影点。
+
+
+八、当前 adapter 的完整信息流
+---------------------------
+
+完整信息流可以写成：
+
+  image_i, pose_i, mask_i, points3D
+    -> VGGT aggregated_tokens_list
+    -> pose_features(view_i, token_j)
+    -> point_projection_features(points3D projected to view_i/token_j)
+    -> optional token_mask_features(mask_i/token_j)
+    -> projection_features(view_i, token_j)
+    -> adapter MLP
+    -> spatial token bias(view_i, token_j)
+    -> adapted VGGT aggregated tokens
+    -> get_ss_cond / get_slat_cond
+    -> sparse / mesh sampling
+
+
+九、当前设计的本质
+----------------
+
+当前 adapter 不是“让 point prior 直接生成 mesh”。
+
+它更像：
+
+  用 AR point prior + pose + mask 构造 per-view per-token 几何提示，
+  然后轻量调制 ReconViaGen/VGGT 的 condition tokens，
+  让 TRELLIS 原生生成先验在条件侧受到 AR geometry 的局部偏置。
+
+所以它的优势是：
+
+  1. 不破坏 VGGT/TRELLIS base model；
+  2. zero-init 可保证初始等价；
+  3. 可以比较干净地做 delta 诊断；
+  4. 能把 AR point / pose / mask 接入现有 ReconViaGen 条件路径。
+
+它的限制是：
+
+  1. 只是 token bias，不是强几何约束；
+  2. 不直接 clamp sparse latent；
+  3. 不直接约束 mesh surface；
+  4. 如果 token bias 方向不对，仍可能增加 mask 外结构；
+  5. point / pose 先验必须先投影到 token grid，投影和 mask 支持质量会决定效果上限。
+
+
+十、为什么当前要看 delta，而不是直接看 mesh
+-----------------------------------------
+
+当前 adapter 是 condition-side 微扰。
+
+它对 sparse 结构的改变通常很小，所以需要先看：
+
+  added voxels
+  removed voxels
+  added-minus-removed 是否更靠近 point prior
+  added-minus-removed 是否更符合 mask projection
+  outside-mask event 是否下降
+
+如果这些 sparse delta 都不正确，直接跑 mesh 很难解释：
+
+  mesh 变好可能是随机采样；
+  mesh 变坏也不知道是 sparse、SLAT、decoder 哪一段出问题。
+
+因此当前判断顺序应是：
+
+  sparse delta 先过关；
+  再跑 mesh。
+
+
+
+• 是的，adapted aggregated_tokens_list 已经测试过能被 get_ss_cond() 正常接受。
+
+  证据有两类：
+
+  1. 训练/诊断里直接比较过 base/adapted condition
+     reconvggt_ar_adapter_a/train_b_projection_adapter.py:275 里调用了：
+
+  ss_base = pipeline.get_ss_cond(ss_image_cond, base_tokens, num_samples=1)
+  ss_adapted = pipeline.get_ss_cond(ss_image_cond, adapted_tokens, num_samples=1)
+
+  已有 report 显示 trained adapter 后：
+
+  ss_cond_max_abs_diff = 0.25
+  slat_cond_max_abs_diff = 0.03125
+
+  说明 adapted tokens 不但能进 get_ss_cond，而且确实改变了 ss/slat condition。
+
+  2. B3 sparse/mesh smoke 里实际用 adapted tokens 采样过
+     reconvggt_ar_adapter_a/run_b3_adapter_injection_smoke.py:431 里：
+
+  tokens_for_cond = _scaled_tokens(...)
+  ss_cond = pipeline.get_ss_cond(ss_image_cond, tokens_for_cond, ...)
+
+  后面已经完成 sparse / mesh 输出，所以接口路径是通的。
+
+  当前没有训练 get_ss_cond。只训练了 adapter。
+
+  训练脚本里是：
+
+  adapter.train()
+  optimizer = torch.optim.AdamW(adapter.parameters(), ...)
+
+  VGGT、ReconViaGen、TRELLIS flow、get_ss_cond 相关模块都处于 eval/frozen 状态。训练目标也不是 sparse loss 或 mesh loss，而是让 adapter 产生的 token bias 在 point-hit token 上有 directional score，在 miss token 上接近 0。
+
+  我认为 adapter 对 condition 影响不大的主要原因是：
+
+  1. adapter 是 condition-side 小扰动，不改生成模型本体。TRELLIS sparse flow 的 base prior 很强，小 token bias 不一定能改变最终 sparse decision。
+  2. bias 本身很小。已有 drift eval 里 selected token max diff 约 0.0016 - 0.0037，这是很轻的 residual。
+  3. get_ss_cond 会进一步聚合/变换 tokens，局部 token bias 会被 condition encoder 稀释。尤其 prefix/global tokens 保持不变，image_cond 也保持不变。
+  4. 训练目标是间接目标。现在训练 adapter 去拟合 point projection hit/miss 的方向性 bias，但没有用 get_ss_cond 输出、sparse coords、mesh、mask outside penalty 反传训练。
+  5. sparse sampling 有阈值/离散化效应。condition 有变化，不代表 decoded sparse set 一定变化。比如 B4 strict p2 的 runtime scale 0.5 和 1.0 输出完全一致，说明扰动没有跨过采样/解码决策边界。
+
+  所以当前 adapter 更像“几何先验轻量调制 condition”的验证路径，不是强约束生成路径。要让影响变大，需要进入更直接的目标：例如训练 get_ss_cond 后的 condition alignment、sparse delta loss、outside-mask negative loss，或者直接做 sparse 后验过滤。
+

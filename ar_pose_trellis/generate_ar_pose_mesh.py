@@ -112,6 +112,16 @@ def parse_args():
     parser.add_argument("--no_crop", action="store_true")
     parser.add_argument("--pose_only", action="store_true")
     parser.add_argument("--image_only", action="store_true")
+    parser.add_argument(
+        "--condition_mode",
+        choices=["ray", "projected"],
+        default="ray",
+        help="Sparse condition type. Use projected for TRELLIS sparse-grid AR projected observation condition.",
+    )
+    parser.add_argument("--projected_grid_resolution", type=int, default=16)
+    parser.add_argument("--projected_min_support", type=float, default=0.5)
+    parser.add_argument("--projected_min_support_ratio", type=float, default=0.15)
+    parser.add_argument("--projected_grid_transform", choices=["identity", "pixal3d_rotation"], default="identity")
     parser.add_argument("--cond_fp16", action="store_true", help="Run AR pose condition in fp16; required for flash-attn.")
     parser.add_argument("--extrinsics_type", choices=["manifest", "c2w", "w2c"], default="manifest")
     parser.add_argument("--camera_forward_sign", type=float, default=1.0)
@@ -206,6 +216,11 @@ def main():
         use_image_features=not args.pose_only,
         use_pose_features=not args.image_only,
         cond_fp16=args.cond_fp16,
+        condition_mode=args.condition_mode,
+        projected_grid_resolution=args.projected_grid_resolution,
+        projected_min_support=args.projected_min_support,
+        projected_min_support_ratio=args.projected_min_support_ratio,
+        projected_grid_transform=args.projected_grid_transform,
         apply_lora=True,
     )
     if args.only_sparse:
