@@ -159,10 +159,11 @@ class DirectSLatCacheDataset(Dataset):
             raise ValueError(f"uid={uid} support seed mismatch")
         corrected_ss = support["corrected_ss"].float()
         occupancy = support["occupancy_logits64"].float()
-        native_every_block = (
-            str(self.config.get("condition_arch", "legacy"))
-            == "native_every_block_v1"
-        )
+        condition_arch = str(self.config.get("condition_arch", "legacy"))
+        native_every_block = condition_arch in {
+            "native_every_block_v1",
+            "native_ss_genrecon_v2",
+        }
         if native_every_block:
             if physical.get("unused_native_placeholder") is not True:
                 raise ValueError(

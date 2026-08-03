@@ -36,8 +36,14 @@ from ar_ss_flow.pose_lifting import (  # noqa: E402
     build_projection_geometry,
     cache_config_hash,
     calibrate_vggt_depth,
-    scale_intrinsics,
     schema_hash,
+)
+from ar_ss_flow.shared_object_preprocessing import (  # noqa: E402
+    SHARED_OBJECT_PREPROCESSING_VERSION,
+    canonical_json_sha256,
+    prepare_shared_object_views,
+    shared_preprocessing_contract,
+    transform_intrinsics,
 )
 from reconvggt_ar_adapter_a.inspect_and_sanity import normalize_image_cond  # noqa: E402
 from reconvggt_ar_adapter_a.train_pointpose_ss_lora import (  # noqa: E402
@@ -79,41 +85,6 @@ def select_object_balanced_samples(
     return selected
 
 
-def full_frame_masked_images(
-    image_paths: list[str],
-    mask_paths: list[str],
-    *,
-    resolution: int,
-) -> tuple[list[Image.Image], np.ndarray, list[tuple[int, int]]]:
-    if len(image_paths) != len(mask_paths) or not image_paths:
-        raise ValueError("image/mask paths must be non-empty and aligned")
-    images: list[Image.Image] = []
-    masks: list[np.ndarray] = []
-    source_sizes: list[tuple[int, int]] = []
-    for image_path, mask_path in zip(image_paths, mask_paths):
-        with Image.open(image_path) as handle:
-            rgb = handle.convert("RGB")
-        with Image.open(mask_path) as handle:
-            mask = handle.convert("L")
-        if mask.size != rgb.size:
-            raise ValueError(
-                f"mask/image size mismatch: {mask_path}={mask.size}, {image_path}={rgb.size}"
-            )
-        source_sizes.append(rgb.size)
-        rgb_array = np.asarray(rgb, dtype=np.uint8)
-        mask_array = np.asarray(mask, dtype=np.uint8)
-        masked = rgb_array * (mask_array[..., None] >= 127).astype(np.uint8)
-        full_frame = Image.fromarray(masked, mode="RGB").resize(
-            (resolution, resolution), Image.Resampling.LANCZOS
-        )
-        resized_mask = mask.resize(
-            (resolution, resolution), Image.Resampling.BILINEAR
-        )
-        images.append(full_frame)
-        masks.append(np.asarray(resized_mask, dtype=np.float32) / 255.0)
-    return images, np.stack(masks), source_sizes
-
-
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -123,9 +94,27 @@ def sha256_file(path: str | Path) -> str:
 
 
 @torch.no_grad()
-def extract_stock_condition(pipeline, batch: dict[str, Any]) -> torch.Tensor:
-    stock_images = rgba_images(batch["image_paths"], batch["mask_paths"], pipeline)
-    aggregated, image_tensor = pipeline.vggt_feat(stock_images)
+def extract_stock_condition(
+    pipeline,
+    source: list[Image.Image] | dict[str, Any],
+) -> torch.Tensor:
+    if isinstance(source, dict):
+        preprocessing = dict(source.get("preprocessing", {}))
+        shared = dict(preprocessing.get("shared_geometry", {}))
+        if shared.get("version") == SHARED_OBJECT_PREPROCESSING_VERSION:
+            prepared = prepare_shared_object_views(
+                source["image_paths"],
+                source["mask_paths"],
+                resolution=int(shared["resolution"]),
+                foreground_margin=float(shared["foreground_margin"]),
+                alpha_threshold=float(shared["alpha_threshold"]),
+            )
+            images = prepared.images
+        else:
+            images = rgba_images(source["image_paths"], source["mask_paths"], pipeline)
+    else:
+        images = source
+    aggregated, image_tensor = pipeline.vggt_feat(images)
     raw_image_cond = pipeline.encode_image(image_tensor)
     batch_size = int(aggregated[0].shape[0])
     views = int(aggregated[0].shape[1])
@@ -217,8 +206,17 @@ def build_native_stock_pipeline(pretrained: str, device: torch.device):
     ):
         for parameter in module.parameters():
             parameter.requires_grad = False
-    pipeline.stock_condition_source = "native_unmodified_reconviagen_vggt"
+    pipeline.stock_condition_source = "native_reconviagen_shared_object_geometry"
     return pipeline
+
+
+def require_pipeline_resolution(pipeline, resolution: int) -> None:
+    actual = int(getattr(pipeline, "default_image_resolution", 0))
+    if actual != int(resolution):
+        raise ValueError(
+            "shared preprocessing must match the encoder image resolution: "
+            f"pipeline={actual}, requested={resolution}"
+        )
 
 
 def build_lifting_pipeline(
@@ -262,7 +260,9 @@ def build_lifting_pipeline(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cache reusable full-frame visual patches and auditable pose-lifting inputs."
+        description=(
+            "Cache shared-preprocessed visual patches and auditable pose-lifting inputs."
+        )
     )
     parser.add_argument("--source_cache_manifest", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -275,6 +275,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--object_seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--image_resolution", type=int, default=518)
+    parser.add_argument("--foreground_margin", type=float, default=1.10)
+    parser.add_argument("--alpha_threshold", type=float, default=0.80)
     parser.add_argument("--vggt_feature_index", type=int, default=-1)
     parser.add_argument("--min_depth_matches", type=int, default=8)
     parser.add_argument("--affine_improvement_ratio", type=float, default=0.90)
@@ -321,16 +323,31 @@ def main() -> None:
     # Stock conditions must be computed before loading the replacement VGGT used
     # for depth. This keeps the baseline semantically native even when the
     # ReconViaGen VGGT has no depth head.
+    preprocessing_contract = shared_preprocessing_contract(
+        resolution=int(args.image_resolution),
+        foreground_margin=float(args.foreground_margin),
+        alpha_threshold=float(args.alpha_threshold),
+    )
     stock_conditions: dict[str, torch.Tensor] = {}
+    stock_geometry_hashes: dict[str, str] = {}
     failures: list[dict[str, str]] = []
     native_pipeline = build_native_stock_pipeline(args.pretrained, device)
+    require_pipeline_resolution(native_pipeline, int(args.image_resolution))
     for sample_index in range(limit):
         batch = dataset[sample_index]
         uid = str(batch["uid"])
         try:
-            stock_conditions[uid] = extract_stock_condition(
-                native_pipeline, batch
+            prepared = prepare_shared_object_views(
+                batch["image_paths"],
+                batch["mask_paths"],
+                resolution=int(args.image_resolution),
+                foreground_margin=float(args.foreground_margin),
+                alpha_threshold=float(args.alpha_threshold),
             )
+            stock_conditions[uid] = extract_stock_condition(
+                native_pipeline, prepared.images
+            )
+            stock_geometry_hashes[uid] = prepared.geometry_record()["geometry_hash"]
             if (sample_index + 1) % max(1, int(args.log_every)) == 0:
                 print(
                     f"[pose_lifting_stock] {sample_index + 1}/{limit} uid={uid}",
@@ -347,6 +364,7 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     pipeline = build_lifting_pipeline(args.pretrained, args.vggt_pretrained, device)
+    require_pipeline_resolution(pipeline, int(args.image_resolution))
     rows: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
     feature_metadata: dict[str, Any] | None = None
@@ -357,25 +375,25 @@ def main() -> None:
         if uid not in stock_conditions:
             continue
         try:
-            full_images, masks, source_sizes = full_frame_masked_images(
+            prepared = prepare_shared_object_views(
                 batch["image_paths"],
                 batch["mask_paths"],
                 resolution=int(args.image_resolution),
+                foreground_margin=float(args.foreground_margin),
+                alpha_threshold=float(args.alpha_threshold),
             )
-            if len(set(source_sizes)) != 1:
-                raise ValueError(f"uid={uid} source image sizes differ: {source_sizes}")
-            source_width, source_height = source_sizes[0]
-            intrinsic = scale_intrinsics(
-                batch["intrinsics"].numpy(),
-                source_width=source_width,
-                source_height=source_height,
-                target_width=int(args.image_resolution),
-                target_height=int(args.image_resolution),
+            geometry_record = prepared.geometry_record()
+            if geometry_record["geometry_hash"] != stock_geometry_hashes[uid]:
+                raise RuntimeError(f"uid={uid} stock/lifting geometric preprocessing differs")
+            source_intrinsic = batch["intrinsics"].numpy().astype(np.float32)
+            intrinsic = transform_intrinsics(
+                source_intrinsic,
+                prepared.source_to_feature_affines,
             )
             extrinsic = batch["extrinsics"].numpy().astype(np.float32)
             visual, depth, depth_confidence, current_metadata = extract_lifting_features(
                 pipeline,
-                full_images,
+                prepared.images,
                 vggt_feature_index=int(args.vggt_feature_index),
             )
             if feature_metadata is None:
@@ -385,6 +403,15 @@ def main() -> None:
                     f"uid={uid} feature schema changed: {current_metadata} != {feature_metadata}"
                 )
             stock_condition = stock_conditions[uid]
+            sample_geometry_identity = {
+                "shared_geometry_hash": geometry_record["geometry_hash"],
+                "view_ids": batch["view_ids"].to(torch.int64).tolist(),
+                "source_intrinsics": source_intrinsic.tolist(),
+                "feature_intrinsics": intrinsic.tolist(),
+            }
+            sample_geometry_identity_hash = canonical_json_sha256(
+                sample_geometry_identity
+            )
             calibration = calibrate_vggt_depth(
                 predicted_depth=depth.float().numpy(),
                 depth_confidence=depth_confidence.float().numpy(),
@@ -405,8 +432,12 @@ def main() -> None:
                 "visual_patch_features": visual.to(torch.float16),
                 "predicted_depth": depth.to(torch.float16),
                 "depth_confidence": depth_confidence.to(torch.float16),
-                "masks": torch.from_numpy(masks).to(torch.float16),
+                "masks": torch.from_numpy(prepared.masks).to(torch.float16),
                 "intrinsics": torch.from_numpy(intrinsic),
+                "source_intrinsics": torch.from_numpy(source_intrinsic),
+                "source_to_feature_affines": torch.from_numpy(
+                    prepared.source_to_feature_affines
+                ),
                 "extrinsics": torch.from_numpy(extrinsic),
                 "view_ids": batch["view_ids"].to(torch.int32),
                 "prior_coords": batch["prior_coords"].to(torch.int32),
@@ -418,12 +449,22 @@ def main() -> None:
                 "grid_transform": batch["grid_transform"],
                 "extrinsics_type": batch["extrinsics_type"],
                 "camera_forward_sign": float(batch["camera_forward_sign"]),
-                "source_image_size": [source_height, source_width],
+                "source_image_sizes_wh": [list(size) for size in prepared.source_sizes],
                 "feature_image_size": [int(args.image_resolution)] * 2,
                 "preprocessing": {
-                    "stock_condition": "native unmodified ReconViaGen VGGT alpha crop/recenter",
-                    "lifting_features": "full-frame masked resize without crop",
-                    "intrinsics_scaled_to_lifting_features": True,
+                    "shared_geometry": preprocessing_contract,
+                    "shared_geometry_hash": geometry_record["geometry_hash"],
+                    "stock_condition": "native ReconViaGen encoders on shared geometry",
+                    "lifting_features": "DINOv2/VGGT depth on shared geometry",
+                    "source_to_feature_affines": geometry_record[
+                        "source_to_feature_affines"
+                    ],
+                    "crop_boxes_xyxy": geometry_record["crop_boxes_xyxy"],
+                    "foreground_retained_fractions": geometry_record[
+                        "foreground_retained_fractions"
+                    ],
+                    "intrinsics_rule": "K_feature=A@K_source",
+                    "sample_geometry_identity_hash": sample_geometry_identity_hash,
                 },
                 "depth_calibration": calibration,
             }
@@ -470,7 +511,14 @@ def main() -> None:
                     "visual_patch_abs_mean": float(visual.float().abs().mean().item()),
                     "depth_min": float(depth.float().min().item()),
                     "depth_max": float(depth.float().max().item()),
-                    "mask_nonzero_ratio": float((torch.from_numpy(masks) > 0.5).float().mean().item()),
+                    "mask_nonzero_ratio": float(
+                        (torch.from_numpy(prepared.masks) > 0.5).float().mean().item()
+                    ),
+                    "shared_geometry_hash": geometry_record["geometry_hash"],
+                    "sample_geometry_identity_hash": sample_geometry_identity_hash,
+                    "foreground_retained_min": min(
+                        geometry_record["foreground_retained_fractions"]
+                    ),
                 }
             )
             if (sample_index + 1) % max(1, int(args.log_every)) == 0:
@@ -492,19 +540,21 @@ def main() -> None:
         "pretrained": args.pretrained,
         "vggt_pretrained": args.vggt_pretrained,
         "image_resolution": int(args.image_resolution),
+        "geometric_preprocessing": preprocessing_contract,
+        "geometric_preprocessing_hash": canonical_json_sha256(preprocessing_contract),
         "vggt_feature_index": int(args.vggt_feature_index),
         "min_depth_matches": int(args.min_depth_matches),
         "affine_improvement_ratio": float(args.affine_improvement_ratio),
         "save_correct_geometry": bool(args.save_correct_geometry),
-        "stock_condition_source": "native_unmodified_reconviagen_vggt",
-        "lifting_feature_source": "separate_vggt_depth_pipeline",
+        "stock_condition_source": "native_reconviagen_shared_object_geometry",
+        "lifting_feature_source": "separate_vggt_depth_shared_object_geometry",
     }
     manifest = {
         "format": LIFTING_CACHE_VERSION,
         "output_dir": str(output_dir.resolve()),
         "source_cache_manifest": str(Path(args.source_cache_manifest).resolve()),
-        "stock_condition_source": "native_unmodified_reconviagen_vggt",
-        "lifting_feature_source": "separate_vggt_depth_pipeline",
+        "stock_condition_source": "native_reconviagen_shared_object_geometry",
+        "lifting_feature_source": "separate_vggt_depth_shared_object_geometry",
         "selection": selection,
         "samples": rows,
         "sample_count": len(rows),

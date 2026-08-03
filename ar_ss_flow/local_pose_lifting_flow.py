@@ -17,6 +17,7 @@ from ar_ss_flow.pose_lifting import (
     build_lifting_volume,
     schema_hash,
 )
+from ar_ss_flow.shared_object_preprocessing import canonical_json_sha256
 
 
 LOCAL_LIFTING_ADAPTER_VERSION = "ar_ss_flow.local_pose_lifting_velocity.v2"
@@ -62,6 +63,7 @@ class PoseLiftingCacheDataset(Dataset):
         self.root = Path(payload.get("output_dir", self.manifest_path.parent))
         self.visual_feature_dim = int(payload["visual_feature_dim"])
         self.feature_metadata = dict(payload["feature_metadata"])
+        self.config = dict(payload.get("config", {}))
         self.config_hash = str(payload.get("config_hash", ""))
         if not self.config_hash:
             raise ValueError("lifting cache manifest is missing config_hash")
@@ -105,6 +107,35 @@ class PoseLiftingCacheDataset(Dataset):
             raise ValueError(f"uid={row['uid']} invalid prior confidence")
         if stock_condition.ndim != 3 or stock_condition.shape[0] != 1:
             raise ValueError(f"uid={row['uid']} invalid stock condition shape")
+        shared = dict(payload.get("preprocessing", {}).get("shared_geometry", {}))
+        if shared:
+            if shared != dict(self.config.get("geometric_preprocessing", {})):
+                raise ValueError(f"uid={row['uid']} sample/manifest preprocessing differs")
+            source_intrinsics = payload.get("source_intrinsics")
+            affines = payload.get("source_to_feature_affines")
+            if not torch.is_tensor(source_intrinsics) or not torch.is_tensor(affines):
+                raise ValueError(f"uid={row['uid']} shared geometry lacks K/A tensors")
+            if source_intrinsics.shape != (views, 3, 3) or affines.shape != (views, 3, 3):
+                raise ValueError(f"uid={row['uid']} invalid shared K/A shapes")
+            expected_intrinsics = torch.matmul(
+                affines.float(), source_intrinsics.float()
+            )
+            if not torch.allclose(
+                intrinsics.float(), expected_intrinsics, rtol=1.0e-5, atol=1.0e-4
+            ):
+                raise ValueError(f"uid={row['uid']} intrinsics do not satisfy K'=A@K")
+            identity = {
+                "shared_geometry_hash": payload["preprocessing"].get(
+                    "shared_geometry_hash"
+                ),
+                "view_ids": payload["view_ids"].to(torch.int64).tolist(),
+                "source_intrinsics": source_intrinsics.float().tolist(),
+                "feature_intrinsics": intrinsics.float().tolist(),
+            }
+            if canonical_json_sha256(identity) != payload["preprocessing"].get(
+                "sample_geometry_identity_hash"
+            ):
+                raise ValueError(f"uid={row['uid']} sample geometry identity hash mismatch")
         tensors = (
             visual,
             depth,
