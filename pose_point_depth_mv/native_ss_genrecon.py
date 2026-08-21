@@ -158,7 +158,25 @@ def project_frustum_dino(
         raise ValueError(f"DINO patch count is not square: {patches}")
     if projection_mode == "pose_cyclic1" and views > 1:
         extrinsics = torch.roll(extrinsics, shifts=1, dims=0)
-    image_height, image_width = map(int, sample["predicted_depth"].shape[-2:])
+    # Legacy pose-lifting caches carry an all-zero DINO-only depth placeholder
+    # whose values are not consumed here; only its final H/W dimensions are
+    # used.  Compact-v2 intentionally omits that redundant tensor and freezes
+    # the same dimensions as image_size.  Preserve the legacy branch exactly
+    # whenever predicted_depth exists and fail closed on malformed compact
+    # metadata.
+    if "predicted_depth" in sample:
+        image_height, image_width = map(int, sample["predicted_depth"].shape[-2:])
+    else:
+        image_size = sample.get("image_size")
+        if (
+            not isinstance(image_size, (list, tuple))
+            or len(image_size) != 2
+            or any(int(value) <= 0 for value in image_size)
+        ):
+            raise ValueError(
+                "Native SS projection requires predicted_depth or a valid image_size"
+            )
+        image_height, image_width = map(int, image_size)
     geometry = build_projection_geometry(
         intrinsics=intrinsics,
         extrinsics=extrinsics,
@@ -214,6 +232,24 @@ class GenreconViewAggregator(nn.Module):
     def forward(
         self, features: torch.Tensor, valid: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        aggregated, stats, _ = self.aggregate_with_view_details(features, valid)
+        return aggregated, stats
+
+    def aggregate_with_view_details(
+        self, features: torch.Tensor, valid: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        dict[str, torch.Tensor],
+        dict[str, torch.Tensor],
+    ]:
+        """Aggregate views and expose the per-view evidence used by SLAT fusion.
+
+        The ordinary Native-SS call surface remains unchanged.  Native-SLAT v3
+        additionally consumes the unmasked view logits and validity mask so its
+        per-block cross-attention fusion can combine appearance and posed
+        visibility without recomputing a second geometry network.
+        """
+
         if features.ndim != 3:
             raise ValueError("aggregator features must be [views,voxels,channels]")
         views, voxels, channels = map(int, features.shape)
@@ -228,7 +264,8 @@ class GenreconViewAggregator(nn.Module):
         variance_expanded = variance.expand(views, -1, -1)
         inputs = torch.cat((features, mean_expanded, variance_expanded), dim=-1)
         feature_delta = self.feature_mlp(inputs)
-        logits = self.weight_mlp(inputs).masked_fill(~mask, -1.0e4)
+        raw_logits = self.weight_mlp(inputs)
+        logits = raw_logits.masked_fill(~mask, -1.0e4)
         weights = torch.softmax(logits, dim=0)
         all_invalid = ~valid.any(dim=0, keepdim=True)[..., None]
         weights = torch.where(all_invalid, torch.zeros_like(weights), weights)
@@ -244,7 +281,12 @@ class GenreconViewAggregator(nn.Module):
             ),
             "condition_rms": aggregated.float().square().mean().sqrt(),
         }
-        return aggregated[None], stats
+        details = {
+            "view_logits": raw_logits[..., 0],
+            "view_weights": weights[..., 0],
+            "valid": valid,
+        }
+        return aggregated[None], stats, details
 
 
 class EveryBlockConditionProjection(nn.Module):

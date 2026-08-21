@@ -1,0 +1,18 @@
+{
+    "points": [
+        {
+            "frame_index": 0,
+            "x": 0.384683,
+            "y": 0.586349,
+            "label": 1,
+            "normalized": true
+        },
+        {
+            "frame_index": 0,
+            "x": 0.540158,
+            "y": 0.467725,
+            "label": 1,
+            "normalized": true
+        }
+    ]
+}

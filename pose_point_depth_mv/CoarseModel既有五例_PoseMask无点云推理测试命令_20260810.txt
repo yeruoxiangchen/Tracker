@@ -1,0 +1,136 @@
+CoarseModel既有五例 Pose+Mask 无点云推理测试命令（2026-08-10）
+================================================================
+
+实验范围
+--------
+复用已经实验过的两批CoarseModel本地真实采集：
+
+1. `CoarseModel真实采集_NoVGGT测试_20260810_v1`对应的3个8-view对象；
+2. `CoarseModel两组真实采集_全视图三模型视频对比_20260810_v1`对应的
+   18-view和16-view对象。
+
+新推理严格复用原RGB、mask、K、pose、视图顺序、mixed No-VGGT SS/SLat EMA、CFG和
+seed42。Pose+Mask runtime-O构建器不读取`P_W`、点置信度或旧Mesh。旧Point+Mask结果和
+Pixal3D/ReconViaGen结果只作对照，不被覆盖。
+
+本地采集没有GT Mesh；本命令生成部署世界Mesh、旧reference-O重表达Mesh和人工视频，
+不生成Chamfer/F-score，也不能单凭`passed=true`声称方法获胜。
+
+
+N0：CPU静态检查与单测
+----------------------
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+${PY} -m py_compile \
+  pose_point_depth_mv/dataset_tools/prepare_omni_real_pose_mask_runtime_inputs.py \
+  pose_point_depth_mv/rebase_pose_mask_inference_to_reference_o.py \
+  pose_point_depth_mv/render_coarsemodel_pose_mask_turntables.py \
+  pose_point_depth_mv/render_coarsemodel_current_recon_pixal_videos.py \
+  pose_point_depth_mv/test_render_coarsemodel_pose_mask_turntables.py \
+  pose_point_depth_mv/test_pose_mask_pointcloud_ablation.py
+
+bash -n pose_point_depth_mv/background_jobs/run_coarsemodel_pose_mask_no_point.sh
+
+${PY} -m unittest -v pose_point_depth_mv.test_pose_mask_pointcloud_ablation
+
+
+N1-N8：单GPU后台运行全部五例
+----------------------------
+默认GPU4；只需按空闲情况修改`COARSEMODEL_POSE_MASK_GPU`。任务顺序复用阶段产物，SSH断开
+不停止；修复失败后重新启动会跳过已完成阶段。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+
+COARSEMODEL_POSE_MASK_GPU=${COARSEMODEL_POSE_MASK_GPU:-4}
+LOG=/data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/logs/coarsemodel_pose_mask_no_point.log
+PID=/data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/logs/coarsemodel_pose_mask_no_point.pid
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  coarsemodel-pose-mask-no-point \
+  "${LOG}" \
+  "${PID}" \
+  env COARSEMODEL_POSE_MASK_GPU="${COARSEMODEL_POSE_MASK_GPU}" \
+  bash pose_point_depth_mv/background_jobs/run_coarsemodel_pose_mask_no_point.sh
+N1_N8_LAUNCH_RC=$?
+echo "N1_N8_LAUNCH_RC=${N1_N8_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+
+监控
+----
+tail -f /data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/logs/coarsemodel_pose_mask_no_point.log
+
+cat /data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/logs/coarsemodel_pose_mask_no_point.state
+cat /data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/logs/coarsemodel_pose_mask_no_point.exit_code
+
+PID=$(tr -dc '0-9' < /data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/logs/coarsemodel_pose_mask_no_point.pid)
+ps -p "${PID}" -o pid,stat,etime,time,pcpu,pmem,cmd
+
+
+最终产物
+--------
+三例8-view Pose+Mask自身O、世界坐标Mesh和各自normal环绕视频：
+
+```text
+/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/
+  CoarseModel真实采集_NoVGGT_PoseMask无点云测试_20260810_v1/
+```
+
+三例映射回旧Point+Mask reference-O的同坐标对照Mesh：
+
+```text
+/data/zjr/coarsemodel_real_no_vggt_pose_mask_20260810_v1/
+  rebased_to_point_mask_reference_o_v1/
+```
+
+两例全视图Pose+Mask/ReconViaGen/Pixal3D显示归一化视频：
+
+```text
+/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/
+  CoarseModel两组真实采集_PoseMask无点云_全视图三模型视频对比_显示归一化_20260810_v1/
+```
+
+两例映射回旧Point+Mask reference-O的同坐标对照Mesh：
+
+```text
+/data/zjr/coarsemodel_real_allviews_pose_mask_20260810_v1/
+  rebased_0512_to_point_mask_reference_o_v1/
+  rebased_0513_to_point_mask_reference_o_v1/
+```
+
+
+N9：完成后只读核验关键报告
+--------------------------
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PACKAGE=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/CoarseModel真实采集_NoVGGT_PoseMask无点云测试_20260810_v1/report.json
+VIDEOS=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/CoarseModel两组真实采集_PoseMask无点云_全视图三模型视频对比_显示归一化_20260810_v1/report.json
+
+${PY} - "${PACKAGE}" "${VIDEOS}" <<'PY'
+import json, sys
+package=json.load(open(sys.argv[1],encoding="utf-8"))
+videos=json.load(open(sys.argv[2],encoding="utf-8"))
+assert package["passed"] is True and package["object_count"]==3
+assert package["turntable_review"]["passed"] is True
+assert all(row["turntable"]["passed"] is True for row in package["cases"])
+assert videos["passed"] is True and videos["object_count"]==2
+print({
+  "passed":True,
+  "world_mesh_objects":[row["object_key"] for row in package["cases"]],
+  "video_objects":[row["object_key"] for row in videos["cases"]],
+  "note":"无GT；请人工比较新PoseMask视频与旧PointMask显示归一化v2视频",
+})
+PY
+
+
+对照原则
+--------
+1. 新三路视频中的第一列是Pose+Mask无点云；旧显示归一化v2第一列是Point+Mask。
+2. 比较主体、Snoopy/人物附件、孔洞、薄结构和背面是否恢复，不比较视频原始占屏大小。
+3. 世界尺度检查使用各自`预测Mesh_sparse_world.obj`，不能使用显示归一化视频判断尺度。
+4. 若Pose+Mask改善附件且世界放置合理，说明旧稀疏点驱动O是主要问题；若仍然退化，则继续
+   排查mask、真实域外观和SS/SLat条件，而不是重新加入点云。

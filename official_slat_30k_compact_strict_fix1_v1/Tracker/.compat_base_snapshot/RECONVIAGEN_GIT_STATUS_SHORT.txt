@@ -1,0 +1,22 @@
+ M app.py
+ M trellis/pipelines/trellis_image_to_3d.py
+ M trellis/representations/mesh/flexicube.py
+?? "ProObjaverse30K\345\216\237\345\247\213\346\225\260\346\215\256OSS\344\274\240\350\276\223\345\221\275\344\273\244_20260816.txt"
+?? ar_pose_quality.py
+?? ar_tracker/
+?? cmd
+?? data/
+?? diagnose_vggt_camera_vs_ar.py
+?? diff-gaussian-rasterization/
+?? download_proobjaverse_subset.py
+?? extract_mask.py
+?? nvdiffrast/
+?? output/
+?? prepare_proobjaverse_30k.py
+?? rebuild_mesh_from_coarse_dataset.py
+?? "run_local copy.py"
+?? run_local.py
+?? sam2/
+?? test_prepare_proobjaverse_30k.py
+?? "\344\270\213\350\275\275ProObjaverse300K\347\262\276\347\241\2565K\345\221\275\344\273\244_20260813.txt"
+?? "\347\273\247\347\273\255\344\270\213\350\275\275\351\242\235\345\244\22625K\345\271\266\345\206\273\347\273\223ProObjaverse30K\345\221\275\344\273\244_20260813.txt"

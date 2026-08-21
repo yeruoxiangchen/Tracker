@@ -1,0 +1,523 @@
+C1 pairwise v3.1 + C1.5 visual-only deployment calibration 完整命令
+====================================================================
+
+目的：
+1. 修正 v3 标准评估器：未训练的 legacy visual/geometry score head 仅作诊断，不再影响 PASS/FAIL。
+2. 不重新训练已有 seed42/43/44 checkpoint，只重新生成 v3.1 标准评估。
+3. 使用 4 个 source view、无 held-out 的真实部署形式审计 visual-only pairwise confidence。
+4. 使用 4 source + 1 held-out 的固定目标 probe 做 voxel-level 阈值校准。
+5. 阈值只在 indices 0-15 上选择，在 indices 16-63 上冻结验证。
+6. seed42 先过门，再运行 seed43/44；最后检查阈值跨 seed 稳定性。
+
+约定：
+- Tracker 根目录：/home/zjr/Tracker
+- Python：/home/zjr/anaconda3/envs/reconviagen/bin/python
+- Cache：/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+- 已有 run：
+  ar_ss_flow/outputs/corr_pairwise_v3_s200_seed42
+  ar_ss_flow/outputs/corr_pairwise_v3_s200_seed43
+  ar_ss_flow/outputs/corr_pairwise_v3_s200_seed44
+
+====================================================================
+A. 安装代码
+====================================================================
+
+将下载包放到：
+/home/zjr/Downloads/c1_pairwise_v3_1_calibration_tools.zip
+
+执行：
+
+cd /home/zjr/Tracker || exit 1
+
+mkdir -p /tmp/ar_ss_flow_v31_backup
+
+for FILE in \
+  eval_heldout_correspondence.py \
+  audit_pairwise_deployment_confidence.py \
+  summarize_pairwise_deployment_calibration.py \
+  summarize_pairwise_deployment_multiseed.py \
+  test_pairwise_deployment_calibration.py
+do
+  if [ -f "ar_ss_flow/${FILE}" ]; then
+    cp "ar_ss_flow/${FILE}" "/tmp/ar_ss_flow_v31_backup/${FILE}"
+  fi
+done
+
+unzip -jo \
+  /home/zjr/Downloads/c1_pairwise_v3_1_calibration_tools.zip \
+  -d ar_ss_flow/
+
+====================================================================
+B. 静态检查和单元测试
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  ar_ss_flow/eval_heldout_correspondence.py \
+  ar_ss_flow/audit_pairwise_deployment_confidence.py \
+  ar_ss_flow/summarize_pairwise_deployment_calibration.py \
+  ar_ss_flow/summarize_pairwise_deployment_multiseed.py \
+  ar_ss_flow/test_pairwise_deployment_calibration.py
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  ar_ss_flow.test_correspondence_lifting \
+  ar_ss_flow.test_pairwise_deployment_calibration \
+  -v
+
+预期：
+- 原 correspondence 测试 6 项通过；
+- calibration utility 测试 3 项通过；
+- 总计应为 9 项左右，取决于你当前 test_correspondence_lifting.py 的版本。
+
+确认 v3.1 已移除 legacy score gate：
+
+grep -n "legacy_score_heads_diagnostic_only\|scientific_gate_fields" \
+  ar_ss_flow/eval_heldout_correspondence.py
+
+====================================================================
+C. 不重训，重新生成三 seed 的 v3.1 标准评估
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+export GPU=${GPU:-0}
+
+for SEED in 42 43 44; do
+  RUN=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed${SEED}
+
+  for SPLIT in train fresh; do
+    if [ "${SPLIT}" = "train" ]; then
+      INDICES=0-15
+      MIN_OBJECTS=8
+      EVAL=${RUN}/eval_train16_sources2_3_v31
+    else
+      INDICES=16-63
+      MIN_OBJECTS=16
+      EVAL=${RUN}/eval_fresh48_sources2_3_v31
+    fi
+
+    rm -rf "${EVAL}"
+    rm -f "${EVAL}.log" "${EVAL}.exit_code"
+
+    echo "======================================================================"
+    echo "v3.1 standard eval seed=${SEED} split=${SPLIT}"
+    echo "======================================================================"
+
+    (
+      CUDA_VISIBLE_DEVICES=${GPU} \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        -m ar_ss_flow.eval_heldout_correspondence \
+        --cache_manifest /data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json \
+        --checkpoint "${RUN}/checkpoints/last.pt" \
+        --output_dir "${EVAL}" \
+        --indices "${INDICES}" \
+        --device cuda \
+        --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+        --required_modes pose_cyclic1,pose_cyclic2,pose_reverse \
+        --view_counts 3,4 \
+        --neighborhood_radius 1 \
+        --min_common_voxels 64 \
+        --min_objects "${MIN_OBJECTS}" \
+        --min_object_win_rate 0.65 \
+        --min_pairwise_win_rate 0.65 \
+        --min_pairwise_confidence_advantage 0.0 \
+        --view_trend_tolerance 0.02 \
+        --fail_on_error
+    ) 2>&1 | tee "${EVAL}.log"
+
+    STATUS=${PIPESTATUS[0]}
+    echo "${STATUS}" | tee "${EVAL}.exit_code"
+
+    if [ "${STATUS}" -ne 0 ]; then
+      echo "v3.1 eval failed: seed=${SEED}, split=${SPLIT}, status=${STATUS}"
+      exit "${STATUS}"
+    fi
+  done
+done
+
+检查：
+
+for SEED in 42 43 44; do
+  RUN=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed${SEED}
+  echo "seed=${SEED} train=$(cat ${RUN}/eval_train16_sources2_3_v31.exit_code) fresh=$(cat ${RUN}/eval_fresh48_sources2_3_v31.exit_code)"
+done
+
+====================================================================
+D. 重新汇总三 seed 标准评估
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+SUMMARY=ar_ss_flow/outputs/corr_pairwise_v3_s200_multiseed_summary_v31
+rm -rf "${SUMMARY}"
+rm -f "${SUMMARY}.log" "${SUMMARY}.exit_code"
+
+(
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m ar_ss_flow.summarize_pairwise_v3_multiseed \
+    --runs_root ar_ss_flow/outputs \
+    --run_pattern 'corr_pairwise_v3_s200_seed{seed}' \
+    --eval_relpath eval_fresh48_sources2_3_v31/report.json \
+    --train_relpath train_report.json \
+    --seeds 42,43,44 \
+    --output_dir "${SUMMARY}" \
+    --source_view_count 3 \
+    --fail_on_error
+) 2>&1 | tee "${SUMMARY}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${SUMMARY}.exit_code"
+
+if [ -s "${SUMMARY}/report.json" ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m json.tool \
+    "${SUMMARY}/report.json"
+fi
+
+if [ "${STATUS}" -ne 0 ]; then
+  echo "Corrected v3.1 multi-seed gate did not pass. Stop."
+  exit "${STATUS}"
+fi
+
+====================================================================
+E. seed42：C1.5 训练对象 / fresh 对象部署审计
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+export GPU=${GPU:-0}
+
+SEED=42
+RUN=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed${SEED}
+
+for SPLIT in train fresh; do
+  if [ "${SPLIT}" = "train" ]; then
+    INDICES=0-15
+    OUT=${RUN}/deployment_audit_train16_v1
+  else
+    INDICES=16-63
+    OUT=${RUN}/deployment_audit_fresh48_v1
+  fi
+
+  rm -rf "${OUT}"
+  rm -f "${OUT}.log" "${OUT}.exit_code"
+
+  echo "======================================================================"
+  echo "C1.5 deployment audit seed=${SEED} split=${SPLIT}"
+  echo "======================================================================"
+
+  (
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      -m ar_ss_flow.audit_pairwise_deployment_confidence \
+      --cache_manifest /data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --output_dir "${OUT}" \
+      --indices "${INDICES}" \
+      --device cuda \
+      --seed "${SEED}" \
+      --source_view_count 4 \
+      --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse \
+      --neighborhood_radius 1 \
+      --min_source_views 2 \
+      --min_common_voxels 64 \
+      --max_voxels_per_heldout 1024
+  ) 2>&1 | tee "${OUT}.log"
+
+  STATUS=${PIPESTATUS[0]}
+  echo "${STATUS}" | tee "${OUT}.exit_code"
+
+  if [ "${STATUS}" -ne 0 ]; then
+    echo "C1.5 audit failed: seed=${SEED}, split=${SPLIT}, status=${STATUS}"
+    exit "${STATUS}"
+  fi
+
+  test -s "${OUT}/report.json" || exit 20
+  test -s "${OUT}/voxel_samples.npz" || exit 21
+done
+
+====================================================================
+F. seed42：训练集选阈值，fresh集冻结验证
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+SEED=42
+RUN=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed${SEED}
+SUMMARY=${RUN}/deployment_calibration_v1
+
+rm -rf "${SUMMARY}"
+rm -f "${SUMMARY}.log" "${SUMMARY}.exit_code"
+
+(
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m ar_ss_flow.summarize_pairwise_deployment_calibration \
+    --train_report "${RUN}/deployment_audit_train16_v1/report.json" \
+    --train_voxels "${RUN}/deployment_audit_train16_v1/voxel_samples.npz" \
+    --fresh_report "${RUN}/deployment_audit_fresh48_v1/report.json" \
+    --fresh_voxels "${RUN}/deployment_audit_fresh48_v1/voxel_samples.npz" \
+    --output_dir "${SUMMARY}" \
+    --min_objects 16 \
+    --min_object_win_rate 0.80 \
+    --min_auc 0.70 \
+    --min_gate_coverage 0.20 \
+    --max_gate_coverage 0.80 \
+    --min_gate_selectivity 0.10 \
+    --min_top30_relative_uplift 0.25 \
+    --min_top30_absolute_uplift 0.002 \
+    --max_mode_threshold_spread 0.15 \
+    --fail_on_error
+) 2>&1 | tee "${SUMMARY}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${SUMMARY}.exit_code"
+
+if [ -s "${SUMMARY}/report.json" ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m json.tool \
+    "${SUMMARY}/report.json"
+fi
+
+if [ -s "${SUMMARY}/calibration.json" ]; then
+  echo "================ frozen seed42 calibration ================"
+  cat "${SUMMARY}/calibration.json"
+fi
+
+退出码：
+- 0：seed42 C1.5 通过，可继续 G--H。
+- 2：科学门失败；停止，不进入 C2。
+- 其他：文件或程序错误。
+
+if [ "${STATUS}" -ne 0 ]; then
+  echo "seed42 C1.5 calibration did not pass. Stop before seed43/44 deployment audit and C2."
+  exit "${STATUS}"
+fi
+
+====================================================================
+G. seed43 / seed44：相同 C1.5 审计和冻结验证
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+export GPU=${GPU:-0}
+
+for SEED in 43 44; do
+  RUN=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed${SEED}
+
+  for SPLIT in train fresh; do
+    if [ "${SPLIT}" = "train" ]; then
+      INDICES=0-15
+      OUT=${RUN}/deployment_audit_train16_v1
+    else
+      INDICES=16-63
+      OUT=${RUN}/deployment_audit_fresh48_v1
+    fi
+
+    rm -rf "${OUT}"
+    rm -f "${OUT}.log" "${OUT}.exit_code"
+
+    (
+      CUDA_VISIBLE_DEVICES=${GPU} \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        -m ar_ss_flow.audit_pairwise_deployment_confidence \
+        --cache_manifest /data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json \
+        --checkpoint "${RUN}/checkpoints/last.pt" \
+        --output_dir "${OUT}" \
+        --indices "${INDICES}" \
+        --device cuda \
+        --seed "${SEED}" \
+        --source_view_count 4 \
+        --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse \
+        --neighborhood_radius 1 \
+        --min_source_views 2 \
+        --min_common_voxels 64 \
+        --max_voxels_per_heldout 1024
+    ) 2>&1 | tee "${OUT}.log"
+
+    STATUS=${PIPESTATUS[0]}
+    echo "${STATUS}" | tee "${OUT}.exit_code"
+
+    if [ "${STATUS}" -ne 0 ]; then
+      echo "audit failed seed=${SEED} split=${SPLIT} status=${STATUS}"
+      exit "${STATUS}"
+    fi
+  done
+
+  SUMMARY=${RUN}/deployment_calibration_v1
+  rm -rf "${SUMMARY}"
+  rm -f "${SUMMARY}.log" "${SUMMARY}.exit_code"
+
+  (
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      -m ar_ss_flow.summarize_pairwise_deployment_calibration \
+      --train_report "${RUN}/deployment_audit_train16_v1/report.json" \
+      --train_voxels "${RUN}/deployment_audit_train16_v1/voxel_samples.npz" \
+      --fresh_report "${RUN}/deployment_audit_fresh48_v1/report.json" \
+      --fresh_voxels "${RUN}/deployment_audit_fresh48_v1/voxel_samples.npz" \
+      --output_dir "${SUMMARY}" \
+      --min_objects 16 \
+      --min_object_win_rate 0.80 \
+      --min_auc 0.70 \
+      --min_gate_coverage 0.20 \
+      --max_gate_coverage 0.80 \
+      --min_gate_selectivity 0.10 \
+      --min_top30_relative_uplift 0.25 \
+      --min_top30_absolute_uplift 0.002 \
+      --max_mode_threshold_spread 0.15 \
+      --fail_on_error
+  ) 2>&1 | tee "${SUMMARY}.log"
+
+  STATUS=${PIPESTATUS[0]}
+  echo "${STATUS}" | tee "${SUMMARY}.exit_code"
+
+  if [ "${STATUS}" -ne 0 ]; then
+    echo "calibration failed seed=${SEED} status=${STATUS}"
+    exit "${STATUS}"
+  fi
+done
+
+====================================================================
+H. C1.5 三 seed 汇总
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+SUMMARY=ar_ss_flow/outputs/corr_pairwise_v3_s200_deployment_calibration_multiseed
+rm -rf "${SUMMARY}"
+rm -f "${SUMMARY}.log" "${SUMMARY}.exit_code"
+
+(
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m ar_ss_flow.summarize_pairwise_deployment_multiseed \
+    --runs_root ar_ss_flow/outputs \
+    --run_pattern 'corr_pairwise_v3_s200_seed{seed}' \
+    --calibration_relpath deployment_calibration_v1/report.json \
+    --seeds 42,43,44 \
+    --output_dir "${SUMMARY}" \
+    --max_tau_low_spread 0.10 \
+    --max_tau_high_spread 0.10 \
+    --min_mean_auc 0.70 \
+    --min_mean_object_win_rate 0.80 \
+    --fail_on_error
+) 2>&1 | tee "${SUMMARY}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${SUMMARY}.exit_code"
+
+if [ -s "${SUMMARY}/report.json" ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m json.tool \
+    "${SUMMARY}/report.json"
+fi
+
+退出码：
+- 0：C1.5 多 seed 校准通过，允许开始设计 C2 五路机制门。
+- 2：科学门失败，不进入 C2。
+- 其他：文件或程序错误。
+
+====================================================================
+I. 一次打印最关键结果
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+for seed in (42, 43, 44):
+    path = Path(f"ar_ss_flow/outputs/corr_pairwise_v3_s200_seed{seed}/deployment_calibration_v1/report.json")
+    print("\n" + "=" * 100)
+    print("seed", seed, path)
+    if not path.exists():
+        print("MISSING")
+        continue
+    d = json.loads(path.read_text())
+    c = d["calibration"]
+    print("passed:", d["passed"])
+    print("tau_low:", c["tau_low"], "tau_high:", c["tau_high"])
+    print("threshold_spread:", d["per_mode_threshold_spread"])
+    for mode, row in d["fresh_per_mode"].items():
+        v = row["voxel_metrics"]
+        o = row["object_metrics"]
+        print(
+            mode,
+            "passed=", row["passed"],
+            "object_win=", o["deployment_correct_greater_wrong_rate"],
+            "auc=", v["auc_correct_vs_wrong"],
+            "shuffle_auc=", v["auc_correct_vs_shuffle"],
+            "coverage=", v["correct_gate_coverage"],
+            "selectivity=", v["correct_minus_wrong_gate_coverage"],
+            "top30_rel=", v["top30_reprojection_uplift"]["relative_uplift"],
+            "top30_abs=", v["top30_reprojection_uplift"]["absolute_uplift"],
+        )
+
+multi = Path("ar_ss_flow/outputs/corr_pairwise_v3_s200_deployment_calibration_multiseed/report.json")
+print("\n" + "=" * 100)
+print("MULTISEED", multi)
+if multi.exists():
+    d = json.loads(multi.read_text())
+    print("passed:", d["passed"])
+    print("tau_low:", d["tau_low"])
+    print("tau_high:", d["tau_high"])
+    print("global_checks:", d["global_checks"])
+    print("mode_summary:")
+    for mode, row in d["mode_summary"].items():
+        print(" ", mode, row)
+PY
+
+====================================================================
+J. 打包结果
+====================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+TAR=/tmp/c1_pairwise_v3_1_c1_5_results.tar.gz
+rm -f "${TAR}"
+
+FILES=(
+  ar_ss_flow/outputs/corr_pairwise_v3_s200_multiseed_summary_v31/report.json
+  ar_ss_flow/outputs/corr_pairwise_v3_s200_deployment_calibration_multiseed/report.json
+)
+
+for SEED in 42 43 44; do
+  RUN=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed${SEED}
+  FILES+=(
+    "${RUN}/eval_train16_sources2_3_v31/report.json"
+    "${RUN}/eval_fresh48_sources2_3_v31/report.json"
+    "${RUN}/deployment_audit_train16_v1/report.json"
+    "${RUN}/deployment_audit_train16_v1/voxel_samples.npz"
+    "${RUN}/deployment_audit_fresh48_v1/report.json"
+    "${RUN}/deployment_audit_fresh48_v1/voxel_samples.npz"
+    "${RUN}/deployment_calibration_v1/report.json"
+    "${RUN}/deployment_calibration_v1/calibration.json"
+  )
+done
+
+MISSING=0
+for FILE in "${FILES[@]}"; do
+  if [ ! -s "${FILE}" ]; then
+    echo "Missing or empty: ${FILE}"
+    MISSING=1
+  fi
+done
+
+if [ "${MISSING}" -ne 0 ]; then
+  echo "Archive not created because required files are missing."
+  exit 30
+fi
+
+tar -czf "${TAR}" "${FILES[@]}"
+gzip -t "${TAR}" || exit 31
+ls -lh "${TAR}"
+tar -tzf "${TAR}"
+
+====================================================================
+阶段纪律
+====================================================================
+
+1. C/D 未通过：说明标准 v3.1 门仍有问题，停止。
+2. seed42 F 返回 2：visual-only confidence 在真实部署形式下不可校准，停止，不进入 C2。
+3. H 返回 2：阈值或性能跨 seed 不稳定，停止，不进入 C2。
+4. H 返回 0：冻结 seed42 checkpoint 与 seed42 calibration.json，下一步实现 C2 五路机制门：
+   - stock
+   - correct learned-confidence gate
+   - wrong-pose learned-confidence gate
+   - uniform gate
+   - visual-shuffled confidence gate
+5. C2 第一轮不挑 seed44，不增加训练步数，不直接做完整 mesh 长流程。

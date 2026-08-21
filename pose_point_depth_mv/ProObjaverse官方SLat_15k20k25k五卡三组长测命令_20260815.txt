@@ -1,0 +1,202 @@
+ProObjaverse official SLat 15k/20k/25k：五卡三组无人值守评测
+=======================================================================
+
+目标
+----
+
+一次启动后，按step15000 -> step20000 -> step25000依次完成三组评测：
+
+  tmux new-session -d -s slat152025eval \
+    'EVAL_GPUS=3,4,5,6,7 bash /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_proobjaverse_slat_trajectory_eval_5gpu.sh'
+    
+  1. Train64 + official GT SLat support
+  2. Dev64 + official GT SLat support
+  3. Dev64中未参与Native-SS CFG校准的[16,64) Dev48
+     + 新official Native-SS step2000 EMA / CFG5 predicted support
+
+每组都分成五个不重叠的单GPU shard并行。共九wave、四十五个worker；
+同一wave内五卡并行，wave之间自动等待、聚合并进入下一组。
+
+重要科学边界
+------------
+
+  - GT-support的Train64和Dev64都是完整64对象。
+  - Native-SS report只冻结了Dev indices [16,64)。前16个对象用于CFG校准，
+    不能伪装成held-out predicted-support结果；因此第三组严格称为Dev48。
+  - 第三组每个checkpoint都输出：
+
+      A = Stock SS -> Stock SLat
+      B = New official Native SS -> Stock SLat
+      C = New official Native SS -> 当前trained SLat checkpoint
+
+    以及 B-A、C-A、C-B三个配对transfer。
+  - 已知support爆炸对象可能使predicted-support worker最终`complete=true,
+    passed=false`。编排器会保留这个正式结果、照常聚合并继续后续wave，不会把它
+    误判为程序崩溃。
+  - 本测试不修改checkpoint、manifest、Native-SS report或stock freeze。
+
+
+A0. 源服务器恢复完bundle后确认三个主checkpoint
+=======================================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+BUNDLE=/data/zjr/slat_train2000_trajectory_archives/slat_train2000_trajectory_step10000_25000_strict_fix1_v1
+
+for STEP in 15000 20000 25000; do
+  CKPT=$(printf '%s/checkpoints/step_%06d.pt' "${BUNDLE}" "${STEP}")
+  test -s "${CKPT}"
+  ls -lh "${CKPT}"
+done
+
+(
+  cd "${BUNDLE}"
+  sha256sum -c SHA256SUMS.txt
+)
+
+echo "A0 PASS"
+
+
+A1. 新编排代码静态回归（CPU）
+====================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/run_proobjaverse_slat_trajectory_eval_5gpu.py \
+  pose_point_depth_mv/evaluate_proobjaverse_official_slat_gt_support_cross_host.py \
+  pose_point_depth_mv/evaluate_proobjaverse_official_native_ss_stock_slat.py
+
+"${PY}" -m unittest -v \
+  pose_point_depth_mv.test_proobjaverse_slat_trajectory_eval_5gpu \
+  pose_point_depth_mv.test_proobjaverse_official_slat_gt_support_cross_host \
+  pose_point_depth_mv.test_evaluate_proobjaverse_official_native_ss_stock_slat
+
+"${PY}" -m pose_point_depth_mv.run_proobjaverse_slat_trajectory_eval_5gpu \
+  --print_plan_only \
+  --gpus 3,4,5,6,7
+
+echo "A1 PASS"
+
+
+A2. 一次只读真实preflight（强制先运行）
+===============================================
+
+该步会读取并哈希15k/20k/25k checkpoint，检查：
+
+  - checkpoint内step与Native-SS冻结身份；
+  - A72 -> 源服务器只允许的report/checkpoint路径relocation；
+  - Train2000/Dev64 cache与official protocol；
+  - 新Native-SS step2000 EMA / CFG5 / Dev48 [16,64)完整覆盖；
+  - GPU 3,4,5,6,7每张至少22000 MiB空闲显存。
+
+cd /home/zjr/Tracker
+set +e
+
+EVAL_GPUS=3,4,5,6,7 \
+  bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat_trajectory_eval_5gpu.sh \
+  --preflight_only
+
+A2_RC=$?
+set +e
+echo "A2_RC=${A2_RC}"
+echo "current terminal remains open"
+
+只有A2_RC=0时启动A3。
+
+
+A3. 一次启动九wave五卡长任务
+=================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+SESSION=slat152025eval
+
+if tmux has-session -t "${SESSION}" 2>/dev/null; then
+  echo "blocked: tmux session already exists: ${SESSION}"
+  exit 75
+fi
+
+tmux new-session -d -s "${SESSION}" \
+  'EVAL_GPUS=3,4,5,6,7 bash /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_proobjaverse_slat_trajectory_eval_5gpu.sh'
+
+tmux list-sessions
+echo "A3 LAUNCHED: ${SESSION}"
+
+
+A4. 监视（任选一种）
+========================
+
+直接进入master终端：
+
+tmux attach -t slat152025eval
+
+不进入tmux，只看master log：
+
+tail -f \
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/logs/slat_trajectory_15k20k25k_5gpu_strict_fix1_v1.log
+
+看GPU与当前worker：
+
+watch -n 20 'date -u; nvidia-smi -i 3,4,5,6,7 --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits; pgrep -af "evaluate_proobjaverse_official_(slat_gt_support|native_ss_stock_slat)" || true'
+
+每一wave完成后都会更新：
+
+/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+  eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1/
+  progress.json
+
+
+A5. 长任务完成判定
+====================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1
+
+test -s "${ROOT}/trajectory_summary.json"
+test -s "${ROOT}/trajectory_summary.txt"
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - "${ROOT}/trajectory_summary.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["all_nine_aggregates_generated"] is True
+assert len(report["results"]) == 9
+assert {(row["step"], row["group"]) for row in report["results"]} == {
+    (step, group)
+    for step in (15000, 20000, 25000)
+    for group in ("train64_gt", "dev64_gt", "dev48_predicted")
+}
+print(json.dumps({
+    "all_nine_aggregates_generated": report["all_nine_aggregates_generated"],
+    "all_runtime_integrity_passed": report["all_runtime_integrity_passed"],
+    "result_count": len(report["results"]),
+}, indent=2, ensure_ascii=False))
+PY
+
+cat "${ROOT}/trajectory_summary.txt"
+
+注意：
+  `all_nine_aggregates_generated=true`表示无人值守任务已完整产生九份聚合结果。
+  `all_runtime_integrity_passed=false`可能是已知的80k support安全上限所致，不能据此
+  把整个长任务误写为没有运行完。最终科学判读必须分别看Train64 GT、Dev64 GT
+  和Dev48 predicted-support的完整metrics。
+
+
+A6. 中断后重新执行规则
+========================
+
+  - 已完成的worker/aggregate会通过report identity校验后复用。
+  - predicted-support的partial worker会自动加`--resume`。
+  - GT-support evaluator当前不支持partial resume。如果中断时正处于GT wave，
+    编排器会保护partial目录并拒绝覆盖；请先审计log，然后使用新的
+    versioned `OUTPUT_ROOT`重跑，不要删除原失败证据。
+  - 无中断时只需启动A3一次。

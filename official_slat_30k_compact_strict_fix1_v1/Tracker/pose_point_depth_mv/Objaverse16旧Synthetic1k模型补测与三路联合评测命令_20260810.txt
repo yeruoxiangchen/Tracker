@@ -1,0 +1,82 @@
+# Objaverse16旧Synthetic1k模型补测与三路联合评测
+# =================================================
+#
+# 目的：把旧 reviewed1k synthetic-only No-VGGT 的完整 SS+SLat 模型放到已经
+# 冻结的 Objaverse16 上，回答两个问题：
+#   1. 旧 synthetic1k 完整Mesh相对原版 ReconViaGen 是否仍有优势；
+#   2. 旧 synthetic1k 相对当前 real376+synth868 mixed No-VGGT 的差距。
+#
+# 本补测不重新抽样，不重跑O0-O9，也不运行Pixal3D：
+#   - O10复用O5的相同DINO+Pose目标隔离输入，运行旧SS/SLat，seed=42；
+#   - O11复用O9中当前mixed模型和ReconViaGen的已冻结20k指标，只新增旧模型指标；
+#   - 三路都使用相同canonical Objaverse GT和固定轴变换
+#     (x,y,z)->(x,z,-y)，不做ICP、逐对象缩放或GT拟合。
+#
+# O0已显式审计旧synthetic train868与这16个test对象无重叠。新推理入口会再次绑定
+# 该审计、SS final32报告、SLat训练报告和两个step2000 checkpoint，任一不一致即停止。
+#
+# 预计时间：GPU推理通常约15分钟，CPU 20k评测约数分钟；整体约20--30分钟。
+
+
+###############################################################################
+# A. 推荐：后台运行O10-O11
+###############################################################################
+
+cd /home/zjr/Tracker
+
+OBJAVERSE16_SYNTHETIC1K_GPU=${OBJAVERSE16_SYNTHETIC1K_GPU:-4}
+ROOT=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1
+LOG=${ROOT}/logs/Objaverse16_synthetic1k_addendum.log
+PID=${ROOT}/logs/Objaverse16_synthetic1k_addendum.pid
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  objaverse16-synthetic1k-addendum \
+  "${LOG}" \
+  "${PID}" \
+  env OBJAVERSE16_SYNTHETIC1K_GPU="${OBJAVERSE16_SYNTHETIC1K_GPU}" \
+      OBJAVERSE16_ROOT="${ROOT}" \
+  bash pose_point_depth_mv/background_jobs/run_objaverse16_synthetic1k_addendum.sh
+
+echo "后台任务不依赖当前终端"
+echo "监视: tail -f '${LOG}'"
+echo "current terminal remains open"
+
+
+###############################################################################
+# B. 监视；Ctrl-C只退出tail/watch，不终止任务
+###############################################################################
+
+tail -f /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_synthetic1k_addendum.log
+
+watch -n 10 '
+date
+echo "=== process ==="
+PID_FILE=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_synthetic1k_addendum.pid
+if [ -s "${PID_FILE}" ]; then ps -p "$(cat "${PID_FILE}")" -o pid,ppid,sid,stat,etime,time,pcpu,pmem,rss,cmd; fi
+echo "=== recent log ==="
+tail -n 15 /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_synthetic1k_addendum.log 2>/dev/null
+echo "=== completion ==="
+cat /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_synthetic1k_addendum.exit_code 2>/dev/null || echo "exit_code尚未生成"
+test -s /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O11_synthetic1k_current_reconviagen_axisfixed_20k_v1/report.json && echo "O11报告已生成" || echo "O11报告尚未生成"
+'
+
+
+###############################################################################
+# C. 不后台运行：当前终端直接执行
+###############################################################################
+
+cd /home/zjr/Tracker
+OBJAVERSE16_SYNTHETIC1K_GPU=${OBJAVERSE16_SYNTHETIC1K_GPU:-4} \
+OBJAVERSE16_ROOT=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1 \
+bash pose_point_depth_mv/background_jobs/run_objaverse16_synthetic1k_addendum.sh
+
+
+###############################################################################
+# 主要产物
+###############################################################################
+# 旧synthetic1k No-VGGT SS/SLat decoder Mesh及推理合同：
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O10_synthetic1k_no_vggt_seed42_v1/
+#
+# 旧synthetic1k / 当前mixed / ReconViaGen三路指标、逐例配对和最终报告：
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O11_synthetic1k_current_reconviagen_axisfixed_20k_v1/
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O11_synthetic1k_current_reconviagen_axisfixed_20k_v1/report.json

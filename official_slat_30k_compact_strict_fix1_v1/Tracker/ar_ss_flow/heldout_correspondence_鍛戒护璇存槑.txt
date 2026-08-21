@@ -1,0 +1,482 @@
+AR SS Flow：局部多视图 correspondence / held-out reprojection 命令说明
+日期：2026-07-14
+
+目标
+====
+
+本分支先完全不接 ReconViaGen Flow，验证：
+
+  per-view [V,C] feature + mask/depth/visibility
+    -> same-voxel local leave-one-view-out correspondence
+    -> held-out patch reconstruction
+
+在同一对象、同一图像集合下，correct pose 的重投影误差必须稳定低于：
+
+  pose_cyclic1 / pose_cyclic2 / pose_reverse
+
+cross_sample 只作为辅助 easy negative，不参与主门。
+
+只有 C1 在 fresh object 上通过后，才进入 C2：
+
+  correspondence confidence
+    -> 聚合 visual volume
+    -> weighted_support * correspondence_confidence hard gate
+    -> same-voxel SS velocity residual
+
+当前 /data/ar_ss_flow_pose_lifting_overfit64_v1_20260714 缓存通常为 4 views，
+因此本轮只测试 2-view / 4-view。要测试 8-view 趋势，必须先用真正含 8 个视图的
+source cache 重新构建 lifting cache；不能在 4-view cache 上伪造 8-view。
+
+
+12.0 静态检查与 CPU 单测
+========================
+
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  ar_ss_flow/correspondence_lifting.py \
+  ar_ss_flow/train_heldout_correspondence.py \
+  ar_ss_flow/eval_heldout_correspondence.py \
+  ar_ss_flow/summarize_heldout_correspondence.py \
+  ar_ss_flow/correspondence_gated_flow.py \
+  ar_ss_flow/train_correspondence_gated_ss_flow.py \
+  ar_ss_flow/eval_correspondence_gated_ss_flow.py \
+  ar_ss_flow/summarize_correspondence_gated_multiseed.py \
+  ar_ss_flow/test_correspondence_lifting.py
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  ar_ss_flow.test_correspondence_lifting -v
+
+
+12.1 C1 单 GPU s20 数值/梯度 smoke
+=================================
+
+说明：
+  至少使用 4 个样本，cross_sample 才能找到不同对象的匹配形状负例。
+  本阶段不加载 TRELLIS / ReconViaGen Flow。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_smoke4_s20_seed42
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.train_heldout_correspondence \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --indices 0-3 \
+  --device cuda \
+  --seed 42 \
+  --max_steps 20 \
+  --save_every 20 \
+  --log_every 1 \
+  --lr 2.0e-4 \
+  --weight_decay 1.0e-4 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --embedding_dim 128 \
+  --geometry_hidden_dim 48 \
+  --score_hidden_dim 192 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --neighborhood_radius 1 \
+  --min_source_views 2 \
+  --max_voxels_per_step 2048 \
+  --min_common_voxels 64 \
+  --rank_margin 0.05 \
+  --score_margin 0.10 \
+  --shortcut_margin 0.02 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+
+检查：
+  train_report.json finite=true
+  checkpoint 存在
+  loss / grad_norm finite
+  common_voxels >= 64
+  normalized_advantage 不要求 s20 已经稳定为正，只要求非退化和能更新
+
+
+12.2 C1 overfit16 三训练 seed，s300
+==================================
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+(
+set -uo pipefail
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed${TRAIN_SEED}
+GPU=$(( (TRAIN_SEED - 42) % 3 + 1 ))
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.train_heldout_correspondence \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --indices 0-15 \
+  --device cuda \
+  --seed "${TRAIN_SEED}" \
+  --max_steps 300 \
+  --save_every 50 \
+  --log_every 10 \
+  --lr 2.0e-4 \
+  --weight_decay 1.0e-4 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --embedding_dim 128 \
+  --geometry_hidden_dim 48 \
+  --score_hidden_dim 192 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --neighborhood_radius 1 \
+  --min_source_views 2 \
+  --max_voxels_per_step 2048 \
+  --min_common_voxels 64 \
+  --rank_margin 0.05 \
+  --score_margin 0.10 \
+  --shortcut_margin 0.02 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+done
+
+
+12.3 C1 fresh-object held-out reprojection eval
+===============================================
+
+说明：
+  训练使用 0-15；输入端生死门使用 fresh 16-63。
+  correct/wrong 必须在 common support 上比较。
+  4-view 是当前缓存的主门；2-view 只做趋势诊断。
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+(
+set -uo pipefail
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+RUN=/home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed${TRAIN_SEED}
+OUT=${RUN}/eval_fresh48_views2_4
+GPU=$(( (TRAIN_SEED - 42) % 3 + 1 ))
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.eval_heldout_correspondence \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --checkpoint "${RUN}/checkpoints/last.pt" \
+  --output_dir "${OUT}" \
+  --indices 16-63 \
+  --max_samples 0 \
+  --device cuda \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --required_modes pose_cyclic1,pose_cyclic2,pose_reverse \
+  --view_counts 2,4 \
+  --neighborhood_radius 1 \
+  --min_source_views 2 \
+  --min_common_voxels 64 \
+  --min_objects 16 \
+  --min_object_win_rate 0.65 \
+  --min_visual_score_advantage 0.0 \
+  --min_visual_over_geometry_advantage 0.0 \
+  --view_trend_tolerance 0.02 \
+  --fail_on_error \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+done
+
+C1 每个 seed 的 report.json 必须满足：
+
+  passed=true
+  pose_cyclic1 / pose_cyclic2 / pose_reverse：
+    4-view object_win_rate >= 0.65
+    advantage mean > 0
+    advantage median > 0
+    visual_score_advantage mean >= 0
+    visual_over_geometry_advantage mean >= 0
+  4-view advantage 不应比 2-view 低超过 0.02
+
+如果 identity 之后作为诊断加入，不能把它当普通 hard negative；identity 只用于检查 coverage shortcut。
+
+
+12.4 C1 三训练 seed 汇总
+========================
+
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.summarize_heldout_correspondence \
+  --report_dirs \
+    ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed42/eval_fresh48_views2_4 \
+    ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed43/eval_fresh48_views2_4 \
+    ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed44/eval_fresh48_views2_4 \
+  --expected_train_seeds 42,43,44 \
+  --require_all_pass \
+  --output_dir ar_ss_flow/outputs/corr_heldout_overfit16_s300_multiseed_summary
+
+只有 summary/report.json passed=true 才允许运行 12.5 以后命令。
+不要通过选择单一 seed、降低 0.65、删除 reverse/cyclic 来绕过门。
+
+
+12.5 C2 correspondence-gated SS residual 单样本 s5 smoke
+=======================================================
+
+说明：
+  C1 correspondence checkpoint 冻结。
+  ReconViaGen stock SS Flow 冻结。
+  只训练 zero-init same-voxel adapter。
+  correspondence confidence 是必要 gate，不只是 view-softmax bias。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+CORR=/home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed42/checkpoints/last.pt
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/corr_gated_ss_smoke1_s5_seed42
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.train_correspondence_gated_ss_flow \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --correspondence_checkpoint "${CORR}" \
+  --correspondence_audit_report /home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed42/eval_fresh48_views2_4/report.json \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0 \
+  --device cuda \
+  --seed 42 \
+  --max_steps 5 \
+  --save_every 5 \
+  --log_every 1 \
+  --lr 1.0e-4 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --confidence_threshold 0.55 \
+  --neighborhood_radius 1 \
+  --min_source_views 2 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse \
+  --t_schedule uniform \
+  --flow_weight 1.0 \
+  --wrong_stock_weight 0.10 \
+  --correct_gain_weight 0.10 \
+  --correct_gain_margin 0.005 \
+  --correct_wrong_rank_weight 0.05 \
+  --correct_wrong_margin 0.002 \
+  --delta_norm_weight 0.01 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+
+必须确认 train_report.json：
+  finite=true
+  physical_off_max_abs_diff=0
+  null_max_abs_diff=0
+  zero_init_enabled_max_abs_diff=0
+  C1 checkpoint 全程 frozen
+
+
+12.6 C2 overfit16 三训练 seed，s50
+=================================
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+(
+set -uo pipefail
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+CORR=/home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed${TRAIN_SEED}/checkpoints/last.pt
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/corr_gated_ss_overfit16_s50_seed${TRAIN_SEED}
+GPU=$(( (TRAIN_SEED - 42) % 3 + 1 ))
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.train_correspondence_gated_ss_flow \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --correspondence_checkpoint "${CORR}" \
+  --correspondence_audit_report /home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed${TRAIN_SEED}/eval_fresh48_views2_4/report.json \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-15 \
+  --device cuda \
+  --seed "${TRAIN_SEED}" \
+  --max_steps 50 \
+  --save_every 10 \
+  --log_every 5 \
+  --lr 1.0e-4 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --confidence_threshold 0.55 \
+  --neighborhood_radius 1 \
+  --min_source_views 2 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --t_schedule uniform \
+  --flow_weight 1.0 \
+  --wrong_stock_weight 0.10 \
+  --correct_gain_weight 0.10 \
+  --correct_gain_margin 0.005 \
+  --correct_wrong_rank_weight 0.05 \
+  --correct_wrong_margin 0.002 \
+  --delta_norm_weight 0.01 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+done
+
+
+12.7 C2 固定噪声、三 eval seed、五 t
+=====================================
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+(
+set -uo pipefail
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+CORR=/home/zjr/Tracker/ar_ss_flow/outputs/corr_heldout_overfit16_s300_seed${TRAIN_SEED}/checkpoints/last.pt
+RUN=/home/zjr/Tracker/ar_ss_flow/outputs/corr_gated_ss_overfit16_s50_seed${TRAIN_SEED}
+OUT=${RUN}/eval_noise424344_t013579
+GPU=$(( (TRAIN_SEED - 42) % 3 + 1 ))
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.eval_correspondence_gated_ss_flow \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --correspondence_checkpoint "${CORR}" \
+  --flow_checkpoint "${RUN}/checkpoints/last.pt" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-15 \
+  --max_samples 0 \
+  --device cuda \
+  --seeds 42,43,44 \
+  --t_values 0.1,0.3,0.5,0.7,0.9 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --confidence_threshold 0.55 \
+  --neighborhood_radius 1 \
+  --min_source_views 2 \
+  --amp_dtype bf16 \
+  --min_correct_stock_object_win_rate 0.65 \
+  --min_correct_wrong_object_win_rate 0.65 \
+  --min_positive_t 4 \
+  --max_wrong_abs_gain 0.005 \
+  --min_confidence_object_win_rate 0.65 \
+  --fail_on_error \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+done
+
+C2 必须同时满足：
+  physical_off/null bit-exact stock
+  correct > stock，object win >= 65%
+  correct > 每个 hard wrong，object win >= 65%
+  至少 4/5 t 方向为正
+  wrong 相对 stock 的平均绝对 gain <= 0.005
+  correct correspondence confidence > wrong，object win >= 65%
+
+
+12.8 C2 三训练 seed 汇总
+========================
+
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m ar_ss_flow.summarize_correspondence_gated_multiseed \
+  --report_dirs \
+    ar_ss_flow/outputs/corr_gated_ss_overfit16_s50_seed42/eval_noise424344_t013579 \
+    ar_ss_flow/outputs/corr_gated_ss_overfit16_s50_seed43/eval_noise424344_t013579 \
+    ar_ss_flow/outputs/corr_gated_ss_overfit16_s50_seed44/eval_noise424344_t013579 \
+  --expected_train_seeds 42,43,44 \
+  --output_dir ar_ss_flow/outputs/corr_gated_ss_overfit16_s50_multiseed_summary
+
+只有 C1 和 C2 两个 multiseed summary 都 passed=true，才允许设计 fresh overfit64。
+当前不启用 Flow LoRA，不训练 VGGT/DINO，不修改 stock get_cond。

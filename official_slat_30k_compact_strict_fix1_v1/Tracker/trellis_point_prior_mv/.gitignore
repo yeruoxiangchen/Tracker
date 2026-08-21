@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+outputs/
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+*.obj
+*.ply
+*.glb
+*.gltf
+*.bin
+*.png
+*.jpg
+*.jpeg

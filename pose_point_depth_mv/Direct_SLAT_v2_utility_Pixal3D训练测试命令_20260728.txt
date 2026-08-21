@@ -1,0 +1,552 @@
+# Direct-SLAT v2 engineering utility track:
+# stock / Full / native single-view Pixal3D
+# 2026-07-28
+#
+# 固定顺序：
+#   T0 step100 训练产物校验（默认复用，不重训）
+#   U0 代码/依赖/N5 数据有效性校验
+#   U1 6-object smoke + Pixal3D canonical transform audit
+#   U2 32-object exploratory
+#   U3 fresh 64-object x seeds 42/43/44 confirmatory
+#
+# 约束：
+# - stock/Full：同 corrected coords、同 coordinate-keyed SLAT noise。
+# - Full/Pixal3D：同对象、冻结单视图、同整数 seed、同 GT/scorer；
+#   不声明跨架构 latent noise 相同。
+# - Pixal3D 只使用一个冻结的 metadata-only canonical 规则：
+#   inverse selected-c2w Pixal training rotation + fixed 0.9 scale；
+#   camera translation 只影响投影距离，不进入 object-centered Mesh。
+#   禁止 per-object bbox normalize、ICP、autoframe、best transform。
+# - 6-object smoke 的 U2 只作方向诊断；U1 不再 rollout 崩塌即可进入 U2。
+# - 只有 fresh >=64-object confirmatory 的 U1/U2 同时 PASS 才能重新裁决长训。
+
+
+###############################################################################
+# 公共变量
+###############################################################################
+
+cd /home/zjr/Tracker
+set +e
+set -o pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PYTEST_PY=/home/zjr/anaconda3/bin/python
+PIXAL_PY=/home/zjr/anaconda3/envs/pixal3d/bin/python
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+
+GPU=${GPU:-4}
+TRAIN_CACHE=/data/zjr/ar_slat_direct_train_all_step000900_seed424344_lhslatv2_20260723
+VAL_CACHE=/data/zjr/ar_slat_direct_val_all_step000900_seed424344_lhslatv2_20260723
+TARGET_DEC_AUDIT=${VAL_CACHE}/target_decoder_audit32_v2/report.json
+
+WORK=/data/zjr/direct_slat_v2_bounded_mechanism_20260727
+PREFLIGHT=${WORK}/train897_preflight100_seed42_v1
+PREFLIGHT_CKPT=${PREFLIGHT}/checkpoints/step_000100.pt
+N5_REPORT=${PREFLIGHT}/eval_val32_objects_seed424344_t013579_mechanism_v2_fix1/report.json
+N5_REPORT_SHA256=8ba7b32295211721d841fd052619eac8cd3088a6c843e984a44216101ad4a3f2
+
+UTILITY_ROOT=${PREFLIGHT}/engineering_utility_pixal3d_v1
+PIXAL_TRANSFORM=${UTILITY_ROOT}/pixal3d_native_to_direct_canonical_v1.json
+
+MATRIX_UIDS=0d18146b4fdd40ef9dfeb08e19fc4335_seq000,0cd491abba6140dda5eea7c4c2452979_seq000,29ddf51d78ae455caba970b9cd3eb75c_seq001,092bb80346414104abd5cace71892752_seq000,04d712a0dae0421cae9083484f4332ee_seq001,262afaaf596a4cf683f74b5768bd4db8_seq000
+
+# 官方 TencentARC/Pixal3D HF snapshot。固定 commit 路径，不跟随 refs/main 漂移。
+PIXAL_REVISION=0b31f9160aa400719af409098bff7936a932f726
+PIXAL_SNAPSHOT=/home/zjr/.cache/huggingface/hub/models--TencentARC--Pixal3D/snapshots/${PIXAL_REVISION}
+
+NAF_COMMIT=37f2dfc180f2de53d98bd601109c0da0dd6b0f43
+NAF_ROOT=/data/models/valeoai_NAF_${NAF_COMMIT}
+NAF_REPO=${NAF_ROOT}/repo
+NAF_CKPT=${NAF_ROOT}/naf_release.pth
+NAF_SOURCE_MANIFEST=${NAF_ROOT}/source_manifest.sha256
+
+mkdir -p "${UTILITY_ROOT}"
+
+run_logged() {
+  LOG_PATH=$1
+  shift
+  set +e
+  "$@" 2>&1 | tee "${LOG_PATH}"
+  COMMAND_RC=${PIPESTATUS[0]}
+  printf '%s\n' "${COMMAND_RC}" > "${LOG_PATH}.exit_code"
+  return "${COMMAND_RC}"
+}
+
+run_direct_mesh() {
+  DIRECT_OUT=$1
+  shift
+  if [ -s "${DIRECT_OUT}/report.json" ]; then
+    echo "reuse immutable Direct Mesh: ${DIRECT_OUT}"
+  elif [ -e "${DIRECT_OUT}" ]; then
+    echo "Direct Mesh partial output exists; preserve and inspect: ${DIRECT_OUT}"
+    return 91
+  else
+    run_logged "${DIRECT_OUT}.log" env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+        --cache_manifest "${VAL_CACHE}/manifest.json" \
+        --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+        --checkpoint "${PREFLIGHT_CKPT}" \
+        --output_dir "${DIRECT_OUT}" \
+        --pretrained "${PRETRAINED}" \
+        --steps 25 \
+        --cfg_strength 5.0 \
+        --cfg_interval 0.5,1.0 \
+        --rescale_t 3.0 \
+        --slat_guided_delta_policy post_cfg_v2 \
+        --surface_samples 20000 \
+        --bootstrap_samples 5000 \
+        --amp_dtype bf16 \
+        --noise_identity_mode object_uid_v1 \
+        "$@"
+  fi
+}
+
+prepare_pixal_protocol() {
+  DIRECT_REPORT=$1
+  PIXAL_OUT=$2
+  JOINT_SEEDS=$3
+  "${PY}" -u -m pose_point_depth_mv.compare_pixal3d_singleview_smoke \
+    prepare \
+    --current_report "${DIRECT_REPORT}" \
+    --cache_manifest "${VAL_CACHE}/manifest.json" \
+    --output_dir "${PIXAL_OUT}" \
+    --selection_mode report_objects_v1 \
+    --joint_seeds "${JOINT_SEEDS}" \
+    --view_counts 2 4 8 \
+    --selection_seed 20260728
+}
+
+run_pixal_native() {
+  PIXAL_OUT=$1
+  PIXAL_PROTOCOL=${PIXAL_OUT}/protocol.json
+  if [ ! -s "${PIXAL_PROTOCOL}" ]; then
+    echo "missing Pixal3D protocol: ${PIXAL_PROTOCOL}"
+    return 92
+  fi
+  "${PY}" -c \
+    'import json,sys; from pathlib import Path; from pose_point_depth_mv.compare_pixal3d_singleview_smoke import pixal3d_mesh_path,sha256_file,validate_protocol; pth=Path(sys.argv[1]).resolve(); p=validate_protocol(pth); ok=True
+for c in p["cases"]:
+ m=pixal3d_mesh_path(pth,c["case_id"]); r=m.with_name("result.json")
+ if not m.is_file() or not r.is_file(): ok=False; break
+ x=json.loads(r.read_text(encoding="utf-8"))
+ if x.get("protocol_sha256")!=p["protocol_sha256"] or x.get("mesh_sha256")!=sha256_file(m): ok=False; break
+raise SystemExit(0 if ok else 1)' \
+    "${PIXAL_PROTOCOL}"
+  PIXAL_REUSE_RC=$?
+  if [ "${PIXAL_REUSE_RC}" -eq 0 ]; then
+    echo "reuse immutable Pixal3D outputs: ${PIXAL_OUT}"
+    return 0
+  fi
+  PIXAL_LOG=${PIXAL_OUT}/pixal3d_infer_sdpa.log
+  if [ -e "${PIXAL_LOG}" ]; then
+    PIXAL_LOG=${PIXAL_OUT}/pixal3d_infer_sdpa.resume1.log
+  fi
+  run_logged "${PIXAL_LOG}" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    ATTN_BACKEND=sdpa \
+    SPARSE_ATTN_BACKEND=sdpa \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PIXAL_PY}" -u -m pose_point_depth_mv.compare_pixal3d_singleview_smoke \
+      infer \
+      --protocol "${PIXAL_PROTOCOL}" \
+      --model_path "${PIXAL_SNAPSHOT}" \
+      --naf_repo "${NAF_REPO}" \
+      --naf_checkpoint "${NAF_CKPT}" \
+      --naf_source_manifest "${NAF_SOURCE_MANIFEST}" \
+      --device cuda \
+      --low_vram \
+      --skip_rembg \
+      --camera_mode known_crop_fov \
+      --resolution 1024 \
+      --sampling_steps 12
+}
+
+
+###############################################################################
+# T0. step100 训练命令与不可变复用
+###############################################################################
+
+# 当前目录已经完成 100 steps。默认只复用。
+# 仅在目录完全不存在、且重新完成 N2/N3 后才手工执行：
+#   export APPROVE_REBUILD_STEP100=1
+if [ -s "${PREFLIGHT}/report.json" ] && [ -s "${PREFLIGHT_CKPT}" ]; then
+  echo "reuse immutable step100 checkpoint: ${PREFLIGHT_CKPT}"
+elif [ -e "${PREFLIGHT}" ]; then
+  echo "step100 partial output exists; preserve and inspect: ${PREFLIGHT}"
+elif [ "${APPROVE_REBUILD_STEP100:-0}" != 1 ]; then
+  echo "step100 missing; set APPROVE_REBUILD_STEP100=1 only after N2/N3 pass"
+else
+  run_logged "${PREFLIGHT}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.train_direct_slat_flow \
+      --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+      --output_dir "${PREFLIGHT}" \
+      --pretrained "${PRETRAINED}" \
+      --max_steps 100 \
+      --save_every 20 \
+      --log_every 5 \
+      --grad_accum 8 \
+      --seed 42 \
+      --lr 1e-5 \
+      --weight_decay 0 \
+      --grad_clip 1.0 \
+      --lora_rank 16 \
+      --lora_alpha 32 \
+      --adapter_hidden_dim 128 \
+      --max_slat_points 40960 \
+      --support_scale 1.0 \
+      --training_semantics bounded_mechanism_v2 \
+      --slat_guided_delta_policy post_cfg_v2 \
+      --slat_delta_scale 1.0 \
+      --slat_delta_rms_ratio_cap 0.10 \
+      --delta_norm_weight 1e-4 \
+      --raw_delta_excess_weight 0.01 \
+      --wrong_support_rank_weight 0.10 \
+      --wrong_support_margin 0.001 \
+      --wrong_support_probability 0.50 \
+      --support_dropout_weight 0.10 \
+      --support_dropout_probability 0.25 \
+      --sampling_mode object_balanced \
+      --t_schedule uniform \
+      --amp_dtype bf16 \
+      --gradient_checkpointing \
+      --verify_cache_hashes
+  T0_RC=$?
+  echo "T0_RC=${T0_RC}"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# U0. 静态、CPU 单测、依赖和 N5 数据有效性
+###############################################################################
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/export_direct_slat_mesh_pairs.py \
+  pose_point_depth_mv/compare_pixal3d_singleview_smoke.py \
+  pose_point_depth_mv/evaluate_direct_slat_pixal3d_utility.py
+U0_COMPILE_RC=$?
+
+"${PYTEST_PY}" -m pytest -q \
+  pose_point_depth_mv/test_direct_slat_pixal3d_utility.py \
+  pose_point_depth_mv/test_branch_matrix_and_matched_view_protocol.py
+U0_TEST_RC=$?
+
+test -s "${PREFLIGHT_CKPT}"
+U0_CKPT_RC=$?
+test -s "${PIXAL_SNAPSHOT}/pipeline.json"
+U0_PIXAL_RC=$?
+test -s "${NAF_REPO}/hubconf.py"
+U0_NAF_REPO_RC=$?
+test -s "${NAF_CKPT}"
+U0_NAF_CKPT_RC=$?
+test -s "${NAF_SOURCE_MANIFEST}"
+U0_NAF_MANIFEST_RC=$?
+
+if [ -s "${N5_REPORT}" ]; then
+  N5_ACTUAL_SHA=$(sha256sum "${N5_REPORT}" | awk '{print $1}')
+else
+  N5_ACTUAL_SHA=missing
+fi
+if [ "${N5_ACTUAL_SHA}" = "${N5_REPORT_SHA256}" ]; then
+  U0_N5_RC=0
+else
+  U0_N5_RC=93
+  echo "N5 report SHA mismatch: ${N5_ACTUAL_SHA}"
+fi
+
+echo "U0_COMPILE_RC=${U0_COMPILE_RC}"
+echo "U0_TEST_RC=${U0_TEST_RC}"
+echo "U0_CKPT_RC=${U0_CKPT_RC}"
+echo "U0_PIXAL_RC=${U0_PIXAL_RC}"
+echo "U0_NAF_REPO_RC=${U0_NAF_REPO_RC}"
+echo "U0_NAF_CKPT_RC=${U0_NAF_CKPT_RC}"
+echo "U0_NAF_MANIFEST_RC=${U0_NAF_MANIFEST_RC}"
+echo "U0_N5_RC=${U0_N5_RC}"
+echo "N5 mechanism verdict remains FAIL; utility track uses only its valid U1 evidence."
+echo "current terminal remains open"
+
+
+###############################################################################
+# U1. 6-object smoke
+###############################################################################
+
+# U0 全部 RC=0 后人工执行：
+#   export APPROVE_UTILITY_SMOKE=1
+SMOKE_MESH=${UTILITY_ROOT}/mesh6_postcfg_seed42_utility_v1
+SMOKE_PIXAL=${UTILITY_ROOT}/pixal3d_native_smoke6_seed42_utility_v1
+SMOKE_PROTOCOL=${SMOKE_PIXAL}/protocol.json
+SMOKE_SCORE=${UTILITY_ROOT}/score_smoke6_seed42_utility_v1
+
+if [ "${APPROVE_UTILITY_SMOKE:-0}" != 1 ]; then
+  echo "U1 not started; set APPROVE_UTILITY_SMOKE=1 after U0 review"
+else
+  run_direct_mesh "${SMOKE_MESH}" \
+    --uids "${MATRIX_UIDS}" \
+    --joint_seeds 42
+  U1_DIRECT_RC=$?
+
+  if [ "${U1_DIRECT_RC}" -eq 0 ]; then
+    prepare_pixal_protocol "${SMOKE_MESH}/report.json" "${SMOKE_PIXAL}" 42
+    U1_PREPARE_RC=$?
+  else
+    U1_PREPARE_RC=94
+  fi
+
+  if [ "${U1_PREPARE_RC}" -eq 0 ]; then
+    run_pixal_native "${SMOKE_PIXAL}"
+    U1_PIXAL_RC=$?
+  else
+    U1_PIXAL_RC=94
+  fi
+
+  if [ "${U1_PIXAL_RC}" -eq 0 ]; then
+    if [ -s "${PIXAL_TRANSFORM}" ]; then
+      "${PY}" -c \
+        'import sys; from pathlib import Path; from pose_point_depth_mv.evaluate_direct_slat_pixal3d_utility import validate_transform; validate_transform(Path(sys.argv[1])); print("reuse frozen Pixal3D canonical transform")' \
+        "${PIXAL_TRANSFORM}"
+      U1_TRANSFORM_RC=$?
+    elif [ -e "${PIXAL_TRANSFORM}" ]; then
+      echo "partial transform exists; preserve and inspect: ${PIXAL_TRANSFORM}"
+      U1_TRANSFORM_RC=95
+    else
+      TRANSFORM_LOG=${PIXAL_TRANSFORM}.log
+      if [ -e "${TRANSFORM_LOG}" ]; then
+        TRANSFORM_LOG=${PIXAL_TRANSFORM}.retry_float32_fix1.log
+      fi
+      run_logged "${TRANSFORM_LOG}" \
+        "${PY}" -u -m pose_point_depth_mv.evaluate_direct_slat_pixal3d_utility \
+          freeze-transform \
+          --protocol "${SMOKE_PROTOCOL}" \
+          --output "${PIXAL_TRANSFORM}" \
+          --min_audit_objects 6 \
+          --native_aabb_half_extent 0.5 \
+          --aabb_tolerance 0.02 \
+          --expected_direct_margin 0.9
+      U1_TRANSFORM_RC=$?
+    fi
+  else
+    U1_TRANSFORM_RC=94
+  fi
+
+  if [ "${U1_TRANSFORM_RC}" -eq 0 ]; then
+    if [ -s "${SMOKE_SCORE}/report.json" ]; then
+      echo "reuse immutable U1 score: ${SMOKE_SCORE}"
+      U1_SCORE_RC=0
+    elif [ -e "${SMOKE_SCORE}" ]; then
+      echo "U1 score partial output exists; preserve and inspect: ${SMOKE_SCORE}"
+      U1_SCORE_RC=95
+    else
+      run_logged "${SMOKE_SCORE}.log" env \
+        OMP_NUM_THREADS=8 \
+        MKL_NUM_THREADS=8 \
+        OPENBLAS_NUM_THREADS=8 \
+        "${PY}" -u -m pose_point_depth_mv.evaluate_direct_slat_pixal3d_utility \
+          evaluate \
+          --protocol "${SMOKE_PROTOCOL}" \
+          --pixal_transform "${PIXAL_TRANSFORM}" \
+          --output_dir "${SMOKE_SCORE}" \
+          --expected_objects 6 \
+          --expected_seeds 42 \
+          --surface_samples 20000 \
+          --bootstrap_samples 5000 \
+          --decision_profile smoke
+      U1_SCORE_RC=$?
+    fi
+  else
+    U1_SCORE_RC=94
+  fi
+
+  echo "U1_DIRECT_RC=${U1_DIRECT_RC}"
+  echo "U1_PREPARE_RC=${U1_PREPARE_RC}"
+  echo "U1_PIXAL_RC=${U1_PIXAL_RC}"
+  echo "U1_TRANSFORM_RC=${U1_TRANSFORM_RC}"
+  echo "U1_SCORE_RC=${U1_SCORE_RC}"
+  test -s "${SMOKE_SCORE}/summary.txt" && sed -n '1,120p' "${SMOKE_SCORE}/summary.txt"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# U2. 32-object exploratory
+###############################################################################
+
+# U1 report 中 continue_to_next_stage=true 后人工执行：
+#   export APPROVE_UTILITY_32=1
+MESH32=${UTILITY_ROOT}/mesh32_postcfg_seed42_utility_v1
+PIXAL32=${UTILITY_ROOT}/pixal3d_native32_seed42_utility_v1
+PROTOCOL32=${PIXAL32}/protocol.json
+SCORE32=${UTILITY_ROOT}/score32_seed42_utility_v1
+
+if [ "${APPROVE_UTILITY_32:-0}" != 1 ]; then
+  echo "U2 not started; require U1 continue_to_next_stage=true"
+else
+  run_direct_mesh "${MESH32}" \
+    --max_objects 32 \
+    --joint_seeds 42
+  U2_DIRECT_RC=$?
+
+  if [ "${U2_DIRECT_RC}" -eq 0 ]; then
+    prepare_pixal_protocol "${MESH32}/report.json" "${PIXAL32}" 42
+    U2_PREPARE_RC=$?
+  else
+    U2_PREPARE_RC=94
+  fi
+
+  if [ "${U2_PREPARE_RC}" -eq 0 ]; then
+    run_pixal_native "${PIXAL32}"
+    U2_PIXAL_RC=$?
+  else
+    U2_PIXAL_RC=94
+  fi
+
+  if [ "${U2_PIXAL_RC}" -eq 0 ]; then
+    if [ -s "${SCORE32}/report.json" ]; then
+      echo "reuse immutable U2 score: ${SCORE32}"
+      U2_SCORE_RC=0
+    elif [ -e "${SCORE32}" ]; then
+      echo "U2 score partial output exists; preserve and inspect: ${SCORE32}"
+      U2_SCORE_RC=95
+    else
+      run_logged "${SCORE32}.log" env \
+        OMP_NUM_THREADS=8 \
+        MKL_NUM_THREADS=8 \
+        OPENBLAS_NUM_THREADS=8 \
+        "${PY}" -u -m pose_point_depth_mv.evaluate_direct_slat_pixal3d_utility \
+          evaluate \
+          --protocol "${PROTOCOL32}" \
+          --pixal_transform "${PIXAL_TRANSFORM}" \
+          --output_dir "${SCORE32}" \
+          --expected_objects 32 \
+          --expected_seeds 42 \
+          --surface_samples 20000 \
+          --bootstrap_samples 5000 \
+          --decision_profile exploratory
+      U2_SCORE_RC=$?
+    fi
+  else
+    U2_SCORE_RC=94
+  fi
+
+  echo "U2_DIRECT_RC=${U2_DIRECT_RC}"
+  echo "U2_PREPARE_RC=${U2_PREPARE_RC}"
+  echo "U2_PIXAL_RC=${U2_PIXAL_RC}"
+  echo "U2_SCORE_RC=${U2_SCORE_RC}"
+  test -s "${SCORE32}/summary.txt" && sed -n '1,160p' "${SCORE32}/summary.txt"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# U3. fresh 64-object x 3 seeds confirmatory
+###############################################################################
+
+# U2 的 U1/U2 都 passed 后才能执行：
+#   export APPROVE_FRESH64=1
+#
+# exporter 对 eligible object_uid 排序后跳过前 32 个，再取 64 个；
+# scorer 还会对 PROTOCOL32 做 object_uid + source_glb 双重零重叠硬检查。
+MESH64=${UTILITY_ROOT}/mesh64_fresh_offset32_postcfg_seed424344_utility_v1
+PIXAL64=${UTILITY_ROOT}/pixal3d_native64_fresh_seed424344_utility_v1
+PROTOCOL64=${PIXAL64}/protocol.json
+SCORE64=${UTILITY_ROOT}/score64_fresh_seed424344_confirmatory_v1
+
+if [ "${APPROVE_FRESH64:-0}" != 1 ]; then
+  echo "U3 not started; require U2 U1/U2 both passed"
+else
+  run_direct_mesh "${MESH64}" \
+    --object_offset 32 \
+    --max_objects 64 \
+    --joint_seeds 42,43,44
+  U3_DIRECT_RC=$?
+
+  if [ "${U3_DIRECT_RC}" -eq 0 ]; then
+    prepare_pixal_protocol "${MESH64}/report.json" "${PIXAL64}" 42,43,44
+    U3_PREPARE_RC=$?
+  else
+    U3_PREPARE_RC=94
+  fi
+
+  if [ "${U3_PREPARE_RC}" -eq 0 ]; then
+    run_pixal_native "${PIXAL64}"
+    U3_PIXAL_RC=$?
+  else
+    U3_PIXAL_RC=94
+  fi
+
+  if [ "${U3_PIXAL_RC}" -eq 0 ]; then
+    if [ -s "${SCORE64}/report.json" ]; then
+      echo "reuse immutable U3 score: ${SCORE64}"
+      U3_SCORE_RC=0
+    elif [ -e "${SCORE64}" ]; then
+      echo "U3 score partial output exists; preserve and inspect: ${SCORE64}"
+      U3_SCORE_RC=95
+    else
+      run_logged "${SCORE64}.log" env \
+        OMP_NUM_THREADS=8 \
+        MKL_NUM_THREADS=8 \
+        OPENBLAS_NUM_THREADS=8 \
+        "${PY}" -u -m pose_point_depth_mv.evaluate_direct_slat_pixal3d_utility \
+          evaluate \
+          --protocol "${PROTOCOL64}" \
+          --pixal_transform "${PIXAL_TRANSFORM}" \
+          --output_dir "${SCORE64}" \
+          --expected_objects 64 \
+          --expected_seeds 42,43,44 \
+          --exclude_protocol "${PROTOCOL32}" \
+          --surface_samples 20000 \
+          --bootstrap_samples 10000 \
+          --decision_profile confirmatory
+      U3_SCORE_RC=$?
+    fi
+  else
+    U3_SCORE_RC=94
+  fi
+
+  echo "U3_DIRECT_RC=${U3_DIRECT_RC}"
+  echo "U3_PREPARE_RC=${U3_PREPARE_RC}"
+  echo "U3_PIXAL_RC=${U3_PIXAL_RC}"
+  echo "U3_SCORE_RC=${U3_SCORE_RC}"
+  test -s "${SCORE64}/summary.txt" && sed -n '1,180p' "${SCORE64}/summary.txt"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# 监视与最终裁决
+###############################################################################
+
+# Pixal3D 推理监视（另开终端；按当前阶段修改 PIXAL_OUT）：
+# PIXAL_OUT=${PIXAL32}
+# watch -n 20 "
+#   date
+#   find '${PIXAL_OUT}/pixal3d' -type f -name mesh.obj 2>/dev/null | wc -l
+#   tail -n 12 '${PIXAL_OUT}/pixal3d_infer_sdpa.log' 2>/dev/null
+#   nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+#     --format=csv,noheader,nounits
+# "
+
+# 最终只读取：
+#   ${SCORE64}/report.json
+#   decision.u1_full_gt_stock.passed
+#   decision.u2_full_gt_pixal3d_native.passed
+#   decision.long_training_unlocked
+#
+# long_training_unlocked=false：
+#   不启动 897-object 长训；按失败分支诊断 rollout/decoder/Pixal 坐标协议。
+# long_training_unlocked=true：
+#   只允许重新裁决是否启动长训，不自动启动；仍保留 mechanism science track FAIL。

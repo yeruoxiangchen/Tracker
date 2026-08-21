@@ -1,0 +1,83 @@
+目标
+====
+
+对 20260810_133235_817 做严格配对诊断：
+
+1. AR 分支绑定已经完成的 axis_viewfix_v1 / Mixed 结果，不重新推理。
+2. 离线 COLMAP 用同一采集序列的 18 张完整 RGB 场景特征做 SfM 和 BA；mask 仍固定，并在 runtime-O 阶段筛选物体稀疏点。
+3. 模型推理只暴露与 AR 分支完全相同的以下 8 帧，不允许静默换帧：
+   frame_0005.jpg frame_0013.jpg frame_0025.jpg frame_0032.jpg
+   frame_0042.jpg frame_0058.jpg frame_0075.jpg frame_0091.jpg
+4. 两路均使用当前 Mixed no-VGGT SS/SLat、EMA、seed=42。
+5. COLMAP 世界没有可靠重力方向，因此 COLMAP 分支不传 Y-up 重力先验；最终用显示归一化预览人工比较。
+
+
+一、完整运行（前台运行，不是后台任务）
+====================================
+
+cd /home/zjr/Tracker
+
+GPU=4 /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m pose_point_depth_mv.run_ar_offline_colmap_ab \
+  --resume
+
+默认输出：
+
+pose_point_depth_mv/outputs/可视AR/diagnostics/20260810_133235_817_ar_vs_offline_colmap_fullimage_v1
+
+重点查看：
+
+pose_point_depth_mv/outputs/可视AR/diagnostics/20260810_133235_817_ar_vs_offline_colmap_fullimage_v1/ARPose与COLMAPPose_同输入并排预览.png
+pose_point_depth_mv/outputs/可视AR/diagnostics/20260810_133235_817_ar_vs_offline_colmap_fullimage_v1/report.json
+pose_point_depth_mv/outputs/可视AR/diagnostics/20260810_133235_817_ar_vs_offline_colmap_fullimage_v1/colmap_workspace/colmap.log
+
+`--resume` 可安全续跑本脚本已完成且合同一致的阶段；若输入、命令或固定帧发生变化会拒绝复用。
+
+
+二、仅检查输入合同和将要执行的 COLMAP 命令（不写结果）
+========================================================
+
+cd /home/zjr/Tracker
+
+GPU=4 /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m pose_point_depth_mv.run_ar_offline_colmap_ab \
+  --dry_run
+
+
+三、只完成 COLMAP 和固定 8 帧数据集，不运行 Mixed 推理
+=====================================================
+
+cd /home/zjr/Tracker
+
+GPU=4 /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m pose_point_depth_mv.run_ar_offline_colmap_ab \
+  --prepare_only \
+  --resume
+
+之后执行“一、完整运行”即可从已有 COLMAP 阶段继续。
+
+
+四、已确认失败的前景特征对照（通常不要运行）
+==========================================
+
+817 实测中，前景 mask 内的 SIFT 只能形成 5 帧模型，固定 8 帧中仅 frame_0058.jpg 被注册；完整 RGB 则注册 18/18 帧并得到 6173 个稀疏点。因此默认已经改为完整 RGB。只有复现实验时才运行下面的前景版，并写入独立目录：
+
+cd /home/zjr/Tracker
+
+GPU=4 /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  -m pose_point_depth_mv.run_ar_offline_colmap_ab \
+  --foreground_features \
+  --output_root \
+    pose_point_depth_mv/outputs/可视AR/diagnostics/20260810_133235_817_ar_vs_offline_colmap_foreground_v2 \
+  --resume
+
+
+解释边界
+========
+
+当前 runtime-O 前端仍需要稀疏几何来确定中心、尺度和世界变换。因此这个实验交换的是完整几何前端：
+
+- ARFoundation K/T_W2C + ARPointCloudManager 点云；
+- COLMAP K/T_W2C + COLMAP 稀疏点。
+
+它严格固定原始 RGB、mask、8 个推理视图、checkpoint 和 seed，但不是数学意义上只替换 pose、完全固定点云的干预。COLMAP 与 AR 世界还存在独立 Sim(3) 规范，不能直接比较两个 world OBJ 的绝对坐标；应看并排的显示归一化预览及 report.json 中的相对旋转、归一化相机基线和 K 差异。

@@ -1,0 +1,123 @@
+# 全96帧 COLMAP 实验：同 selected-8 输入运行原版 ReconViaGen，并输出 Mesh 环绕视频
+# 日期：2026-08-11
+#
+# 逐段执行 R0、R1、R2。R1 是原版 ReconViaGen 推理；R2 只做展示渲染。
+# 两个方法的 normal 环绕采用同一相机轨迹，但分别按自身包围盒居中和等比例缩放，
+# 因而只比较形状，不能据此比较 AR 世界位置或真实尺度。
+
+
+R0. 静态检查与路径核对
+=======================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/全96帧COLMAP重建/20260810_133235_817_full96_colmap_v1
+RUNTIME=${ROOT}/03_reconstruction/reconstructions/20260810_133235_817_full96_colmap_v1/02_runtime_o/runtime_input_manifest.json
+FINAL_DIR=${ROOT}/03_reconstruction/final_ar_world
+CURRENT_MESH=${FINAL_DIR}/reconstructed_object_ar_world.obj
+RECON_OUT=${FINAL_DIR}/reconviagen_original_selected8_seed42_v1
+RECON_MESH=${RECON_OUT}/meshes/coarsemodel_real/dataset_registered_undistorted_object/seed_42/mesh_reference_o.obj
+VIDEO_OUT=${FINAL_DIR}/reconviagen_original_selected8_seed42_video_compare_v1
+
+${PY} -m py_compile \
+  pose_point_depth_mv/infer_omni_real_reconviagen.py \
+  pose_point_depth_mv/render_ar_reconviagen_comparison_video.py
+
+${PY} -c '
+import json, pathlib, sys
+runtime, current = map(pathlib.Path, sys.argv[1:])
+r = json.load(open(runtime))
+assert r["format"] == "pose_point_depth_mv.omni_real_runtime_input_manifest.v2"
+assert r["passed"] is True and len(r["objects"]) == 1
+row = r["objects"][0]
+assert row["selected_view_count"] == 8
+assert len(row["prepared_rgb_paths"]) == 8
+assert all(pathlib.Path(p).is_file() for p in row["prepared_rgb_paths"])
+assert current.is_file()
+print(json.dumps({
+  "passed": True,
+  "object_key": row["object_key"],
+  "selected_frames": row["selected_frame_names"],
+  "formal_input_passed": row["input_quality"]["formal_input_passed"],
+}, indent=2, ensure_ascii=False))
+' "${RUNTIME}" "${CURRENT_MESH}"
+
+echo "R0 complete"
+echo "current terminal remains open"
+
+
+R1. 使用同一 selected-8 RGB 运行冻结的原版 ReconViaGen
+=====================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-5}  # 必须按 nvidia-smi 改成实际空闲卡
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/全96帧COLMAP重建/20260810_133235_817_full96_colmap_v1
+RUNTIME=${ROOT}/03_reconstruction/reconstructions/20260810_133235_817_full96_colmap_v1/02_runtime_o/runtime_input_manifest.json
+FINAL_DIR=${ROOT}/03_reconstruction/final_ar_world
+RECON_OUT=${FINAL_DIR}/reconviagen_original_selected8_seed42_v1
+
+if [ -s "${RECON_OUT}/inference_manifest.json" ]; then
+  echo "reuse ReconViaGen inference: ${RECON_OUT}/inference_manifest.json"
+else
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  ${PY} -u -m pose_point_depth_mv.infer_omni_real_reconviagen \
+    --runtime_input_manifest "${RUNTIME}" \
+    --output_dir "${RECON_OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --seeds 42 \
+    --device cuda \
+    --low_vram \
+    2>&1 | tee "${FINAL_DIR}/R1_reconviagen_original_selected8_seed42.log"
+fi
+
+echo "ReconViaGen Mesh: ${RECON_OUT}/meshes/coarsemodel_real/dataset_registered_undistorted_object/seed_42/mesh_reference_o.obj"
+echo "current terminal remains open"
+
+
+R2. 输出当前模型、ReconViaGen 及二者并排的 normal 环绕视频
+===========================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-5}  # 必须按 nvidia-smi 改成实际空闲卡
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/全96帧COLMAP重建/20260810_133235_817_full96_colmap_v1
+FINAL_DIR=${ROOT}/03_reconstruction/final_ar_world
+CURRENT_MESH=${FINAL_DIR}/reconstructed_object_ar_world.obj
+RECON_OUT=${FINAL_DIR}/reconviagen_original_selected8_seed42_v1
+RECON_MESH=${RECON_OUT}/meshes/coarsemodel_real/dataset_registered_undistorted_object/seed_42/mesh_reference_o.obj
+VIDEO_OUT=${FINAL_DIR}/reconviagen_original_selected8_seed42_video_compare_v1
+
+if [ ! -s "${RECON_MESH}" ]; then
+  echo "R2 blocked: run R1 first: ${RECON_MESH}"
+else
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  ${PY} -u -m pose_point_depth_mv.render_ar_reconviagen_comparison_video \
+    --current_mesh "${CURRENT_MESH}" \
+    --reconviagen_mesh "${RECON_MESH}" \
+    --output_dir "${VIDEO_OUT}" \
+    --device cuda \
+    --render_frames 72 \
+    --resolution 512 \
+    --fps 18 \
+    --display_margin 1.0 \
+    --resume
+fi
+
+echo "ReconViaGen 视频: ${VIDEO_OUT}/ReconViaGen原版_normal环绕.mp4"
+echo "当前模型视频: ${VIDEO_OUT}/当前NoVGGT_normal环绕.mp4"
+echo "并排视频: ${VIDEO_OUT}/当前NoVGGT_vs_ReconViaGen原版_normal并排.mp4"
+echo "抽帧图: ${VIDEO_OUT}/当前与ReconViaGen_六视图对比抽帧.png"
+echo "current terminal remains open"

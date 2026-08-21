@@ -1,0 +1,125 @@
+# Mixed10k Omni256 v4：两卡运行中的新 D7 监视与 D8 汇总
+# 2026-07-29
+#
+# 当前 unit:
+#   tracker-mixed10k-omnipilot256-w0-of2-v4.service -> GPU 1
+#   tracker-mixed10k-omnipilot256-w1-of2-v4.service -> GPU 3
+#
+# 这已经是两卡运行。不要再次执行启动命令，也不要创建新的 render root。
+# 两个 worker 分别顺序处理：
+#   worker0: shard 0,2,4,6
+#   worker1: shard 1,3,5,7
+#
+# 每个 shard = 32 objects × 2 sequences = 64 tasks。
+# _WORKER_COMPLETE.json 只有64个任务全部结束后才生成，因此只看 marker 会长时间为0。
+
+
+###############################################################################
+# D7. 两卡 Omni256 的 shard 内实时进度
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+watch -n 20 -- \
+  "${PY} -u pose_point_depth_mv/dataset_tools/monitor_mixed_render_shards.py \
+    --render_root /data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4 \
+    --log_root /data/zjr/dataset10k_20260726/logs/pilot_omni256_cyclescuda_v4 \
+    --source omni \
+    --expected_shards 8 \
+    --expected_tasks_per_shard 64 \
+    --num_workers 2 \
+    --unit tracker-mixed10k-omnipilot256-w0-of2-v4.service \
+    --unit tracker-mixed10k-omnipilot256-w1-of2-v4.service \
+    --gpu_index 1 \
+    --gpu_index 3"
+
+# 输出会同时显示：
+# - 总 sequence 进度（0..512）；
+# - 完成 shard 数（0..8）；
+# - 两个 worker 当前分别处理哪个 shard；
+# - shard 内 accepted/failed、elapsed、ETA、last failure class；
+# - GPU 1/3 的显存与利用率。
+#
+# 首个 sequence 没结束前仍会显示 0/64，并标明“首个sequence处理中”。
+# Omni 单个 sequence 可能耗时数分钟，这不等于服务停止。
+
+
+###############################################################################
+# D8. 8个 shard 全部完成后的 pilot 汇总与候选预算硬门（CPU）
+###############################################################################
+
+# D7 显示“全部shard marker已生成”后退出 watch，再执行本段。
+
+cd /home/zjr/Tracker
+set +e
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE_FREEZE=/data/zjr/dataset10k_20260726/source_freeze_obj11546_omni215_v2
+OMNI_PILOT_ROOT=/data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4
+OMNI_PILOT_REPORT=${OMNI_PILOT_ROOT}/pilot_report.json
+OMNI_MARKERS=$(find "${OMNI_PILOT_ROOT}/omni" -mindepth 2 -maxdepth 2 \
+  -type f -name _WORKER_COMPLETE.json 2>/dev/null | wc -l)
+D8_RC=97
+
+if [ "${OMNI_MARKERS}" -ne 8 ]; then
+  echo "D8 blocked: Omni pilot incomplete: ${OMNI_MARKERS}/8"
+  echo "run D7 to inspect live per-shard progress"
+  D8_RC=96
+elif [ -s "${OMNI_PILOT_REPORT}" ]; then
+  echo "reuse immutable pilot report: ${OMNI_PILOT_REPORT}"
+  D8_RC=0
+elif [ -e "${OMNI_PILOT_REPORT}" ]; then
+  echo "D8 blocked: partial pilot report exists; preserve and inspect"
+  D8_RC=98
+else
+  "${PY}" -u \
+    pose_point_depth_mv/dataset_tools/analyze_mixed_render_pilot.py \
+      --render_root "${OMNI_PILOT_ROOT}" \
+      --source omni \
+      --expected_shards 8 \
+      --sequences_per_object 2 \
+      --max_low_texture_ratio 0.22 \
+      --target_objects 4000 \
+      --reserve_fraction 0.15 \
+      --output "${OMNI_PILOT_REPORT}"
+  D8_RC=$?
+fi
+
+if [ "${D8_RC}" -eq 0 ]; then
+  "${PY}" -c \
+    'import json,sys
+p=json.load(open(sys.argv[1])); s=json.load(open(sys.argv[2]))
+available=int(s["omni"]["object_count"])
+suggested=int(p["suggested_candidate_objects"])
+out={
+  "passed":p["passed"],
+  "completed_shards":p["completed_shards"],
+  "attempted_objects":p["attempted_objects"],
+  "attempted_sequences":p["attempted_sequences"],
+  "accepted_sequences":p["accepted_sequences"],
+  "sequence_acceptance_rate":p["sequence_acceptance_rate"],
+  "objects_with_any_accepted_sequence":p["objects_with_any_accepted_sequence"],
+  "estimated_admitted_object_yield":p["estimated_admitted_object_yield"],
+  "suggested_candidate_objects":suggested,
+  "available_omni_objects":available,
+  "candidate_budget_sufficient":suggested<=available,
+  "infrastructure_failure_count":p["infrastructure_failure_count"],
+  "failure_counts":p["failure_counts"],
+}
+print(json.dumps(out,indent=2,ensure_ascii=False))
+assert p["passed"] is True
+assert p["infrastructure_failure_count"]==0
+assert suggested<=available' \
+    "${OMNI_PILOT_REPORT}" \
+    "${SOURCE_FREEZE}/source_report.json"
+  D8_RC=$?
+fi
+
+echo "D8_RC=${D8_RC}"
+echo "pilot report: ${OMNI_PILOT_REPORT}"
+echo "current terminal remains open"
+
+# D8_RC=0 才允许进入正式24-shard渲染。
+# D8只做CPU汇总，不再占用GPU。

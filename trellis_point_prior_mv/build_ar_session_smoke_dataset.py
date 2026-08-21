@@ -126,6 +126,18 @@ def read_phone_poses(pose_path: Path) -> dict[str, dict]:
             "quat": None,
             "intrinsics": None,
             "image_transform": "unknown",
+            "cpu_image_timestamp_s": None,
+            "camera_frame_timestamp_ns": None,
+            "pose_sample_realtime_s": None,
+            "camera_frame_timestamp_delta_s": None,
+            "pose_binding": "legacy_unversioned",
+            "screen_orientation": "unknown",
+            "tracking_state": "unknown",
+            "display_matrix": None,
+            "projection_matrix": None,
+            "pose_coordinate_frame": "legacy_unversioned",
+            "capture_anchor_tracking_state": "unknown",
+            "strictly_synchronized": False,
         }
         if len(parts) >= 11:
             quat = [parse_float(v) for v in parts[7:11]]
@@ -150,6 +162,37 @@ def read_phone_poses(pose_path: Path) -> dict[str, dict]:
             pose["image_transform"] = parts[21] or "None"
         elif len(parts) >= 19:
             pose["image_transform"] = "MirrorY"
+        if len(parts) > 22:
+            pose["cpu_image_timestamp_s"] = parse_float(parts[22])
+        if len(parts) > 23:
+            pose["camera_frame_timestamp_ns"] = parse_int(parts[23])
+        if len(parts) > 24:
+            pose["pose_sample_realtime_s"] = parse_float(parts[24])
+        if len(parts) > 25:
+            pose["camera_frame_timestamp_delta_s"] = parse_float(parts[25])
+        if len(parts) > 26 and parts[26]:
+            pose["pose_binding"] = parts[26]
+        if len(parts) > 27 and parts[27]:
+            pose["screen_orientation"] = parts[27]
+        if len(parts) > 28 and parts[28]:
+            pose["tracking_state"] = parts[28]
+        if len(parts) > 29 and parts[29]:
+            pose["display_matrix"] = parts[29]
+        if len(parts) > 30 and parts[30]:
+            pose["projection_matrix"] = parts[30]
+        if len(parts) > 31 and parts[31]:
+            pose["pose_coordinate_frame"] = parts[31]
+        if len(parts) > 32 and parts[32]:
+            pose["capture_anchor_tracking_state"] = parts[32]
+        delta = pose["camera_frame_timestamp_delta_s"]
+        pose["strictly_synchronized"] = bool(
+            pose["pose_binding"] in {
+                "camera_frame_received",
+                "camera_frame_received_anchor_a0_relative_v1",
+            }
+            and delta is not None
+            and 0.0 <= delta <= 0.05
+        )
         poses[frame_name] = pose
     if not poses:
         raise ValueError(f"no valid phone poses parsed from {pose_path}")
@@ -196,7 +239,18 @@ def unity_world_point_to_colmap(point: np.ndarray) -> np.ndarray:
     return np.asarray([point[0], point[1], -point[2]], dtype=np.float64)
 
 
-def unity_pose_to_colmap_w2c(pose: dict) -> tuple[np.ndarray, np.ndarray]:
+def image_camera_rotation_matrix(degrees: float) -> np.ndarray:
+    angle = math.radians(float(degrees))
+    cosine, sine = math.cos(angle), math.sin(angle)
+    return np.asarray(
+        [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def unity_pose_to_colmap_w2c(
+    pose: dict, *, image_camera_rotation_degrees: float = 90.0
+) -> tuple[np.ndarray, np.ndarray]:
     if pose.get("quat") is not None:
         r_unity_c2w = unity_quat_to_rotmat(pose["quat"])
     elif pose.get("rot_deg") is not None:
@@ -212,13 +266,8 @@ def unity_pose_to_colmap_w2c(pose: dict) -> tuple[np.ndarray, np.ndarray]:
     r_w2c = r_cv_c2w.T
     t_w2c = -r_w2c @ cam_center_w
 
-    image_cam_from_pose_cam = np.array(
-        [
-            [0.0, -1.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
+    image_cam_from_pose_cam = image_camera_rotation_matrix(
+        image_camera_rotation_degrees
     )
     return image_cam_from_pose_cam @ r_w2c, image_cam_from_pose_cam @ t_w2c
 
@@ -345,6 +394,9 @@ def copy_session_files(
     if not kept:
         raise ValueError(f"no frames with image/pose/mask were copied from {data_dir}")
     shutil.copy2(data_dir / "poses.txt", dataset_dir / "poses.txt")
+    frame_metadata = data_dir / "frame_metadata.jsonl"
+    if frame_metadata.is_file():
+        shutil.copy2(frame_metadata, dataset_dir / "frame_metadata.jsonl")
     return kept
 
 

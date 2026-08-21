@@ -1,0 +1,153 @@
+{
+  "format": "pose_point_depth_mv.holdout64_pose_mask_blind_protocol.v1",
+  "frozen_at_utc": "2026-08-10T08:46:53.692064+00:00",
+  "purpose": "Formal Holdout64 Pose+Mask/no-point blind addendum",
+  "blindness": {
+    "result_inspected_before_freeze": false,
+    "no_holdout_metric_log_mesh_screenshot_or_ranking_read": true,
+    "one_shot_joint_unblinding": true,
+    "old_fiveway_report_consumption_forbidden": true,
+    "intermediate_metric_printing_forbidden": true
+  },
+  "evaluation": {
+    "object_count": 64,
+    "object_order": "exact M11C reference-runtime object order",
+    "seeds": [
+      42
+    ],
+    "weights": "ema",
+    "amp_dtype": "bf16",
+    "ss_sampling": "exact checkpoint SLat-upstream binding",
+    "slat_sampling": {
+      "steps": 25,
+      "cfg_strength": 5.0,
+      "cfg_interval": [
+        0.5,
+        1.0
+      ],
+      "guidance_rescale": 0.0,
+      "rescale_t": 3.0
+    },
+    "point_pose_sampling_must_match": true,
+    "surface_samples": 20000,
+    "surface_seed_policy": "seed*1009 + sorted_pair_position*9173",
+    "primary_population": "all64",
+    "sensitivity_populations": [
+      "reliable",
+      "low_confidence"
+    ],
+    "gt_alignment_fit_allowed": false,
+    "pose_rebase": "O_posemask -> W -> O_reference",
+    "passed_semantics": "protocol and mesh completeness only"
+  },
+  "frozen_inputs": {
+    "holdout_split": {
+      "path": "/data/zjr/omni_real_video500_download_20260804_v2/D6_novel500_dev64_holdout64_v3_pilotfree_eval/holdout.json",
+      "sha256": "78a5dc044de5b5696725a9eb35c9538b22034b114ed112e1ba5a765023805d5c"
+    },
+    "raw_cache_report": {
+      "path": "/data/zjr/omni_real_video500_download_20260804_v2/M11B_holdout64_raw_cache_v1/raw_cache_report.json",
+      "sha256": "24415264a98a337c99d9e13cea1d3c94fcd84a5ea48f2ca429e9e35143089179"
+    },
+    "reference_runtime_manifest": {
+      "path": "/data/zjr/omni_real_video500_download_20260804_v2/M11C_holdout64_runtime_o_v1/runtime_input_manifest.json",
+      "sha256": "b6b3e3c7b4f754896e3dd03084b7d69b9c4a28f9828595092733198fb966ec1c"
+    },
+    "runtime_o_label_manifest": {
+      "path": "/data/zjr/omni_real_video500_download_20260804_v2/M11E_holdout64_mesh_o_labels_v1/runtime_o_label_manifest.json",
+      "sha256": "01478b7e42e044ca5bc3a44d895e268aae625a82fe9ff9e10d4a3484d923a798"
+    },
+    "mixed_no_vggt_ss_ema_checkpoint": {
+      "path": "/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_mixed_step2000_seed42_1gpu_v1/checkpoints/step_002000.pt",
+      "sha256": "7c036321e8d89c131a65f236ebe0df713c5bf7b95b84cd838b661be1fb09cd09"
+    },
+    "mixed_no_vggt_slat_ema_checkpoint": {
+      "path": "/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/slat_mixed_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt",
+      "sha256": "252b201ce3da91ffbd2cd145af70d47917061c30b0b20d35d55a2287a80c2d9d"
+    },
+    "ss_migration_contract": {
+      "path": "/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/contracts/ss_real_full_ema_v1.json",
+      "sha256": "9d6421788de233b40eafba5a99afb2eca496c83cd7268c95c1fb3493d60830ed"
+    },
+    "slat_migration_contract": {
+      "path": "/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/contracts/slat_real_full_ema_v1.json",
+      "sha256": "249bd206392ce70a2b3bc38db7588df523be369bb30e30b9f8ebe743214f5f81"
+    },
+    "stock_slat_freeze": {
+      "path": "/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json",
+      "sha256": "131f9612c736a57cf41ed2161ee102ce8bcab3b9f39fd1a2473ce7919b290bc6"
+    }
+  },
+  "required_existing_inference_manifests": {
+    "point_mask": "/data/zjr/omni_real_video500_download_20260804_v2/M11H_holdout64_native_no_vggt_mixed1244_seed42_v1/inference_manifest.json",
+    "real_adapted_native_v2_full": "/data/zjr/omni_real_video500_download_20260804_v2/M11I_holdout64_native_v2_realadapt_step1000_seed42_v1/inference_manifest.json",
+    "synthetic_parent_native_v2_full": "/data/zjr/omni_real_video500_download_20260804_v2/M11J_holdout64_native_v2_parent_seed42_v1/inference_manifest.json",
+    "reconviagen_original": "/data/zjr/omni_real_video500_download_20260804_v2/M11K_holdout64_reconviagen_original_seed42_v1/inference_manifest.json",
+    "pixal3d_official": "/data/zjr/omni_real_video500_download_20260804_v2/M11L_holdout64_pixal3d_official_seed42_v1/inference_manifest.json"
+  },
+  "result_outputs": {
+    "M11N_pose_mask_runtime": "/data/zjr/omni_real_video500_download_20260804_v2/M11N_holdout64_pose_mask_runtime_o_blind_v1",
+    "M11O_dino_only_model_inputs": "/data/zjr/omni_real_video500_download_20260804_v2/M11O_holdout64_pose_mask_dino_only_blind_v1",
+    "M11P_pose_mask_inference": "/data/zjr/omni_real_video500_download_20260804_v2/M11P_holdout64_pose_mask_no_vggt_mixed1244_seed42_blind_v1",
+    "M11Q_reference_o_rebase": "/data/zjr/omni_real_video500_download_20260804_v2/M11Q_holdout64_pose_mask_reference_o_seed42_blind_v1",
+    "M11R_joint_sixway_report": "/data/zjr/omni_real_video500_download_20260804_v2/M11R_holdout64_sixway_pose_mask_blind_addendum_v1"
+  },
+  "forbidden_inputs": {
+    "old_fiveway_report": "/data/zjr/omni_real_video500_download_20260804_v2/M11M_holdout64_fiveway_no_vggt_mixed1244_seed42_v1/report.json",
+    "point_cloud_fields": [
+      "P_W",
+      "P_O",
+      "point_confidence"
+    ],
+    "selection_inputs": [
+      "GT metrics",
+      "old meshes",
+      "rankings",
+      "screenshots"
+    ]
+  },
+  "implementation": {
+    "code_01": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/pose_mask_object_canonicalization.py",
+      "sha256": "3c2ed12c3f241decb90506b83b675c4d74f59cc1159789711eecb23135cf45b0"
+    },
+    "code_02": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/dataset_tools/prepare_omni_real_pose_mask_runtime_inputs.py",
+      "sha256": "9dc6b9d4b07bcc1d5c867864f1b9e43a19b91d10b4b2b42fe81f2605db20c92b"
+    },
+    "code_03": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/dataset_tools/prepare_omni_real_dino_only_model_inputs.py",
+      "sha256": "bb56bf9eba6243b4249f0150d5dbf7cac512d09e9fa5aa94164517a47cd33f56"
+    },
+    "code_04": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/infer_omni_real_native_no_vggt_mixed.py",
+      "sha256": "a102d96fee3d27cab1118c1c6047d5b430685d65fad73ca0ade9b7c108fb7098"
+    },
+    "code_05": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/rebase_pose_mask_inference_to_reference_o.py",
+      "sha256": "ef46a02ecf232ce6b83186c130f8da2f8ec39db1dcd950961c5827e4c8cc5711"
+    },
+    "code_06": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/evaluate_holdout64_pose_mask_blind_addendum.py",
+      "sha256": "5e7e0113ee336c3545c1e4b6825993485f82a3bc71c1bbbb7e819034179e6647"
+    },
+    "code_07": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/freeze_holdout64_pose_mask_blind_protocol.py",
+      "sha256": "17fe33955744d6bf6cb9e5c2e5a91013e4483557365519e458a6dd2bfeac8bfb"
+    },
+    "code_08": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/unblind_holdout64_pose_mask_addendum.py",
+      "sha256": "8cd4a20f4d7539e4d66e463ec5533359fc8dc04ca173b05bb8bc65e505203e02"
+    },
+    "code_09": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_holdout64_pose_mask_blind_addendum.sh",
+      "sha256": "5001097ff93119c90b5fd30956c2762a59ac3ab0893887e6f2c6bff2cc9070dc"
+    },
+    "commands": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/Holdout64_PoseMask无点云盲态补测命令_20260810.txt",
+      "sha256": "582679893b8e470af5670effa83a0b4ccb5d4787dfc25634181c1942ac4e3d01"
+    }
+  },
+  "passed": true,
+  "payload_sha256": "9ab722fd3fcace7bb8429a48e42ac20998137d3da55cdbb136eeb55fabb00081"
+}

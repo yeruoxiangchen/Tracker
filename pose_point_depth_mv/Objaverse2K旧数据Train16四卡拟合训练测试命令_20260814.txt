@@ -1,0 +1,88 @@
+目的
+====
+
+补做“先前 Objaverse2K 训练数据”的 Train16 拟合对照。它与当前官方
+ProObjaverse Train16 使用相同的 Stock 零初始化、condition+LoRA v2、200 step、
+uniform timestep、最多 8 个 condition views 和 global batch 8；主要变化只有
+target/data 来源。
+
+旧 cache 只有 Native-SS support seed 42，因此测试是单 seed 的训练重叠诊断，
+不能形成泛化或正式科学结论。
+
+
+O0. 当前卡分配
+===============
+
+截至 2026-08-14，GPU 0、1、4、5、6 空闲，2、3、7 被占用。默认使用
+0、1、4、5 四卡训练，grad_accum=2，所以 global batch 仍为 8。不要改成五卡，
+否则 global batch 会变化，破坏与官方 Train16 的控制变量。
+
+
+O1. 后台启动完整 Train16 训练和四卡评测
+==========================================
+
+cd /home/zjr/Tracker
+
+systemctl --user stop tracker-objaverse2k-train16-current-v1.service 2>/dev/null || true
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-train16-current-v1 \
+  --collect \
+  --property=Type=exec \
+  --setenv=OBJ2K_TRAIN16_GPUS=0,1,4,5 \
+  /bin/bash /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_train16_current_recipe_4gpu.sh
+
+echo "current terminal remains open"
+
+
+O2. 监视
+========
+
+watch -n 20 '
+date -u
+systemctl --user is-active tracker-objaverse2k-train16-current-v1.service || true
+tail -n 4 /data/zjr/objaverse2k_train16_current_recipe_20260814_v1/logs/train.log 2>/dev/null || true
+for i in 0 1 2 3; do
+  printf "eval worker %s records: " "${i}"
+  find /data/zjr/objaverse2k_train16_current_recipe_20260814_v1/eval_train16_B_condition_lora_step200_seed42_4gpu_v1/worker_${i}/records -name "*.json" 2>/dev/null | wc -l
+done
+'
+
+
+O3. 一次性状态检查
+===================
+
+systemctl --user status tracker-objaverse2k-train16-current-v1.service --no-pager || true
+cat /data/zjr/objaverse2k_train16_current_recipe_20260814_v1/logs/run.state 2>/dev/null || true
+cat /data/zjr/objaverse2k_train16_current_recipe_20260814_v1/logs/run.exit_code 2>/dev/null || true
+
+
+O4. 训练和评测完成后看结果
+===========================
+
+cat /data/zjr/objaverse2k_train16_current_recipe_20260814_v1/train16_fit_decision_v1/summary.txt
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+p="/data/zjr/objaverse2k_train16_current_recipe_20260814_v1/train16_fit_decision_v1/report.json"
+r=json.load(open(p))
+print(json.dumps({
+  "passed":r["passed"],
+  "objects":r["object_count"],
+  "checkpoint":r["checkpoint"],
+  "paired_improvement":r["paired_improvement"],
+  "decision":r["decision"],
+},indent=2,ensure_ascii=False))
+'
+
+判读：
+
+1. 若旧 Objaverse2K Train16 在 200 step 明显超过 Stock，而官方 Train16 也超过
+   Stock，说明小样本可拟合，旧 2135-object/2000-step 失败更像每对象更新预算不足、
+   target 域和规模训练问题，不是 condition+LoRA 完全不可学。
+2. 若旧 Train16 仍不能超过 Stock，而官方 Train16 能，则旧 local-rebuild target/
+   Native-SS support 数据合同是主要嫌疑。
+3. 若二者 Train16 都能过、扩大训练都不过，优先检查每对象 exposure、采样和规模化
+   优化，不应先继续增加结构复杂度。
+4. 该报告只有 seed42 且训练重叠；passed=true 只说明程序和配对协议完整，是否拟合成功
+   看 decision.fit_advantage_established。

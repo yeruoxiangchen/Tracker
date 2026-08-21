@@ -1,0 +1,164 @@
+Mixed no-VGGT SLat：Correct / LoRA-only / Pose-cyclic / Stock四路消融
+日期：2026-08-11 UTC
+==========================================================================
+
+实验边界
+--------
+
+模型固定为当前M8 mixed real376+synth868 no-VGGT SLat step2000 EMA。
+数据固定从M8训练时的mixed cache按对象1:1抽取synthetic和real；同一对象四路严格共享：
+
+  - M3预测的Native-SS support；
+  - initial SLat noise；
+  - 25-step sampler、CFG和冻结Mesh decoder；
+  - GT Mesh与20k表面采样seed。
+
+四路为：
+
+  stock         LoRA关闭、posed-DINO residual关闭；
+  lora_only     LoRA保留，每层posed-DINO residual连同projection bias精确置零；
+  pose_cyclic1  LoRA和residual保留，只循环错配相机pose；
+  correct       LoRA和residual保留，使用正确图像-pose绑定。
+
+注意：这个mixed cache就是M8训练cache，因此报告永久标记training_overlap=true、formal=false。
+它只回答当前checkpoint是否使用条件，不能证明未见对象泛化，也不能替代未来5K冻结测试。
+
+
+T0. CPU编译与单元测试
+=====================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/evaluate_mixed_no_vggt_slat_fourway.py \
+  pose_point_depth_mv/test_mixed_no_vggt_slat_fourway.py
+
+bash -n pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_fourway.sh
+
+"${PY}" -m unittest -v \
+  pose_point_depth_mv.test_mixed_no_vggt_slat_fourway
+
+
+T1. 先跑2+2对象四路GPU smoke
+=============================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+GPU=${GPU:-4}
+OUT=/data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/smoke_synth2_real2_seed42
+
+CUDA_VISIBLE_DEVICES="${GPU}" \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+"${PY}" -u -m pose_point_depth_mv.evaluate_mixed_no_vggt_slat_fourway \
+  --cache_manifest "${RUN}/manifests/mixed_slat_synth868_real376_v1.json" \
+  --lifting_cache_manifest "${RUN}/manifests/mixed_ss_lifting_synth868_real376_v1.json" \
+  --checkpoint "${RUN}/slat_mixed_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt" \
+  --migration_contract "${RUN}/contracts/slat_real_full_ema_v1.json" \
+  --stock_slat_freeze \
+    /data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json \
+  --output_dir "${OUT}" \
+  --weights ema \
+  --objects_per_domain 2 \
+  --selection_seed 20260811 \
+  --noise_seed 42 \
+  --surface_samples 20000 \
+  --bootstrap_samples 1000 \
+  --amp_dtype bf16
+
+T1_RC=$?
+echo "T1_RC=${T1_RC}"
+test "${T1_RC}" -eq 0 && sed -n '1,180p' "${OUT}/summary.txt"
+echo "current terminal remains open"
+
+# 如果T1因SSH/进程中断留下partial，检查目录后给同一命令末尾增加 --resume；
+# 不要删除已经完成且hash匹配的分支Mesh/result.json。
+# Mesh decoder固定在SLat bf16采样autocast之外以fp32执行，避免Cube2Mesh
+# scatter_reduce的fp32累加buffer与bf16 src dtype不匹配。
+
+
+T2. 后台运行16+16对象四路主机制诊断
+=====================================
+
+cd /home/zjr/Tracker
+GPU=${GPU:-4}
+OBJECTS_PER_DOMAIN=${OBJECTS_PER_DOMAIN:-16}
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-slat-fourway-${OBJECTS_PER_DOMAIN}x2 \
+  /data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/logs/fourway_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}.log \
+  /data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/logs/fourway_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}.pid \
+  env MIXED_SLAT_FOURWAY_GPU="${GPU}" \
+      MIXED_SLAT_FOURWAY_OBJECTS_PER_DOMAIN="${OBJECTS_PER_DOMAIN}" \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_fourway.sh
+
+T2_LAUNCH_RC=$?
+echo "T2_LAUNCH_RC=${T2_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 监视；Ctrl-C只退出tail，不会停止后台任务：
+# tail -f /data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/logs/fourway_synth16_real16.log
+#
+# 状态：
+# cat /data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/logs/fourway_synth16_real16.state
+# cat /data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/logs/fourway_synth16_real16.exit_code
+#
+# 中断恢复：原样重跑T2。后台脚本自动增加--resume，并复用hash匹配的分支结果。
+
+
+T3. 只查看完整报告中的四个主差值
+==================================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OBJECTS_PER_DOMAIN=${OBJECTS_PER_DOMAIN:-16}
+REPORT=/data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}_seed42/report.json
+
+"${PY}" - "${REPORT}" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["passed"] is True
+assert p["formal"] is False and p["training_overlap"] is True
+for group in ("synthetic", "real", "mixed_macro_1to1"):
+    print("\n["+group+"]")
+    rows=p["summary"]["comparisons"][group]
+    for name in (
+        "total_trained_slat",
+        "posed_dino_increment",
+        "correct_pose_specificity",
+        "generic_lora_increment",
+    ):
+        r=rows[name]
+        print(name, json.dumps({
+            "left":r["left"], "right":r["right"],
+            "chamfer":r["metrics"]["chamfer_l1"],
+            "fscore_0p02":r["metrics"]["fscore_0p02"],
+            "normal":r["metrics"]["normal_consistency"],
+        }, ensure_ascii=False))
+PY
+
+T3_RC=$?
+echo "T3_RC=${T3_RC}; current terminal remains open"
+
+
+判读
+----
+
+所有paired improvement均为正值表示左侧更好：
+
+  total_trained_slat       correct - stock，全部SLat训练增量；
+  posed_dino_increment     correct - lora_only，3D条件净增量；
+  correct_pose_specificity correct - pose_cyclic1，正确pose绑定净增量；
+  generic_lora_increment   lora_only - stock，通用LoRA增量。
+
+只有correct同时超过lora_only和pose_cyclic1，才能说条件在当前checkpoint中实际发挥作用。
+如果correct只超过stock、却不超过lora_only/pose_cyclic1，应解释为通用LoRA收益，不是
+pose-aware条件收益。synthetic和real必须分别报告；mixed_macro_1to1不能掩盖任一域反向。

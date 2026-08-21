@@ -1,0 +1,404 @@
+用途
+====
+
+这不是直接重训最终模型，而是先回答当前 SLat 失败到底来自哪里：
+
+  官方 RGBA + 官方 pose + 官方 SLat target
+                    |
+                    +--> Stock（不训练）
+                    +--> condition-only（posed-DINO every-block，完全无 LoRA）
+                    +--> condition + small LoRA（同一 v2 结构，rank=8）
+
+关键控制：
+
+  - 三路都在官方 SLat 的 GT sparse coordinates 上采样；不运行 Native SS。
+  - target Mesh 是“官方 SLat 经过冻结 Stock Mesh decoder”的输出。
+  - Stock/Full 同坐标、同噪声、同 sampler、同 decoder。
+  - 官方 JSON 虽将字段命名为 extrinsic，其语义是 C2W；缓存端显式
+    转换为本项目投影器需要的 W2C，这个契约也被写入缓存身份。
+  - 两个训练臂都用 uniform timestep；不加 decoder geometry loss，不加 rollout。
+  - 首轮直接复制审计第141.4章的training-overlap隔离评测：在参与训练的
+    同一16个对象上检查Full是否超过frozen Stock。
+  - 首轮不跑dev64，也不用泛化门否决模块可学性。
+
+2000 对固定拆分：train=1872，dev=64，predicted-support bridge=32，
+decoder audit=32。四组对象完全不重叠。首轮只编码train16，不编码dev64，
+也不能一上来跑完1872。
+
+
+P0. 静态检查与单元测试（CPU，约十几秒）
+=========================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+${PY} -m py_compile \
+  pose_point_depth_mv/proobjaverse_official_slat_protocol.py \
+  pose_point_depth_mv/audit_proobjaverse_official_slat_decoder.py \
+  pose_point_depth_mv/prepare_proobjaverse_official_slat_dino_cache.py \
+  pose_point_depth_mv/proobjaverse_official_slat_training.py \
+  pose_point_depth_mv/train_proobjaverse_official_slat_condition_only.py \
+  pose_point_depth_mv/train_proobjaverse_official_slat_condition_lora.py \
+  pose_point_depth_mv/evaluate_proobjaverse_official_slat_gt_support.py \
+  pose_point_depth_mv/summarize_proobjaverse_official_slat_arms.py \
+  pose_point_depth_mv/train_native_slat_genrecon.py
+
+${PY} -m unittest -v \
+  pose_point_depth_mv.test_proobjaverse_official_slat_protocol
+
+echo "current terminal remains open"
+
+
+P1. 冻结当前已完成的前 2000 对（CPU，数秒）
+============================================
+
+下载报告 completed_pair_count 不足 2000 时，本段返回 3，不会建立半成品协议。
+达到 2000 后，后续继续下载不会改变本协议。
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+DATA=/data/zjr/ProObjaverse-300K-ReconViaGen-5K
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+PROTOCOL=${RUN}/protocol2000_v1
+
+${PY} -u -m pose_point_depth_mv.proobjaverse_official_slat_protocol freeze \
+  --data_root "${DATA}" \
+  --selection "${DATA}/selection.json" \
+  --output_dir "${PROTOCOL}" \
+  --pair_count 2000 \
+  --seed 20260813
+
+echo "protocol: ${PROTOCOL}/protocol.json"
+echo "current terminal remains open"
+
+
+P2. 审计首轮 Train16 的官方 NPZ、tar 和相机矩阵（CPU）
+================================================================
+
+首轮只审计和消费实际参加训练的前16对。冻结2000对用于保持未来拆分
+不变，不代表现在就要扫描train1872/dev64/bridge32。
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+PROTOCOL=${RUN}/protocol2000_v1
+
+${PY} -u -m pose_point_depth_mv.proobjaverse_official_slat_protocol audit \
+  --split_manifest "${PROTOCOL}/train.json" \
+  --output "${RUN}/cpu_audit_train16.json" \
+  --max_objects 16
+
+echo "current terminal remains open"
+
+
+P3. 冻结 Stock decoder 审计官方 target 32（单 GPU）
+===================================================
+
+输出 32 个 decoded official target OBJ。这里不和 source GLB 比；目的是确认官方
+latent 在我们冻结的 Stock decoder 中全部可解码，并给 GT-support 实验定义 target。
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-6}
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+PROTOCOL=${RUN}/protocol2000_v1
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+AUDIT=${RUN}/decoder_audit32_v1
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+${PY} -u -m pose_point_depth_mv.audit_proobjaverse_official_slat_decoder \
+  --split_manifest "${PROTOCOL}/decoder_audit.json" \
+  --stock_slat_freeze "${STOCK_FREEZE}" \
+  --output_dir "${AUDIT}" \
+  --max_objects 32
+
+echo "decoder audit: ${AUDIT}/report.json"
+echo "current terminal remains open"
+
+
+P4A. 预计算首轮 Train16 posed-DINO/官方 target 缓存（单 GPU）
+===========================================================
+
+Native SS 在这里仅作为未来部署版本的绑定，不会执行，也不会生成 support。
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-6}
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+PROTOCOL=${RUN}/protocol2000_v1
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+CACHE=${RUN}/cache_train16_views8_v1
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+${PY} -u -m pose_point_depth_mv.prepare_proobjaverse_official_slat_dino_cache \
+  --split_manifest "${PROTOCOL}/train.json" \
+  --native_ss_report "${SS_REPORT}" \
+  --stock_slat_freeze "${STOCK_FREEZE}" \
+  --output_dir "${CACHE}" \
+  --selected_views 8 \
+  --max_objects 16
+
+echo "train cache: ${CACHE}/slat_manifest.json"
+echo "current terminal remains open"
+
+
+P4B. 当前不运行Dev
+=====================
+
+本文档当前只做第141.4章式Train16拟合诊断。Dev64、Dev16和
+predicted_support_bridge32都不在首轮消费。
+
+
+P5A. Train16 condition-only / uniform / 400 step（两 GPU）
+=========================================================
+
+这个臂完全没有 SLat attention LoRA。decoder/trust/rollout 权重全部为零。
+
+cd /home/zjr/Tracker
+
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+TRAIN_GPUS=${TRAIN_GPUS:-4,5}
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+CACHE=${RUN}/cache_train16_views8_v1
+AUDIT=${RUN}/decoder_audit32_v1/report.json
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+OUT=${RUN}/A_condition_only_train16_step200_seed42_2gpu_v1
+
+CUDA_VISIBLE_DEVICES=${TRAIN_GPUS} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+${TORCHRUN} --standalone --nproc_per_node=2 \
+  -m pose_point_depth_mv.train_proobjaverse_official_slat_condition_only \
+  --cache_manifest "${CACHE}/slat_manifest.json" \
+  --lifting_cache_manifest "${CACHE}/lifting_manifest.json" \
+  --target_decoder_audit "${AUDIT}" \
+  --native_ss_report "${SS_REPORT}" \
+  --stock_slat_freeze "${STOCK_FREEZE}" \
+  --output_dir "${OUT}" \
+  --max_steps 200 \
+  --save_every 50 \
+  --log_every 10 \
+  --grad_accum 4 \
+  --seed 42 \
+  --condition_lr 1e-4 \
+  --condition_weight_decay 0.01 \
+  --warmup_ratio 0.02 \
+  --ema_decay 0.9995 \
+  --p_uncond 0.1 \
+  --t_schedule uniform \
+  --separate_t_rng \
+  --decoder_geometry_weight 0 \
+  --stock_flow_trust_weight 0 \
+  --stock_trust_weight 0 \
+  --min_condition_views 1 \
+  --max_condition_views 8 \
+  --amp_dtype bf16 \
+  --gradient_checkpointing
+
+echo "current terminal remains open"
+
+
+P5B. Train16 condition + small LoRA / uniform / 400 step（两 GPU）
+================================================================
+
+除新增 rank=8 attention LoRA 外，数据、视图、timestep、训练步数与 P5A 相同。
+
+cd /home/zjr/Tracker
+
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+TRAIN_GPUS=${TRAIN_GPUS:-1,2,3,4}
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+CACHE=${RUN}/cache_train16_views8_v1
+AUDIT=${RUN}/decoder_audit32_v1/report.json
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+OUT=${RUN}/B_condition_lora_train16_step200_seed42_2gpu_v1
+
+CUDA_VISIBLE_DEVICES=${TRAIN_GPUS} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+${TORCHRUN} --standalone --nproc_per_node=4 \
+  -m pose_point_depth_mv.train_proobjaverse_official_slat_condition_lora \
+  --architecture v2 \
+  --cache_manifest "${CACHE}/slat_manifest.json" \
+  --lifting_cache_manifest "${CACHE}/lifting_manifest.json" \
+  --target_decoder_audit "${AUDIT}" \
+  --native_ss_report "${SS_REPORT}" \
+  --stock_slat_freeze "${STOCK_FREEZE}" \
+  --output_dir "${OUT}" \
+  --max_steps 200 \
+  --save_every 50 \
+  --log_every 10 \
+  --grad_accum 2 \
+  --seed 42 \
+  --lora_rank 8 \
+  --lora_alpha 16 \
+  --new_lr 1e-4 \
+  --lora_lr 3e-5 \
+  --new_weight_decay 0.01 \
+  --warmup_ratio 0.02 \
+  --ema_decay 0.9995 \
+  --p_uncond 0.1 \
+  --t_schedule uniform \
+  --min_condition_views 1 \
+  --max_condition_views 8 \
+  --amp_dtype bf16 \
+  --gradient_checkpointing
+
+echo "current terminal remains open"
+
+
+P6A. 在同一Train16上测condition-only-vs-Stock（单GPU，3 seed）
+======================================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-6}
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+CACHE=${RUN}/cache_train16_views8_v1
+CKPT=${RUN}/A_condition_only_train16_step200_seed42_2gpu_v1/checkpoints/step_000200.pt
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+OUT=${RUN}/eval_train16_A_condition_only_step200_seed424344_v1
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_slat_gt_support \
+  --arm condition_only \
+  --cache_manifest "${CACHE}/slat_manifest.json" \
+  --lifting_cache_manifest "${CACHE}/lifting_manifest.json" \
+  --checkpoint "${CKPT}" \
+  --native_ss_report "${SS_REPORT}" \
+  --stock_slat_freeze "${STOCK_FREEZE}" \
+  --output_dir "${OUT}" \
+  --weights ema \
+  --joint_seeds 42,43,44 \
+  --max_objects 16 \
+  --surface_samples 20000
+
+echo "report: ${OUT}/report.json"
+echo "current terminal remains open"
+
+
+P6B. 在同一Train16上测condition+LoRA-vs-Stock（单GPU，3 seed）
+======================================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-6}
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+CACHE=${RUN}/cache_train16_views8_v1
+CKPT=${RUN}/B_condition_lora_train16_step200_seed42_2gpu_v1/checkpoints/step_000200.pt
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+OUT=${RUN}/eval_train16_B_condition_lora_step200_seed424344_v1
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_slat_gt_support \
+  --arm condition_lora \
+  --cache_manifest "${CACHE}/slat_manifest.json" \
+  --lifting_cache_manifest "${CACHE}/lifting_manifest.json" \
+  --checkpoint "${CKPT}" \
+  --native_ss_report "${SS_REPORT}" \
+  --stock_slat_freeze "${STOCK_FREEZE}" \
+  --output_dir "${OUT}" \
+  --weights ema \
+  --joint_seeds 42,43,44 \
+  --max_objects 16 \
+  --surface_samples 20000
+
+echo "report: ${OUT}/report.json"
+echo "current terminal remains open"
+
+
+P7. Train16 training-overlap拟合裁决（CPU）
+============================================
+
+退出码 3 表示两臂在同一Train16上都未越过 Stock 拟合门，
+应停止 rollout；不是程序崩溃。这一门不是显著性检验：要求
+Chamfer improvement的均值>0、中位数>0、对象胜率>=10/16。
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+RUN=/data/zjr/proobjaverse_official_slat_target2000_20260813_v1
+
+${PY} -u -m pose_point_depth_mv.summarize_proobjaverse_official_slat_arms \
+  --condition_only_report \
+    "${RUN}/eval_train16_A_condition_only_step200_seed424344_v1/report.json" \
+  --condition_lora_report \
+    "${RUN}/eval_train16_B_condition_lora_step200_seed424344_v1/report.json" \
+  --expected_split train \
+  --expected_objects 16 \
+  --output "${RUN}/train16_fit_two_arm_decision_v1/report.json"
+
+P7_RC=$?
+echo "P7_RC=${P7_RC}（3=停止该路线，不是崩溃）"
+echo "current terminal remains open"
+
+
+P8. P7之后怎样解释和扩展
+=======================
+
+1. condition-only在Train16上 > Stock，且LoRA没有增量：
+   说明官方target/posed-DINO通路至少能拟合，LoRA暂不必要。
+
+2. condition-only在Train16上不过门，但condition+LoRA > Stock：
+   说明纯condition容量不足，LoRA对训练集拟合是必要的。
+
+3. 两者在Train16上都不如Stock：
+   这复现第141.4章“训练对象上都没学到decoder后表面收益”的问题。
+   官方target和GT support已排除本地target与Native-SS predicted support；
+   应查pose投影、condition容量和flow目标，不加rollout。
+
+4. P7 selected_arm非空只表示“训练拟合门通过”：
+
+   - 不构成泛化证据；
+   - 只扩被选中的一个arm，不同时长训两臂；
+   - 后续是否扩到train1872、再建对象互斥的泛化评测，单独决策；
+   - 本轮不运行dev64，不消费predicted_support_bridge32。

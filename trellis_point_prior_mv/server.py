@@ -7,6 +7,7 @@ import sys
 import re
 import logging
 import math
+import threading
 from flask import Flask, request, jsonify, send_from_directory
 import cv2
 import numpy as np
@@ -46,6 +47,7 @@ current_mask_dir = MASK_ROOT
 current_review_dir = REVIEW_ROOT
 current_seg_points = []
 current_seed_frames = set()
+_CURRENT_SESSION_LOCK = threading.RLock()
 
 for path in [TRACKER_ROOT, COARSE_CONNECT_DIR, COARSEMODEL_DIR, COARSE_CORE_DIR, RECONVIAGEN_DIR]:
     if path not in sys.path:
@@ -73,58 +75,96 @@ def _make_session_id():
     return f"{time.strftime('%Y%m%d_%H%M%S')}_{int((time.time() % 1) * 1000):03d}"
 
 
-def _set_current_session(session_id, reset_points=False):
+def _atomic_write_json(path, payload):
+    """Publish JSON without exposing a truncated intermediate file."""
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = (
+        f"{path}.tmp-{os.getpid()}-{threading.get_ident()}-"
+        f"{time.time_ns()}"
+    )
+    try:
+        with open(temporary, "w") as f:
+            json.dump(payload, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _set_current_session(session_id, reset_points=False, _persist=True):
     global current_session_id, current_data_dir, current_preview_dir, current_mask_dir, current_review_dir
     global current_seg_points, current_seed_frames, frame_counter
-    current_session_id = _safe_dataset_name(session_id)
-    current_data_dir = os.path.join(DATA_ROOT, current_session_id)
-    current_preview_dir = os.path.join(PREVIEW_ROOT, current_session_id)
-    current_mask_dir = os.path.join(MASK_ROOT, current_session_id)
-    current_review_dir = os.path.join(REVIEW_ROOT, current_session_id)
-    for d in [current_data_dir, current_preview_dir, current_mask_dir, current_review_dir, OUTPUT_DIR, FLAG_DIR]:
-        os.makedirs(d, exist_ok=True)
-    if reset_points:
-        current_seg_points = []
-        current_seed_frames = set()
-    else:
-        _load_seg_points()
-        _load_seed_frames()
+    with _CURRENT_SESSION_LOCK:
+        current_session_id = _safe_dataset_name(session_id)
+        current_data_dir = os.path.join(DATA_ROOT, current_session_id)
+        current_preview_dir = os.path.join(PREVIEW_ROOT, current_session_id)
+        current_mask_dir = os.path.join(MASK_ROOT, current_session_id)
+        current_review_dir = os.path.join(REVIEW_ROOT, current_session_id)
+        for d in [current_data_dir, current_preview_dir, current_mask_dir, current_review_dir, OUTPUT_DIR, FLAG_DIR]:
+            os.makedirs(d, exist_ok=True)
+        if reset_points:
+            current_seg_points = []
+            current_seed_frames = set()
+        else:
+            _load_seg_points()
+            _load_seed_frames()
 
-    with open(FLAG_CURRENT_SESSION, "w") as f:
-        json.dump(
-            {
-                "session_id": current_session_id,
-                "data_dir": current_data_dir,
-                "preview_dir": current_preview_dir,
-                "mask_dir": current_mask_dir,
-                "review_dir": current_review_dir,
-            },
-            f,
-            indent=4,
-        )
-    existing_ids = []
-    for name in os.listdir(current_data_dir):
-        match = re.match(r"frame_(\d+)\.(jpg|jpeg|png)$", name, re.IGNORECASE)
-        if match:
-            existing_ids.append(int(match.group(1)))
-    frame_counter = max(existing_ids) + 1 if existing_ids else 0
-    return current_session_id
+        if _persist:
+            _atomic_write_json(
+                FLAG_CURRENT_SESSION,
+                {
+                    "session_id": current_session_id,
+                    "data_dir": current_data_dir,
+                    "preview_dir": current_preview_dir,
+                    "mask_dir": current_mask_dir,
+                    "review_dir": current_review_dir,
+                },
+            )
+        existing_ids = []
+        for name in os.listdir(current_data_dir):
+            match = re.match(r"frame_(\d+)\.(jpg|jpeg|png)$", name, re.IGNORECASE)
+            if match:
+                existing_ids.append(int(match.group(1)))
+        frame_counter = max(existing_ids) + 1 if existing_ids else 0
+        return current_session_id
 
 
 def _load_current_session():
     global current_mask_dir, current_review_dir
-    if os.path.exists(FLAG_CURRENT_SESSION):
-        with open(FLAG_CURRENT_SESSION, "r") as f:
-            data = json.load(f)
-        _set_current_session(data["session_id"])
-        current_mask_dir = data.get("mask_dir") or os.path.join(MASK_ROOT, data["session_id"])
-        current_review_dir = data.get("review_dir") or os.path.join(REVIEW_ROOT, data["session_id"])
-        os.makedirs(current_mask_dir, exist_ok=True)
-        os.makedirs(current_review_dir, exist_ok=True)
-        _load_seg_points()
-        _load_seed_frames()
-    elif current_session_id is None:
-        _set_current_session(_make_session_id(), reset_points=True)
+    with _CURRENT_SESSION_LOCK:
+        if os.path.exists(FLAG_CURRENT_SESSION):
+            data = None
+            last_error = None
+            for _ in range(4):
+                try:
+                    with open(FLAG_CURRENT_SESSION, "r") as f:
+                        data = json.load(f)
+                    break
+                except (json.JSONDecodeError, OSError) as error:
+                    last_error = error
+                    time.sleep(0.02)
+            if data is None:
+                # Recover a legacy partially-written flag only when this
+                # process still owns a valid in-memory session.
+                if current_session_id is not None:
+                    return _set_current_session(
+                        current_session_id, _persist=True
+                    )
+                raise last_error
+            # Loading is read-only: do not truncate/rewrite the flag on every
+            # frame lookup.  RLock keeps the directory globals coherent.
+            _set_current_session(data["session_id"], _persist=False)
+            current_mask_dir = data.get("mask_dir") or os.path.join(MASK_ROOT, data["session_id"])
+            current_review_dir = data.get("review_dir") or os.path.join(REVIEW_ROOT, data["session_id"])
+            os.makedirs(current_mask_dir, exist_ok=True)
+            os.makedirs(current_review_dir, exist_ok=True)
+            _load_seg_points()
+            _load_seed_frames()
+        elif current_session_id is None:
+            _set_current_session(_make_session_id(), reset_points=True)
 
 
 def _list_session_images():
@@ -299,42 +339,49 @@ def _seed_frames_path():
 
 def _load_seg_points():
     global current_seg_points
-    path = _seg_points_path()
-    if not os.path.exists(path):
-        current_seg_points = []
-        return
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        current_seg_points = data.get("points", [])
-    except Exception:
-        current_seg_points = []
+    with _CURRENT_SESSION_LOCK:
+        path = _seg_points_path()
+        if not os.path.exists(path):
+            current_seg_points = []
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            current_seg_points = data.get("points", [])
+        except Exception:
+            current_seg_points = []
 
 
 def _load_seed_frames():
     global current_seed_frames
-    path = _seed_frames_path()
-    if not os.path.exists(path):
-        current_seed_frames = set()
-        return
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        current_seed_frames = set(int(i) for i in data.get("seed_frames", []))
-    except Exception:
-        current_seed_frames = set()
+    with _CURRENT_SESSION_LOCK:
+        path = _seed_frames_path()
+        if not os.path.exists(path):
+            current_seed_frames = set()
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            current_seed_frames = set(int(i) for i in data.get("seed_frames", []))
+        except Exception:
+            current_seed_frames = set()
 
 
 def _save_seg_points():
-    os.makedirs(current_mask_dir, exist_ok=True)
-    with open(_seg_points_path(), "w") as f:
-        json.dump({"points": current_seg_points}, f, indent=4)
+    with _CURRENT_SESSION_LOCK:
+        os.makedirs(current_mask_dir, exist_ok=True)
+        _atomic_write_json(
+            _seg_points_path(), {"points": list(current_seg_points)}
+        )
 
 
 def _save_seed_frames():
-    os.makedirs(current_mask_dir, exist_ok=True)
-    with open(_seed_frames_path(), "w") as f:
-        json.dump({"seed_frames": sorted(current_seed_frames)}, f, indent=4)
+    with _CURRENT_SESSION_LOCK:
+        os.makedirs(current_mask_dir, exist_ok=True)
+        _atomic_write_json(
+            _seed_frames_path(),
+            {"seed_frames": sorted(current_seed_frames)},
+        )
 
 
 def _run_interactive_segmentation():
@@ -450,6 +497,12 @@ def _prepare_coarsemodel_dataset(selected_indices, recon_output_dir=None):
     pose_path = os.path.join(current_data_dir, "poses.txt")
     if os.path.exists(pose_path):
         shutil.copy2(pose_path, os.path.join(dataset_dir, "poses.txt"))
+    frame_metadata_path = os.path.join(current_data_dir, "frame_metadata.jsonl")
+    if os.path.exists(frame_metadata_path):
+        shutil.copy2(
+            frame_metadata_path,
+            os.path.join(dataset_dir, "frame_metadata.jsonl"),
+        )
 
     meta = {
         "dataset_name": dataset_name,
@@ -539,6 +592,18 @@ def _read_phone_poses(pose_path):
                 "quat": None,
                 "intrinsics": None,
                 "image_transform": "unknown",
+                "cpu_image_timestamp_s": None,
+                "camera_frame_timestamp_ns": None,
+                "pose_sample_realtime_s": None,
+                "camera_frame_timestamp_delta_s": None,
+                "pose_binding": "legacy_unversioned",
+                "screen_orientation": "unknown",
+                "tracking_state": "unknown",
+                "display_matrix": None,
+                "projection_matrix": None,
+                "pose_coordinate_frame": "legacy_unversioned",
+                "capture_anchor_tracking_state": "unknown",
+                "strictly_synchronized": False,
             }
 
             if len(parts) >= 11:
@@ -568,6 +633,38 @@ def _read_phone_poses(pose_path):
             elif len(parts) >= 19:
                 # Compatibility for pose logs written by the previous phone client.
                 pose["image_transform"] = "MirrorY"
+
+            if len(parts) > 22:
+                pose["cpu_image_timestamp_s"] = _parse_float(parts[22])
+            if len(parts) > 23:
+                pose["camera_frame_timestamp_ns"] = _parse_int(parts[23])
+            if len(parts) > 24:
+                pose["pose_sample_realtime_s"] = _parse_float(parts[24])
+            if len(parts) > 25:
+                pose["camera_frame_timestamp_delta_s"] = _parse_float(parts[25])
+            if len(parts) > 26 and parts[26]:
+                pose["pose_binding"] = parts[26]
+            if len(parts) > 27 and parts[27]:
+                pose["screen_orientation"] = parts[27]
+            if len(parts) > 28 and parts[28]:
+                pose["tracking_state"] = parts[28]
+            if len(parts) > 29 and parts[29]:
+                pose["display_matrix"] = parts[29]
+            if len(parts) > 30 and parts[30]:
+                pose["projection_matrix"] = parts[30]
+            if len(parts) > 31 and parts[31]:
+                pose["pose_coordinate_frame"] = parts[31]
+            if len(parts) > 32 and parts[32]:
+                pose["capture_anchor_tracking_state"] = parts[32]
+            delta = pose["camera_frame_timestamp_delta_s"]
+            pose["strictly_synchronized"] = bool(
+                pose["pose_binding"] in {
+                    "camera_frame_received",
+                    "camera_frame_received_anchor_a0_relative_v1",
+                }
+                and delta is not None
+                and 0.0 <= delta <= 0.05
+            )
 
             poses[frame_name] = pose
 
@@ -957,6 +1054,44 @@ def upload():
         cpu_image_width = request.form.get('cpu_image_width', '')
         cpu_image_height = request.form.get('cpu_image_height', '')
         image_transform = request.form.get('image_transform', 'unknown')
+        cpu_image_timestamp_s = request.form.get('cpu_image_timestamp_s', '')
+        camera_frame_timestamp_ns = request.form.get('camera_frame_timestamp_ns', '')
+        pose_sample_realtime_s = request.form.get('pose_sample_realtime_s', '')
+        camera_frame_timestamp_delta_s = request.form.get('camera_frame_timestamp_delta_s', '')
+        pose_binding = request.form.get('pose_binding', 'legacy_unversioned')
+        pose_coordinate_frame = request.form.get(
+            'pose_coordinate_frame', 'legacy_unversioned'
+        )
+        capture_anchor_tracking_state = request.form.get(
+            'capture_anchor_tracking_state', 'unknown'
+        )
+        screen_orientation = request.form.get('screen_orientation', 'unknown')
+        tracking_state = request.form.get('tracking_state', 'unknown')
+        display_matrix = request.form.get('display_matrix', '')
+        projection_matrix = request.form.get('projection_matrix', '')
+        capture_view_policy = request.form.get(
+            'capture_view_policy', 'legacy_fixed_interval_unrecorded'
+        )
+        capture_target = [
+            _parse_float(request.form.get(f'capture_target_{axis}', ''))
+            for axis in ('x', 'y', 'z')
+        ]
+        capture_direction = [
+            _parse_float(request.form.get(f'capture_direction_{axis}', ''))
+            for axis in ('x', 'y', 'z')
+        ]
+        capture_minimum_angle_degrees = _parse_float(
+            request.form.get('capture_minimum_angle_degrees', '')
+        )
+        capture_angle_threshold_degrees = _parse_float(
+            request.form.get('capture_angle_threshold_degrees', '')
+        )
+        capture_accepted_ordinal = _parse_int(
+            request.form.get('capture_accepted_ordinal', '')
+        )
+        capture_recommended_candidate_count = _parse_int(
+            request.form.get('capture_recommended_candidate_count', '')
+        )
 
         img_bytes = request.files['image'].read()
         img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -973,8 +1108,50 @@ def upload():
                 f"{quat_x},{quat_y},{quat_z},{quat_w},"
                 f"{fx},{fy},{cx},{cy},{intrinsic_width},{intrinsic_height},"
                 f"{upload_image_width or image_width},{upload_image_height or image_height},"
-                f"{cpu_image_width},{cpu_image_height},{image_transform}\n"
+                f"{cpu_image_width},{cpu_image_height},{image_transform},"
+                f"{cpu_image_timestamp_s},{camera_frame_timestamp_ns},{pose_sample_realtime_s},"
+                f"{camera_frame_timestamp_delta_s},{pose_binding},{screen_orientation},"
+                f"{tracking_state},{display_matrix},{projection_matrix},"
+                f"{pose_coordinate_frame},{capture_anchor_tracking_state}\n"
             )
+
+        frame_metadata = {
+            "schema": "arpose_tracker_frame_metadata_v3",
+            "frame_name": frame_name,
+            "frame_index": int(frame_counter),
+            "cpu_image_timestamp_s": _parse_float(cpu_image_timestamp_s),
+            "camera_frame_timestamp_ns": _parse_int(camera_frame_timestamp_ns),
+            "pose_sample_realtime_s": _parse_float(pose_sample_realtime_s),
+            "camera_frame_timestamp_delta_s": _parse_float(camera_frame_timestamp_delta_s),
+            "pose_binding": pose_binding,
+            "pose_coordinate_frame": pose_coordinate_frame,
+            "capture_anchor_tracking_state": capture_anchor_tracking_state,
+            "screen_orientation": screen_orientation,
+            "tracking_state": tracking_state,
+            "image_transform": image_transform,
+            "display_matrix": display_matrix or None,
+            "projection_matrix": projection_matrix or None,
+            "uploaded_image_size": [int(image_width), int(image_height)],
+            "cpu_image_size": [_parse_int(cpu_image_width), _parse_int(cpu_image_height)],
+            "intrinsics_resolution": [_parse_int(intrinsic_width), _parse_int(intrinsic_height)],
+            "pose_diverse_capture": {
+                "policy": capture_view_policy,
+                "provisional_object_center_W": capture_target,
+                "object_to_camera_direction_W": capture_direction,
+                "minimum_angle_to_previously_accepted_degrees": (
+                    capture_minimum_angle_degrees
+                ),
+                "acceptance_threshold_degrees": capture_angle_threshold_degrees,
+                "accepted_ordinal_zero_based": capture_accepted_ordinal,
+                "recommended_candidate_count": capture_recommended_candidate_count,
+                "role": (
+                    "online redundancy gate only; final runtime-O view selection "
+                    "uses the segmented object-centred spherical farthest policy"
+                ),
+            },
+        }
+        with open(os.path.join(current_data_dir, "frame_metadata.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(frame_metadata, ensure_ascii=False) + "\n")
 
         try:
             append_slam_points_from_upload(

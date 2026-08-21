@@ -1,0 +1,1427 @@
+ReconVGGT AR point-prior 学习路线重新校对与下一步实验建议
+日期：2026-07-10
+
+一、最重要的结论
+================
+
+当前值得保留的主方向是：
+
+  frozen ReconViaGen / VGGT
+    -> frozen sparse_structure_vggt_cond（get_ss_cond）
+    -> cond_base [B, 4096, 1024]
+    -> AR point / pose / mask 构造的物理 16^3 特征
+    -> 可训练 SS-condition residual adapter
+    -> cond_base + delta_cond
+    -> frozen stock TRELLIS sparse flow
+    -> sparse coordinates
+    -> 原 ReconViaGen SLAT / mesh
+    -> pose-based rerank / CoarseModel 对齐与形变
+
+这个注入位置是合理的：它比早期在 VGGT aggregated tokens 上加小 bias 更直接地作用于 sparse topology，
+同时还能保留 ReconViaGen 和 TRELLIS 的原始生成 prior。
+
+但是，当前 B5.8 不能继续按原命令直接跑 s20。原因不是训练步数不够，而是代码和监督定义仍有三项基础问题：
+
+  1. physical 16^3 feature 与 TRELLIS 4096 个 SS token 的空间行序已经确认存在 x/z 交换；
+  2. positive / negative loss mask 几乎完全重叠，同一个 token 被同时要求提高和降低 occupancy；
+  3. 当前 proxy_loss_mode=lowrank_gate 并不经过 sparse flow / decoder，rank basis 的物理方向主要仍由随机初始化决定。
+
+因此，B5.8 s5 只能证明 safe-norm 修复后“优化器可以更新”，不能证明 physical point-prior adapter 已经学会改善几何。
+
+下一步应先做 B5.9 空间映射与标签校准，再做 eval-only candidate sanity；只有 sanity 跨 session、跨 seed 成立，
+才进入真正经过 frozen flow/decoder 的 adapter 训练。
+
+
+二、当前最终系统真正要解决的问题
+================================
+
+当前 AR 系统已经具备：
+
+  1. 多视图 RGB；
+  2. object masks；
+  3. 相机位姿和内参；
+  4. AR/SLAM 或三角化稀疏点云；
+  5. ReconViaGen/TRELLIS 生成完整物体 mesh；
+  6. CoarseModel 把粗 mesh 对齐回 AR 世界坐标并做轮廓形变。
+
+真正缺少的是：
+
+  ReconViaGen 主要依赖图像生成全局形体，不能稳定利用 AR 系统已经观测到的真实几何。
+
+因此当前学习模型的目的不是替代 ReconViaGen，也不是替代 CoarseModel，而是：
+
+  学习如何用 AR point / pose / mask 证据，对 ReconViaGen 的 sparse structure condition 做小而空间对齐的修正，
+  让生成出的完整拓扑既保留 TRELLIS 的全局 shape prior，又更符合真实观测几何。
+
+形式上希望学习：
+
+  delta_cond = Adapter(cond_base, physical_AR_features)
+
+其中：
+
+  cond_base:
+    ReconViaGen 的 sparse_structure_vggt_cond 输出，shape=[B,4096,1024]。
+
+  physical_AR_features:
+    在 16^3 sparse-condition grid 上编码的点云距离、mask support、visible views、visual-hull 等物理证据。
+
+  delta_cond:
+    加到 cond_base 上的 residual；它不直接替换 stock TRELLIS flow。
+
+第一阶段只改 SS，不改 SLAT，是正确取舍：
+
+  SS 决定 coarse topology / occupied sparse coordinates；
+  SLAT 决定这些 coordinates 上的结构化 latent、mesh/纹理细节。
+
+必须先证明 sparse topology 改善，再把相同 coordinates 送入原 SLAT，并检查 mesh 和 CoarseModel 指标。
+
+
+三、当前代码实际训练了什么
+==========================
+
+当前主脚本：
+
+  reconvggt_ar_adapter_a/train_b55_physical_proxy_adapter.py
+
+当前 B5.8 命令使用：
+
+  adapter_type = lowrank_basis
+  proxy_loss_mode = lowrank_gate
+  lowrank_rank = 4
+
+实际 adapter：
+
+  physical_features [4096,14]
+    -> LayerNorm
+    -> gate MLP
+    -> gates [B,4096,4]
+    -> 与 4 个 channel basis [4,1024] 线性组合
+    -> delta_cond [B,4096,1024]
+    -> active_gate
+
+当前训练明确冻结：
+
+  VGGT；
+  image encoder；
+  sparse_structure_vggt_cond / get_ss_cond；
+  TRELLIS sparse flow；
+  sparse decoder；
+  SLAT flow；
+  mesh decoder。
+
+只训练 low-rank SS-condition residual adapter。
+
+需要特别纠正：
+
+  当前 lowrank_gate loss 并没有调用 frozen sparse flow 和 sparse decoder。
+
+它直接监督：
+
+  positive token: mean(gates) -> +0.02
+  negative token: mean(gates) -> -0.01
+  neutral token:  mean(gates) -> 0
+
+附加：
+
+  gate L2；
+  delta squared-norm；
+  delta squared-energy smoothness。
+
+所以 B5.8 report 中：
+
+  “loss is one-step differentiable proxy through frozen sparse flow + frozen sparse decoder logits”
+
+这句话与实际执行分支不一致。只有 proxy_loss_mode=decoder_logits 才走 frozen flow + decoder。
+
+同理，B5.8 命令中的：
+
+  t_values = 0.5, 0.75, 0.9
+
+对 lowrank_gate 分支没有训练作用；它不会训练 high-t vector field，也不是 high-t/pure-noise loss。
+
+
+四、pose 和 point prior 当前到底如何发挥作用
+===========================================
+
+4.1 cond_base 的图像路径
+----------------------
+
+  masked multiview images（当前 max_views=7）
+    -> VGGT aggregated_tokens_list
+    -> image encoder image_cond
+    -> sparse_structure_vggt_cond
+    -> cond_base [1,4096,1024]
+
+这部分是冻结的 ReconViaGen bridge。
+
+4.2 physical feature 路径
+------------------------
+
+当前 B5.8 的 physical feature 不是直接把 pose_file 编码成 neural pose embedding。
+
+代码虽然读取并匹配 pose_file，但结果没有直接传给 low-rank adapter。实际 physical feature 来自 prior_manifest：
+
+  prior_manifest
+    -> prior_coords
+    -> manifest 中的 normalization
+    -> manifest dataset_root / sparse_subdir 的 cameras + images
+    -> 将 16^3 grid cell 投影到各个 mask
+    -> support / visible / outside / prior-distance / visual-hull features
+
+因此更准确的描述是：
+
+  当前 adapter 使用“由预构建 manifest 相机几何得到的 pose-aware physical features”，
+  而不是直接学习 pose vector 或 camera ray embedding。
+
+如果 manifest 的 sparse_ar_streaming/0 来自 AR pose，AR pose 会间接进入投影支持统计；但 pose_file 本身当前没有作为可学习输入。
+
+4.3 view 数量不完全同源
+------------------------
+
+当前三个 session：
+
+  session 1: image condition 7 views，physical manifest 7 frames；
+  session 2: image condition 7 views，physical manifest 18 frames；
+  holdout:   image condition 7 views，physical manifest 18 frames。
+
+这可以被定义成合理的系统设置：
+
+  精选 7 张图用于 ReconViaGen condition；
+  完整 AR scan 的 18 帧用于 point/mask physical prior。
+
+但必须显式记录为 full-scan-prior 模式，并增加 selected7-prior 对照；否则跨 session 差异会混入“prior 使用帧数不同”。
+
+
+五、前面各阶段实验真正证明了什么
+================================
+
+5.1 Points-to-3D strict 分支
+----------------------------
+
+已经证明：
+
+  q_vis / m_s / q_splice 数据链路成立；
+  teacher-forced 单步 inpainting 可以学；
+  overfit1 free sampling 可以超过 q_vis；
+  q_pred mesh 在 overfit1 上明显优于 q_vis mesh。
+
+同时证明：
+
+  train64/train512 的 pure-noise free rollout 容易离开训练分布；
+  teacher-forced 好不等于 START_T=1 free sampling 好；
+  增加 sampling steps / rescale 不能解决；
+  小数据 full-flow/high-t 微调经常破坏 base prior。
+
+所以 strict 路线证明了 point prior 有价值，但没有得到可泛化的 pure-noise G_inp。
+
+5.2 VGGT token adapter（A/B1-B4）
+--------------------------------
+
+已经证明：
+
+  aggregated_tokens_list 的 view/spatial layout 可以恢复；
+  prefix 5 tokens 可以保持不变；
+  adapted aggregated_tokens_list 能被 get_ss_cond 和 get_slat_cond 正常接受；
+  zero-init 接入可以严格保持 baseline；
+  mask-aware / support-aware token bias 能改变 SS/SLAT condition。
+
+但结果是：
+
+  稳定的小 adapter 近似 no-op；
+  强一点的 adapter 会破坏 sparse 结果；
+  mask-aware 和 multi-view support gate 没有稳定改善 outside-mask / prior direction。
+
+因此旧 token adapter 不应继续做 mesh/sweep。
+
+5.3 B5.1 eval-time SS-condition residual
+----------------------------------------
+
+随机 channel direction + 小 residual scale 在单 session、多 residual seed 下出现稳定正方向：
+
+  scale -0.02: 3/3 seed 通过；
+  scale +0.02: 3/3 seed 通过。
+
+它证明：
+
+  SS condition 空间存在可以改善 sparse set 的局部方向；
+  post-get_ss_cond 比 pre-get_ss_cond token bias 更敏感、更直接。
+
+它没有证明：
+
+  AR physical feature 能找到这个方向；
+  random teacher 能跨 object/session 泛化。
+
+5.4 B5.2 单 session teacher mimic
+--------------------------------
+
+strong random teacher（seed=20260707, scale=-0.02）可以在单 session 被 adapter 拟合。
+
+最佳稳定 recipe 接近：
+
+  target_scale=-0.02
+  lr=2e-5
+  target norm ratio=1.05
+  delta norm weight=0.02
+
+这证明 adapter 有容量拟合指定 cond residual，但仍然只是单 session / random teacher 行为。
+
+5.5 B5.3 multi-session random teacher
+------------------------------------
+
+2 train + 1 holdout 全部未通过 strict criterion。
+
+  session1 接近单样本行为；
+  session2 target 本身 mask direction=0；
+  holdout target outside direction 甚至为正。
+
+这证明 random teacher 不是跨 session 的物理监督。
+
+5.6 B5.4 physical feature candidate search
+------------------------------------------
+
+physical feature 本身可计算，并且部分 cond_unit candidate 在平均指标上有正信号。
+
+但没有 candidate 在所有 session 上稳定满足：
+
+  mask direction >= 0；
+  outside direction <= 0；
+  prior direction >= 0；
+  overall outside 不恶化。
+
+当时被解释为 channel basis / proxy 不足。重新核对后，空间行序错位和标签冲突也是重要原因，
+所以 B5.4 的负结果不能再被当成“physical encoding 本身无效”。
+
+5.7 B5.5-B5.7 数值问题
+-----------------------
+
+已确认旧 delta norm / smoothness 在 zero residual 上使用 sqrt-style norm，导致 NaN gradient。
+
+修复为 squared norm / squared energy 后：
+
+  physical features finite；
+  toy backward finite；
+  actual low-rank backward finite；
+  nonfinite_grad=0。
+
+这是一个已经解决的真实代码错误。
+
+5.8 B5.8 safe-norm s5
+----------------------
+
+训练不再 skipped，loss 和 gate 有变化，证明优化路径能运行。
+
+最佳 runtime scale=2：
+
+  strict = 1/3 sessions
+  mean set IoU vs baseline = 0.995542
+  mean mask direction = +0.115338
+  mean outside direction = -0.035166
+  mean prior direction = +0.061091
+
+但分 session：
+
+  session1 train:
+    mask +0.3460
+    outside -0.1866
+    prior +0.1486
+    通过
+
+  session2 train:
+    mask 0
+    outside +0.0651
+    prior +0.2222
+    失败
+
+  holdout:
+    mask 0
+    outside +0.0160
+    prior -0.1875
+    失败
+
+因此只能得出：
+
+  safe-norm 解决了数值问题；当前 lowrank_gate objective 没有跨 session 学到稳定物理修正。
+
+
+六、重新校对后发现的代码级关键问题
+==================================
+
+6.1 已确认的 x/z token 行序错误
+--------------------------------
+
+当前 _ss_grid_coords64()：
+
+  zz, yy, xx = meshgrid(...)
+  xyz = stack(xx, yy, zz).reshape(-1,3)
+
+它生成的前几个 physical rows：
+
+  row 0   -> 64-grid xyz (2,2,2)
+  row 1   -> 64-grid xyz (6,2,2)
+  row 16  -> 64-grid xyz (2,6,2)
+  row 256 -> 64-grid xyz (2,2,6)
+
+但 TRELLIS dense latent 经 patchify/flatten 后：
+
+  token 0   -> dense xyz (0,0,0)
+  token 1   -> dense xyz (0,0,1)
+  token 16  -> dense xyz (0,1,0)
+  token 256 -> dense xyz (1,0,0)
+
+正确的 64-grid cell center 应该对应：
+
+  token 1   -> (2,2,6)
+  token 256 -> (6,2,2)
+
+而当前正好相反。因此 physical row、active_gate、16->64 loss mask 相对 cond token / decoder logits 发生 x/z 交换。
+
+这会影响：
+
+  B5.4 physical candidate；
+  B5.4b gate composition；
+  B5.5 decoder-logit proxy；
+  B5.6 low-rank；
+  B5.8 safe-norm low-rank。
+
+B5.1/B5.2 random token teacher 不依赖物理 xyz，所以不受这一具体错误影响，但它们本来也不是物理 teacher。
+
+6.2 positive / negative label 冲突
+---------------------------------
+
+当前定义大致为：
+
+  positive = max(support_gate, near-prior-and-mask/vh, prior_score*vh)
+  negative = outside_ratio * visible * (1 - 0.5*vh)
+
+一个 cell 只要在部分 view 投影进 mask、部分 view 投影到 mask 外，就会同时 positive 和 negative。
+
+实际统计：
+
+  session1:
+    positive nonzero = 23.93%
+    negative nonzero = 59.33%
+    overlap = 23.39%
+    92.74% 的 positive 权重位于带 negative 权重的 token
+    min(pos,neg) / total positive mass = 42.55%
+
+  session2:
+    positive nonzero = 59.57%
+    negative nonzero = 98.54%
+    overlap = 59.40%
+    99.85% 的 positive 权重位于带 negative 权重的 token
+    min(pos,neg) / total positive mass = 74.89%
+
+  holdout:
+    positive nonzero = 43.55%
+    negative nonzero = 86.16%
+    overlap = 43.24%
+    99.89% 的 positive 权重位于带 negative 权重的 token
+    min(pos,neg) / total positive mass = 75.90%
+
+这是定义性冲突，不应通过继续训练或调权重掩盖。
+
+6.3 visual hull 的语义需要修正
+--------------------------------
+
+TRELLIS sparse structure 表示物体表面/结构 occupancy，不是实心体素。
+
+因此：
+
+  visual-hull outside 可以作为可靠 negative；
+  visual-hull inside 只能表示“允许存在”，不能直接等价为 positive surface occupancy。
+
+当前 loss 把 visual_hull 与 prior_score 组合进 positive，会把物体内部很多没有表面证据的 cell 推成 occupancy，存在 overfill 风险。
+
+6.4 low-rank basis 没有任务方向监督
+-----------------------------------
+
+当前 basis 随机初始化，然后每次 forward 做 L2 normalize。
+
+lowrank_gate loss 只监督 mean(gates)，不监督：
+
+  delta_cond 经过 sparse flow 后是否提高正确 occupancy；
+  basis 哪个 channel direction 对 topology 有帮助；
+  t=0.5/0.75/0.9 的 vector field 如何响应。
+
+delta norm 和 smoothness 只约束幅度，不能提供正确 channel 方向。
+
+所以当前 rank=4 不是“4 个学到的几何 residual basis”，而更接近“4 个随机 channel basis + 学到的空间 gate”。
+
+6.5 rank=4 的 gate supervision 也存在退化
+----------------------------------------
+
+训练使用：
+
+  gate_score = gates.mean(dim=-1)
+
+只约束 4 个 gate 的平均值。不同 rank component 之间没有分工目标，容易全部学成相同 gate；其余零均值自由度没有明确监督。
+
+如果保留 low-rank，basis 和每个 component 都应通过 flow/decoder task loss 获得梯度，而不是只监督 gate mean。
+
+6.6 heterogeneous physical features 的归一化不理想
+--------------------------------------------------
+
+14 个 physical channels 混合：
+
+  support_views / visible_views（0 到 7 或 18）；
+  ratio（0 到 1）；
+  point_distance（不同 normalization 下范围不同）；
+  binary flags；
+  exponential prior score。
+
+当前对每个 token 的 14 维向量做 LayerNorm，会让不同单位的特征互相影响，而且 7-view/18-view session 的 raw count 分布不一致。
+
+更合理的是先显式构造无量纲特征：
+
+  support_ratio；
+  visible_ratio = visible / matched_views；
+  log1p(support_views) / log1p(matched_views)；
+  clipped_distance = clip(distance / prior_radius, 0, max)；
+  prior_within；
+  outside_confidence；
+  binary visible / mask / hull flags。
+
+再用训练集 per-feature mean/std，或者固定物理范围归一化。
+
+6.7 prior 数据分布差异很大
+-----------------------------
+
+当前三个 prior 的有效 coordinate 数约为：
+
+  503 / 70 / 74
+
+normalization scale 约为：
+
+  0.866 / 0.817 / 1.932
+
+并且都使用 prior_bbox normalization。稀疏到只有 70 个点时，少量 outlier 会显著改变 bbox、point distance 和物体 canonical scale。
+
+这会让 holdout 上的 physical feature 分布与 session1 明显不同。
+
+机制 smoke 可以保留 prior_bbox，但正式训练需要：
+
+  robust bbox quantile / outlier filtering；
+  mask-ray object center；
+  camera-distance / silhouette 尺度辅助；
+  或 synthetic 中统一使用 GT/model bbox normalization。
+
+6.8 当前 strict direction 指标对极小 delta 太敏感
+------------------------------------------------
+
+B5.8 的 set IoU 约 0.995，表示 adapter 只改变了很少一部分 coordinates。
+
+当 added/removed 点数很少时：
+
+  mask direction；
+  prior direction；
+  outside direction
+
+会被少量 voxel 强烈影响。当前 strict check 只要求 candidate 与 baseline 有变化，没有最低 changed-count 门槛。
+
+后续必须增加：
+
+  changed_count >= max(100, 0.5% baseline_count)
+  changed_ratio <= 10%
+  absolute candidate outside ratio 不高于 baseline
+  absolute component / coord count 不异常
+
+不能只看 added-minus-removed ratio。
+
+
+七、CoarseModel 在这条路线中的正确角色
+=====================================
+
+CoarseModel 不是当前 adapter 的可微训练 loss。
+
+它执行：
+
+  ReconViaGen 粗 mesh
+    -> template rendering / DINO representation
+    -> feature correspondences
+    -> PnP / Sim3
+    -> 多阶段 frame filtering
+    -> contour / deformation optimization
+    -> T_M2W、final_scale、refined mesh
+
+pose_guided_recon 已经实现：
+
+  pose coverage frame selection；
+  多 seed mesh candidate；
+  AR pose 下 mask reprojection IoU/recall/precision；
+  candidate rerank；
+  可选 visual-hull filter。
+
+因此最终实验应分层：
+
+  Level 1: sparse coordinates
+    prior distance、mask support、outside、component、coord count。
+
+  Level 2: frozen SLAT mesh
+    silhouette IoU/recall/precision、mesh components、surface quality。
+
+  Level 3: CoarseModel endpoint
+    kept/dropped frames、initial/final cost、T_M2W 稳定性、
+    deformation 前后 contour chamfer、mask IoU、synthetic mesh Chamfer/F-score。
+
+CoarseModel 能处理全局 Sim3 和一定程度局部形变，所以 adapter 真正应该改善的是：
+
+  topology；
+  缺失表面；
+  多余表面；
+  与 mask/point evidence 冲突的局部结构。
+
+如果 adapter 只改变全局尺度、旋转或平移，这不是主要创新收益，CoarseModel 本来就能解决。
+
+
+八、当前可以保留与必须停止的方向
+================================
+
+保留：
+
+  1. post-get_ss_cond 的 SS residual 注入位置；
+  2. frozen ReconViaGen bridge + frozen stock TRELLIS flow；
+  3. AR point/mask/pose 构造 16^3 physical encoding；
+  4. zero-init adapter；
+  5. 第一版只改 SS，不碰 SLAT；
+  6. sparse -> mesh -> CoarseModel 分层评估；
+  7. synthetic train / real AR holdout 的最终学习路线。
+
+停止或暂停：
+
+  1. 旧 VGGT token-bias adapter 的更多 mesh/sweep；
+  2. random teacher 的更多 multi-session mimic；
+  3. 当前未修正定义下的 B5.8b s20；
+  4. 继续增加 lowrank rank / runtime scale；
+  5. 只根据 2 train + 1 holdout 做长期训练结论；
+  6. sparse delta 只有十几个 voxel 就判断方法有效；
+  7. 在 SS sparse 指标未稳定前跑大量 mesh；
+  8. 直接解冻 get_ss_cond、VGGT 或全量 TRELLIS flow。
+
+
+九、推荐的下一步实验顺序
+========================
+
+阶段 B5.9-0：代码正确性修复，CPU/静态验证
+-------------------------------------------
+
+先修改：
+
+  1. 统一 16^3 token index <-> xyz <-> 64^3 cell center 的唯一工具函数；
+  2. 修复 _ss_grid_coords64 的 x/z 行序；
+  3. _upsample_16_to_64 使用同一坐标约定；
+  4. 增加 sentinel round-trip unit test；
+  5. report 中记录 token index 0/1/16/256 对应 xyz；
+  6. report 中按实际 proxy_loss_mode 描述 loss，不能再硬编码 one-step flow proxy。
+
+通过标准：
+
+  token 0   -> coarse xyz (0,0,0) -> 64 center (2,2,2)
+  token 1   -> coarse xyz (0,0,1) -> 64 center (2,2,6)
+  token 16  -> coarse xyz (0,1,0) -> 64 center (2,6,2)
+  token 256 -> coarse xyz (1,0,0) -> 64 center (6,2,2)
+
+阶段 B5.9-1：互斥 physical labels，不训练
+------------------------------------------
+
+建议第一版：
+
+  confident_positive:
+    prior_distance <= prior_radius
+    AND support_ratio >= 0.50
+    AND visible_views >= 1
+
+  confident_negative:
+    prior_distance > prior_radius
+    AND visible_views >= 3（不足 3 view 时按 matched views 调整）
+    AND support_ratio <= 0.10
+
+  neutral/unknown:
+    其余全部；
+    visual-hull inside 但不靠近 point prior 的 cell 也先归 neutral。
+
+硬约束：
+
+  positive * negative == 0
+  overlap_nonzero_ratio == 0
+
+需要报告：
+
+  pos/neg/neutral count；
+  每类 prior distance；
+  每类 support/visible ratio；
+  每类在 baseline sparse coords 上的 occupancy rate；
+  selected7-prior 与 fullscan-prior 两种定义。
+
+如果 positive 太少，先增大 prior radius 或用软 distance band，但仍保持 positive/negative 互斥；不要恢复任何非零 support 都算 positive。
+
+阶段 B5.9-2：修复后的 eval-only candidate search
+-----------------------------------------------
+
+先不训练，只验证物理空间方向是否存在。
+
+建议：
+
+  basis:
+    cond_unit
+    cond_centered_unit
+
+  spatial gate:
+    positive - lambda * negative
+
+  scales:
+    +/-0.0025
+    +/-0.005
+    +/-0.01
+
+实验矩阵：
+
+  3 sessions
+  x 3 sparse sampling seeds
+  x selected7-prior / fullscan-prior
+
+继续门槛：
+
+  1. 至少一个 candidate 在所有 3 session 的平均方向不反向；
+  2. holdout mask/prior 不为负，outside 不为正；
+  3. changed_count >= max(100, 0.5% baseline)；
+  4. set IoU >= 0.90；
+  5. component 和 coord count 不异常；
+  6. 三个 sampling seed 方向一致。
+
+如果修复空间映射后仍没有任何 deterministic candidate 过线：
+
+  不要训练 lowrank adapter；
+  先检查 prior normalization、pose/mask calibration 和 surface label 定义。
+
+阶段 B5.10：真正 flow-aware 的 adapter smoke
+-------------------------------------------
+
+只有 B5.9-2 过线后进入。
+
+首选结构仍可用 low-rank，但训练必须改为：
+
+  adapter_type = lowrank_basis
+  proxy_loss_mode = decoder_logits
+
+这样：
+
+  gate MLP 和 channel basis 都通过 frozen sparse flow + decoder 获得任务梯度；
+  t_values 才真正有意义；
+  loss 才直接约束 positive/negative occupancy logits。
+
+训练状态也要修正：
+
+  最好从 stock sampler 的 baseline trajectory 抓取并 detach 真实 x_t；
+  不要在 t=0.5 直接使用纯随机 x_t，因为那不是标准 flow trajectory 上的状态；
+  快速 smoke 可先只用 t=0.9/1.0 的近噪声状态；
+  更严谨版本使用 baseline rollout state cache。
+
+第一轮：
+
+  max_steps = 5 / 20
+  只比较修复后 labels 的 train2/holdout1；
+  不解冻 get_ss_cond；
+  不解冻 sparse flow；
+  不跑 SLAT。
+
+继续门槛：
+
+  2/2 train 改善；
+  holdout 不退化；
+  runtime scale 不需要放大到 4 才有效；
+  三 seed 稳定；
+  absolute outside / component / coord count 同时合理。
+
+阶段 B5.11：synthetic supervised scale-up
+----------------------------------------
+
+即使 real train2/holdout1 smoke 通过，也不能直接宣称泛化。
+
+正式学习建议转现有 Objaverse/PixalV9：
+
+  train = 1488
+  val = 128
+  8 selected views
+  RGB / masks / intrinsic / extrinsic
+  point prior
+  complete sparse latent / target coords
+  source GLB
+
+训练目标优先级：
+
+  1. GT sparse occupancy / decoder-logit supervision；
+  2. baseline preservation；
+  3. observed point support positive；
+  4. outside visual-hull negative；
+  5. component / smoothness 的可微弱正则；
+  6. 必要时才加入 flow/velocity distillation。
+
+数据划分：
+
+  synthetic train：学习 channel direction 和跨对象规律；
+  synthetic val：结构选择与超参数；
+  未使用 synthetic holdout：最终定量；
+  real AR sessions：zero-shot domain transfer，不参与反复调参。
+
+如果 adapter-only 在 synthetic 上有明确收益但容量不足，再考虑：
+
+  get_ss_cond LoRA；
+  sparse flow cross-attention LoRA；
+  少量后层适配。
+
+在 adapter-only 还没有证明物理 loss 有效之前，不建议 full 解冻。
+
+阶段 B5.12：mesh 与 CoarseModel endpoint
+--------------------------------------
+
+只有 sparse 在 synthetic val 和 real holdout 都稳定后，选择 1-2 个配置：
+
+  baseline stock coords；
+  adapted coords；
+  同一原始 get_slat_cond；
+  同一 SLAT noise / seed；
+  同一 decoder。
+
+比较：
+
+  sparse absolute metrics；
+  mesh silhouette IoU/recall/precision；
+  mesh Chamfer/F-score（synthetic）；
+  CoarseModel initial/final cost；
+  kept frames；
+  deformation 后 contour chamfer；
+  final world alignment 稳定性。
+
+这样才能回答论文真正关心的问题：
+
+  AR point/pose prior 是否不仅改变 sparse coordinates，而且实际提高了完整 mesh 和后端 AR 对齐质量。
+
+
+十、建议的决策树
+================
+
+  B5.9 空间映射测试失败
+    -> 继续修坐标/normalization，不训练。
+
+  B5.9 labels overlap != 0
+    -> 修标签，不训练。
+
+  B5.9 eval-only physical candidate 全部跨 session 失败
+    -> 检查 prior 质量、surface label、pose/mask calibration；
+       不进入 lowrank s20。
+
+  B5.9 candidate 过线
+    -> B5.10 flow-aware lowrank decoder-logit s5/s20。
+
+  B5.10 train 改善、holdout 退化
+    -> real 3-session 数据不足；直接转 synthetic supervised，不加 real 步数。
+
+  B5.10 holdout 也稳定
+    -> synthetic scale-up，验证跨 object 泛化。
+
+  synthetic sparse 有效、mesh 无效
+    -> 检查 SLAT conditioning / coords-to-SLAT 接口，不立即解冻 VGGT。
+
+  synthetic + real mesh + CoarseModel 都改善
+    -> 再做 LoRA/get_ss_cond ablation，形成论文完整实验。
+
+
+十一、当前方向的最终判断
+======================
+
+point-prior 思路仍然有希望，而且 post-get_ss_cond residual 是当前最值得保留的学习位置。
+
+但目前不能把 B5.8 解释成：
+
+  “模型已经开始从 pose/point prior 学到 geometry correction，只需要更多 step。”
+
+准确表述应是：
+
+  1. ReconViaGen token/condition 接口已经验证可接入；
+  2. SS condition 空间确实能控制 sparse topology；
+  3. zero-init residual 的 NaN gradient 已修复；
+  4. 当前 physical low-rank 训练可以更新；
+  5. 但 physical token 空间映射错位、正负标签冲突、channel basis 缺少 flow-aware 监督；
+  6. 因此当前跨 session 失败还不能归因于 point prior 无效，也不能归因于模型容量不足；
+  7. 下一步必须先修实验定义，再判断方法本身。
+
+当前最高优先级不是 B5.8b s20，而是：
+
+  B5.9：修正 xyz token mapping + 互斥 surface labels + eval-only multi-seed physical candidate sanity。
+
+这一步完成后，才有资格决定是否继续 flow-aware low-rank adapter，或者转 synthetic supervised SS-condition learning。
+
+
+十二、2026-07-11 当前路线、数据与 CoarseModel 的总体复盘
+=========================================================
+
+1. 当前结论
+-----------
+
+当前 reconvggt_ar_adapter_a 的 SS-condition residual adapter 路线不值得继续扩步数、扩 rank
+或继续在 3 个 real sessions 上调 scale。
+
+最新 B5.9c 已经确认：
+
+  同一 session 跨 seed 的梯度方向会反号；
+  两个 train session 的共享 channel direction cosine = -0.3713；
+  rank-1 explained variance = 0.3944；
+  最佳 shared_train_rank1 candidate 只 strict pass 3 / 9；
+  condition residual 经完整 sparse rollout 后会产生 seed/session 相关的拓扑跳变。
+
+结果位置：
+
+  reconvggt_ar_adapter_a/A_B阶段结果与B结构_20260703.md，第 31 节；
+  reconvggt_ar_adapter_a/outputs/
+    ar_b59c_trainfit_flowgrad_stocktraj_cfg_selected7_t090_seed42_43_44_v2/report.json
+
+这说明当前失败的不是“adapter 参数还不够多”，而是：
+
+  当前 global/low-rank condition residual 的表达方式，
+  无法把指定物理空间位置上的正负约束，
+  稳定映射为经过多步 SS flow 后的局部 topology correction。
+
+但这不等于 point prior 思路失败。应该停止的是当前注入方式和当前训练协议，而不是物理先验本身。
+
+
+2. ReconViaGen 与当前 adapter 的结构错位
+-----------------------------------------
+
+ReconViaGen 是两个独立条件阶段：
+
+  get_ss_cond()
+    -> global geometry condition
+    -> SS Flow
+    -> 16^3 sparse latent
+    -> sparse decoder
+    -> sparse coordinates
+
+  get_slat_cond()
+    -> per-view local condition
+    -> SLAT Flow on the generated coordinates
+    -> mesh/GS/RF decoder
+
+代码位置：
+
+  ReconViaGen/trellis/pipelines/trellis_image_to_3d.py:920
+  ReconViaGen/trellis/pipelines/trellis_image_to_3d.py:942
+
+reconvggt_ar_adapter_a 目前的 token adapter 和 post-get_ss_cond residual 只影响 SS topology，
+并不直接改变 SLAT condition。
+
+当前链路是：
+
+  小 token/condition residual
+    -> 24-block SS flow 的多步非线性 rollout
+    -> sparse decoder threshold
+    -> 离散坐标集合变化
+
+residual 太小时接近 no-op；稍大时会被 rollout 放大。这个行为与 B3-B5 的全部结果一致。
+
+
+3. points_to_3d_strict 提供的边界证据
+--------------------------------------
+
+points_to_3d_strict 并非完全失败：
+
+  q_splice_t0.75:
+    q_pred topk IoU = 0.5776
+    q_vis topk IoU = 0.4741
+
+说明模型在正确 trajectory 附近具备局部 inpainting/refinement 能力。
+
+但 pure-noise/high-t 最好约为：
+
+  direct b1 s100 noise_t1 topk IoU = 0.405096
+
+而 B2 last2 bias 只是：
+
+  0.405096 -> 0.405097
+
+因此当前小 adapter 没有改变 high-t manifold entry，后期微小增益基本属于 identity/no-op。
+
+
+4. 与 CoarseModel 最终需求的指标错位
+--------------------------------------
+
+CoarseModel 真正依赖的是：
+
+  可对应的全局形体；
+  稳定、少碎片的 topology；
+  可被多视图投影对齐；
+  可以继续优化 T_M2W、尺度和 deformation graph。
+
+主流程位置：
+
+  CoarseModel/estimation_4stage_defo_fin.py:150
+
+当前研究分支主要评估 sparse IoU、condition drift、prior/mask alignment 和 component，
+但已有 CoarseModel pipeline reports 中尚没有完成 coarse stage 的正式结果。
+
+所以目前无法证明 sparse IoU 的 0.001 增益会带来：
+
+  更低 rotation / translation / scale error；
+  更高多视图 silhouette IoU；
+  更低 global optimization cost；
+  更稳定 deformation；
+  更高端到端成功率。
+
+后续模型选择必须增加这些 endpoint 指标，而不能只看 sparse proxy。
+
+
+5. 当前数据集的主要问题
+-----------------------
+
+Pixal3D v9 select8 当前统计：
+
+  train samples = 1488
+  train unique objects = 1097
+  val samples = 128
+  val unique objects = 127
+  train/val object overlap = 71
+  val object leakage ratio = 55.9%
+  accepted = 1616
+  failures = 8382
+  accepted low-texture ratio = 21.97%
+
+数据位置：
+
+  /data/pixal3d_multiview/objaverse_sparse_mv_artraj_pbr_5000_v9_select8
+
+这意味着当前 val 不是可靠的 object-disjoint 泛化集。
+
+真实 AR adapter 数据也不足：
+
+  只有 2 个 train sessions + 1 个 validation session；
+  三者属于同一复合物体/相近环境；
+  没有独立对象泛化；
+  没有严格 GT mesh；
+  COLMAP prior 点数约 70-503，密度和 bbox normalization 波动很大。
+
+同时 synthetic prior 是干净、稠密、接近 oracle 的可见表面，和真实稀疏 COLMAP prior 的误差模型不一致。
+
+
+6. 低风险下一路线
+-----------------
+
+在数据尚未扩充前，最高可解释性路线是：
+
+  frozen ReconViaGen stock SS rollout
+    -> sparse decoder occupancy logits
+    -> occupancy uncertainty across seeds
+    -> AR-guided 16^3 residual-logit correction
+    -> corrected sparse coordinates
+    -> stock SLAT condition/flow
+    -> CoarseModel
+
+小 residual head 的输入应包括：
+
+  baseline occupancy logits；
+  跨 seed uncertainty；
+  point distance / support views；
+  mask support / outside ratio；
+  visual hull；
+  pose confidence。
+
+该路线的优势是监督位置和 topology decision 位置一致，不需要 condition residual 穿过完整 flow 后
+仍然保持指定方向。
+
+训练前必须先用无训练的 direct-logit sweep 验证：同一 baseline noise/logits 下是否存在跨对象、
+跨 seed 稳定的物理修正方向。若 direct-logit 也不能稳定改善最终 CoarseModel 指标，就应停止生成器
+改造，把创新转向 CoarseModel-aware candidate/view selection 或 test-time geometry optimization。
+
+
+7. 3090 的能力边界
+------------------
+
+单张 24GB RTX 3090 可支持：
+
+  frozen VGGT/ReconViaGen feature extraction；
+  缓存 16^3 latent/logits/physical fields；
+  小 3D residual head；
+  condition branch；
+  SS flow LoRA；
+  batch=1 + gradient accumulation；
+  test-time optimization。
+
+不适合直接支持：
+
+  full VGGT fine-tune；
+  full ReconViaGen SS+SLAT joint fine-tune；
+  按原论文规模复现大 batch 训练。
+
+VGGT 本地 fp16 权重约 5.0 GB，完整 Adam 训练在加入 gradient、FP32 master weights 和两个 moments
+后，尚未计算 activation 就会明显超过单卡 24GB。SS flow 本地 fp16 权重约 1.13 GB，LoRA 可行，
+full fine-tune 虽可能以 batch=1 勉强运行，但不适合作为当前正式大规模方案。
+
+大数据不会直接增加单步显存，但会增加训练时长和缓存。不要缓存完整多层 VGGT spatial tokens；
+优先缓存 16^3 logits、latent、uncertainty 和 physical fields。
+
+
+十三、点云先验和位姿联合微调 ReconViaGen 是否仍然合理
+=========================================================
+
+1. 直接回答
+-----------
+
+合理，而且从论文模型创新角度看仍然有价值。
+
+当前实验没有证明：
+
+  “真实点云和位姿无法用于微调 ReconViaGen。”
+
+当前实验真正证明的是：
+
+  “在只有 2 个 train sessions、冻结原 bridge/flow、使用 global/low-rank condition residual、
+   并依赖 noisy proxy labels 的条件下，无法得到跨 session/seed 稳定的 topology correction。”
+
+这是更窄的负结论，不能外推为联合微调本身不可行。
+
+
+2. ReconViaGen 原本为什么能成功
+-------------------------------
+
+ReconViaGen 原论文并不是只给 TRELLIS condition 加一个固定小扰动。
+
+论文结构是：
+
+  VGGT aggregator 使用 camera/depth/point-map 多任务监督做 LoRA；
+  新的 Condition Net 从多层 VGGT features 构造 global/local conditions；
+  Condition Net 与 TRELLIS DiT 联合训练；
+  SS Flow transformer 使用 LoRA 适配新的重建条件；
+  SLAT 阶段使用 per-view conditions，并在推理时用 RVC 修正 velocity。
+
+论文明确报告：
+
+  training objects = 390k Objaverse 3D data
+  rendered views per object = 60 for fine-tuning
+  SS transformer LoRA rank = 64, alpha = 128
+  training steps = 40k
+  global batch size = 192
+  hardware = 8 x NVIDIA A800 80GB
+
+论文：
+
+  https://arxiv.org/html/2510.23306
+
+对应本地公开训练脚本也写得很清楚：
+
+  ReconViaGen/train_ss.py
+    trainable = freshly initialized sparse_structure_vggt_cond
+              + rank-64 LoRA on sparse_structure_flow_model attention
+    frozen = VGGT + DINO + other models
+    data = ProObjaverse-300K
+
+  ReconViaGen/train_slat.py
+    trainable = freshly initialized slat_vggt_cond
+              + rank-128 LoRA on slat_flow_model attention
+
+所以 ReconViaGen 的成功来自：
+
+  丰富、经过几何监督的 reconstruction features；
+  新 Condition Net；
+  flow 对新 condition 的联合适配；
+  390k object 级数据覆盖；
+  标准 full-t conditional flow-matching objective；
+  大 batch、大算力；
+  SLAT 推理阶段的显式 rendering loss velocity correction。
+
+它与当前 real-session residual smoke 的训练规模和模型自由度差异非常大。
+
+
+3. 我们究竟训练过哪些模块
+-------------------------
+
+实验 A：reconvggt_ar_adapter_a A/B/B2-B5
+
+  VGGT：冻结
+  sparse_structure_vggt_cond / get_ss_cond：冻结
+  SS flow：冻结
+  sparse decoder：冻结
+  SLAT condition/flow：冻结
+  训练内容：token adapter、post-get_ss_cond residual adapter 或 low-rank physical gate
+  B5.9/B5.9c：不训练，只做 eval-time perturbation / gradient audit
+
+结论：
+
+  这一路绝大多数实验确实只是对 frozen flow 的 condition 做小扰动，
+  没有联合训练 ReconViaGen 的 get_ss_cond 和 SS flow。
+
+实验 B：points_to_3d_strict phase1/phase2
+
+  使用模型：microsoft/TRELLIS-image-large，不是 ReconViaGen VGGT checkpoint
+  get_ss_cond / sparse_structure_vggt_cond：不存在于该路径，没有训练
+  默认 phase1/phase2：扩展 input layer 后，训练整个 TRELLIS SS flow
+  后续实验：input-layer-only、partial b0/b1、LoRA、blockwise adapter
+  数据：train512，q_vis/mask 与 image condition
+
+结论：
+
+  我们确实完整训练过一个 TRELLIS sparse flow；
+  但没有做“ReconViaGen Condition Net + ReconViaGen SS flow + explicit point/pose condition”的联合训练。
+
+实验 C：pixal3d_multiview
+
+  主实验 trainable=proj_only；
+  训练 denoiser 中名称包含 cross_attn/proj 的参数，以及可选 view/geometry adapter；
+  没有 full 训练全部 denoiser；
+  也不是 ReconViaGen 的 sparse_structure_vggt_cond/get_ss_cond 路径。
+
+实验 D：trellis_point_prior_mv
+
+  主要承担 point-prior 数据构建、latent/mask、筛选与评估接口；
+  不能等价为大规模 joint ReconViaGen training。
+
+因此我们尚未真正执行用户现在提出的核心实验：
+
+  大规模 mesh-supervised image + sparse point + calibrated pose
+    -> trainable physical Condition Net
+    -> SS Flow LoRA/full-t flow matching
+    -> pure-noise sparse rollout。
+
+
+4. 当前结果为什么无法稳定利用物理约束
+-------------------------------------
+
+原因 1：原 flow 不认识新增 condition 的语义
+
+原 ReconViaGen flow 学到的是：
+
+  VGGT features -> Condition Net tokens -> flow velocity
+
+当前做法却是：
+
+  cond_base + manually constructed residual
+
+冻结 flow 没有被训练去解释 residual 中的 point distance、mask support 或 outside evidence。
+只要 residual 离开原 condition manifold，其影响就可能随 t、x_t、seed 和 session 改变。
+
+原因 2：global/low-rank channel basis 与局部物理约束不匹配
+
+B5.9c 已经测得：
+
+  surface_gate x one global channel direction
+
+对 token-wise oracle gradient 的拟合 cosine 只有约 0.034-0.059。
+真实梯度具有 token/state/session 依赖，不是一个共享 rank-1 channel basis 可以表达的。
+
+原因 3：物理证据只约束可见部分，不决定完整物体
+
+点云、mask、visual hull 能可靠告诉模型：
+
+  某些位置应占据；
+  某些可见射线位置应为空；
+
+但不能直接告诉模型遮挡区应补成什么完整 topology。模型必须在“尊重可见测量”和“保留生成 prior”
+之间学习置信度权衡。当前 proxy loss 没有大量 GT complete mesh 监督，无法学到这个权衡。
+
+原因 4：坐标系和 canonicalization 不稳定
+
+真实 AR points/poses 在 world frame，TRELLIS/ReconViaGen 在 canonical object grid 中生成。
+当前按稀疏 prior bbox 做 normalization；70 点与 503 点得到的中心、尺度和轴方向可能明显不同。
+如果 Sim(3) 对齐本身不稳，再准确的 point feature 也会投到错误 SS cell。
+
+原因 5：real labels 噪声大且数据过少
+
+当前 real prior 含 COLMAP dropout/outlier，mask 有孔洞和复合物体语义，pose 也有漂移。
+只有两个同类 train sessions 时，模型更容易学习 session-specific correction，无法学习物理规律。
+
+原因 6：训练目标与真实 pure-noise rollout 不一致
+
+部分实验使用 teacher-forced q_splice、one-step x0/flow proxy 或固定 condition mimic；
+这些能验证局部导数和 trajectory 邻域能力，但不能替代从 t=1 pure noise 的完整 CFM 训练分布。
+
+
+5. 大量 image + mesh + sparse point + pose 能否直接联合训练
+--------------------------------------------------------
+
+可以。这是当前从模型创新角度最值得保留的高投入路线，但必须按“新条件模态联合训练”实现，
+不能继续把它实现为 frozen condition 上的小 perturbation。
+
+推荐模型结构：
+
+  images
+    -> frozen/fine-tuned VGGT
+    -> existing image Condition Net
+    -> C_img
+
+  sparse points + RGB/confidence + masks + K + T
+    -> canonicalization / Sim(3) normalization
+    -> 16^3 physical evidence grid
+    -> spatial PointPoseConditionNet
+    -> C_phys
+
+  noisy SS latent x_t
+    -> SS DiT blocks
+       cross-attend C_img
+       cross-attend spatial C_phys with zero-init gates
+    -> velocity
+
+不要只输出一个 pooled global vector。C_phys 应保留 16^3 cell identity，至少包含：
+
+  occupied point support；
+  visible free-space/outside evidence；
+  support/visible view ratio；
+  point distance；
+  color/image feature projection；
+  pose confidence；
+  unknown mask。
+
+建议训练参数：
+
+  VGGT：第一阶段冻结
+  existing image Condition Net：第一阶段冻结或只解冻最后 1-2 blocks
+  PointPoseConditionNet：完整训练
+  physical cross-attention：完整训练，zero-init gate
+  SS Flow：所有 24 blocks 的 attention LoRA，优先 rank 16/32；容量不足再升 rank 64
+  SS decoder：冻结
+  SLAT：第一阶段全部冻结
+
+这是真正的 joint condition-flow adaptation，而不是固定 flow 上做小扰动。
+
+
+6. 正确的数据构建
+-----------------
+
+每个 mesh 应生成：
+
+  complete target mesh / target SS latent q_gt；
+  8-24 个 RGB views；
+  exact masks、K、T；
+  从 depth/backprojection 或 SfM simulation 得到的 sparse point cloud；
+  每个点的 view support、reprojection confidence 和颜色；
+  visible free-space / visual-hull evidence。
+
+关键不是只用干净 oracle prior，而是模拟真实 AR 分布：
+
+  point count 50-1000；
+  correlated pose SE(3) drift；
+  focal/principal-point error；
+  point dropout/outlier；
+  mask erosion/dilation/holes；
+  blur、exposure、background、occlusion；
+  partial trajectory and limited-view coverage；
+  scale/centering error。
+
+数据必须在生成 sequence 之前按 object_uid 切分：
+
+  train；
+  development；
+  untouched synthetic holdout；
+  untouched real-object holdout。
+
+建议规模：
+
+  16-64 objects：先验证能否过拟合和 condition 是否被使用；
+  1k object pilot：验证 object-disjoint 趋势；
+  10k-30k unique objects：小 physical branch + SS LoRA 的正式起点；
+  50k+：更可信的跨类别 scale-up；
+  390k：接近 ReconViaGen 原训练量级，但不是单张 3090 的现实目标。
+
+若希望缩小 synthetic-real gap，应加入带真实照片和扫描 mesh/pose 的 object datasets，而不只使用
+Objaverse Blender renders。
+
+
+7. 正确的 loss 和训练分布
+-------------------------
+
+主损失必须仍然是完整的 conditional flow matching：
+
+  q_gt + Gaussian noise
+    -> sample t over [0,1]
+    -> x_t
+    -> predict full target velocity
+
+辅助损失可以包括：
+
+  predicted-x0 occupancy BCE / soft IoU；
+  observed point positive support；
+  visible free-space/outside negative；
+  multiview mask projection consistency；
+  confident baseline preservation；
+  topology smoothness / component proxy。
+
+训练时要独立做 modality dropout：
+
+  drop image；
+  drop point；
+  drop pose confidence；
+  drop physical branch；
+
+使模型学会在 point/pose 可靠时使用它们，在噪声较大时退回 ReconViaGen generation prior。
+
+high-t 不应只靠 phase curriculum 最后补少量 step，而应在 pilot 稳定后覆盖完整 [0,1]，并分别报告：
+
+  teacher-forced q_splice_t；
+  stock noise_t1；
+  pure-noise multi-seed；
+  point/pose corruption robustness。
+
+
+8. canonical frame 是这条路线的关键创新点
+-----------------------------------------
+
+如果输出仍在 TRELLIS canonical frame，而 points/poses 在 AR world frame，那么模型前必须有可靠的 Sim(3)
+映射。不能继续只依赖稀疏 bbox normalization。
+
+有三种可研究方案：
+
+  A. robust point/mask canonicalizer，预测 world-to-generator Sim(3)；
+  B. 在 point-prior normalized frame 直接生成，并让 target SS 采用同一 frame；
+  C. 使用 SE(3)/Sim(3)-equivariant point encoder，使 condition 对输入 frame 更稳健。
+
+这可能比“再加一个 adapter”更有论文价值，因为它直接解决 AR measurement frame 与 3D generative
+canonical frame 的接口问题。
+
+
+9. 3090 下的现实训练方案
+------------------------
+
+不建议一开始 full fine-tune VGGT、Condition Net、SS Flow 和 SLAT Flow。
+
+单张 3090 的推荐两阶段实现：
+
+第一阶段：10k-object pilot
+
+  frozen VGGT；
+  frozen existing image Condition Net；
+  train PointPoseConditionNet；
+  train zero-init physical cross-attention；
+  train SS Flow attention LoRA rank 16/32；
+  batch=1；
+  gradient accumulation 8-16；
+  gradient checkpointing；
+  bf16/fp16 按稳定性选择；
+  SLAT 完全冻结。
+
+第二阶段：只在第一阶段 object-disjoint holdout 明确提升后
+
+  解冻 image Condition Net 最后 1-2 blocks 或加 LoRA；
+  SS LoRA 扩至 rank 64；
+  增加 30k-50k objects；
+  再考虑 SLAT physical/local condition 或 RVC。
+
+若要接近原论文 390k、batch192、40k-step 的训练，必须使用多 GPU DDP/FSDP 或更大显存卡。
+ReconViaGen/train_ss.py 已有 torchrun/DDP 框架，但当前新增 physical branch 和数据 loader 仍需适配。
+
+
+10. 最终路线取舍
+----------------
+
+低成本、最快裁决：
+
+  direct occupancy-logit correction / uncertainty-gated residual head。
+
+高投入、模型创新更强：
+
+  spatial PointPoseConditionNet
+    + block-wise physical cross-attention
+    + ReconViaGen SS Flow LoRA
+    + large mesh-supervised CFM training。
+
+两者不是互斥的。direct-logit correction 可以先验证物理 evidence 本身是否真的能改善 topology；
+如果它通过，再把相同 physical encoding 升级到 joint condition-flow training。
+
+因此当前应停止 B5.x 小 residual 搜索，但不应放弃“点云先验 + 位姿微调 ReconViaGen”。
+准确的下一步应是：先构建 object-disjoint、AR-noise-matched 的 supervised dataset，并做一个真正的
+PointPoseConditionNet + SS Flow LoRA pilot。这个核心实验目前尚未被现有任何分支真正执行过。

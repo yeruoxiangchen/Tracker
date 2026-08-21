@@ -1,0 +1,116 @@
+ProObjaverse 官方 SS2k / SLat25k 对 Strict ReconViaGen：Dev48 同表比较
+================================================================================
+
+最简命令（先只读校验，不生成目录）：
+
+cd /home/zjr/Tracker
+DRY_RUN=1 \
+  bash pose_point_depth_mv/background_jobs/run_proobjaverse_official_ss_slat_vs_reconviagen_dev48.sh
+
+校验通过后生成正式 JSON 和摘要：
+
+cd /home/zjr/Tracker
+bash pose_point_depth_mv/background_jobs/run_proobjaverse_official_ss_slat_vs_reconviagen_dev48.sh
+
+默认输出：
+
+/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+eval_dev48_official_ss2k_slat25k_vs_strict_reconviagen_v1/
+├── report.json
+└── summary.txt
+
+
+一、本次只比较什么
+================================================================================
+
+只使用官方 ProObjaverse Dev[16:64)，即未参与 Native-SS CFG
+校准的 held-out Dev48，每个物体使用 seed 42/43/44。
+
+四条路线：
+
+R = strict ReconViaGen
+    VGGT -> Stock SS -> Stock SLat -> Stock Mesh decoder
+
+A = 当前 posed-DINO 输入接口
+    posed-DINO -> Stock SS -> Stock SLat -> Stock Mesh decoder
+
+B = 当前 SS
+    posed-DINO -> official Native-SS step2000 EMA
+                -> Stock SLat -> Stock Mesh decoder
+
+C = 当前 SS + 当前 SLat
+    posed-DINO -> official Native-SS step2000 EMA
+                -> Native-SLat step25000 EMA -> Stock Mesh decoder
+
+这个脚本不测 Train64，也不测 GT-support SLat Dev。
+
+
+二、如何解读比较
+================================================================================
+
+1. B - A：当前 Native-SS 的纯增益
+
+   输入接口、初始噪声、Stock SLat、decoder、target 和指标都固定；
+   只把 Stock SS 替换为 official Native-SS step2000。
+
+2. C - B：当前 Native-SLat 的纯增益
+
+   当前 Native-SS support、posed-DINO condition、坐标键噪声、decoder、
+   target 和指标都固定；只把 Stock SLat 替换为 step25000 SLat。
+
+3. C - R：当前完整系统相对 strict ReconViaGen 的最终对比
+
+   这是最终 endpoint 比较，但它同时更换了 VGGT/posed-DINO
+   输入接口、SS 和 SLat，不能将 C-R 全部归因给 SS 或 SLat。
+
+4. A - R 和 B - R
+
+   report.json 中保留为接口/系统诊断，不作纯组件归因。
+
+所有差值都统一为：正值表示 candidate 优于 baseline。
+
+- Chamfer-L1 越低越好：delta = baseline - candidate。
+- F-score / normal consistency / largest-component ratio 越高越好：
+  delta = candidate - baseline。
+
+
+三、严格完整性规则
+================================================================================
+
+- 读取已完成的 5 个 strict ReconViaGen worker report；
+- 读取已完成的 5 个 step25k current worker report；
+- 验证 report 内部 SHA256；
+- 验证 cache/lifting/SS report/SS checkpoint/freeze/SLat checkpoint 真实 SHA256；
+- 验证对象集严格为 Dev[16:64)；
+- 验证每条路线都覆盖 48 x 3 个 object-seed record；
+- 验证 R/A/B/C 对每个 object-seed 使用完全相同的 target Mesh；
+- 四条路线统一只使用“三个 seed 全部成功”的公共物体；
+- 失败 seed、各路线 Mesh success rate 和被排除物体仍显式写入 report；
+- 不重跑 GPU 推理，不保存 Mesh，不修改原 worker report。
+
+
+四、如果要改输出目录
+================================================================================
+
+cd /home/zjr/Tracker
+
+OUTPUT_DIR=/data/zjr/你的新目录 \
+  bash pose_point_depth_mv/background_jobs/run_proobjaverse_official_ss_slat_vs_reconviagen_dev48.sh
+
+输出目录必须不存在，脚本会拒绝覆盖旧证据。
+
+
+五、默认锁定的当前模型
+================================================================================
+
+Native-SS:
+  step = 2000
+  weights = ema
+
+Native-SLat:
+  step = 25000
+  weights = ema
+  SHA256 = 5092422900fe7d1e467684f0168aaa2cce67c754f6a48ff33d91c3772b2bcf58
+
+如果未来替换 SLat checkpoint，不能只改文字路径；必须提供与
+worker reports 一致的 EXPECTED_STEP、EXPECTED_SHA256 和 current report 集。

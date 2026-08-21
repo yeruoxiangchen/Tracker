@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# Native 16^3 SS + active 32^3 SLAT every-block adapter-only route.
+# G0之后不再使用本phase runner。后续请逐步复制：
+# pose_point_depth_mv/Native3DCondition_G0后逐步复制运行命令_20260731.txt
+# Run exactly one phase at a time, for example:
+#   PHASE=C0 bash pose_point_depth_mv/Native3DCondition_SS_SLAT重构训练与验证命令_20260730.txt
+#   GPU=5 PHASE=G0 ...
+# Long phases are not started by default. Monitor the printed log with tail -f.
+
+set -uo pipefail
+
+ROOT_DIR=${ROOT_DIR:-/home/zjr/Tracker}
+PY=${PY:-/home/zjr/anaconda3/envs/reconviagen/bin/python}
+PRETRAINED=${PRETRAINED:-Stable-X/trellis-vggt-v0-2}
+GPU=${GPU:-0}
+PHASE=${PHASE:-HELP}
+WORK=${WORK:-/data/zjr/native3d_condition_ss_slat_20260730_v1}
+
+export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/matplotlib}
+export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-/tmp/numba_cache}
+export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-/tmp/torch_extensions}
+mkdir -p "${MPLCONFIGDIR}" "${NUMBA_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"
+
+# Set these to the final reviewed train/validation artifacts before G0 or training.
+SS_TRAIN_LIFT=${SS_TRAIN_LIFT:-}
+SS_VAL_LIFT=${SS_VAL_LIFT:-}
+TRAIN_SLAT_ROOT=${TRAIN_SLAT_ROOT:-}
+VAL_SLAT_ROOT=${VAL_SLAT_ROOT:-}
+TARGET_DEC_AUDIT=${TARGET_DEC_AUDIT:-}
+
+# G0 only needs an already materialized Direct-SLAT cache to exercise the real
+# frozen sparse stem. It is not used as new-route training evidence.
+BOOTSTRAP_SLAT_CACHE=${BOOTSTRAP_SLAT_CACHE:-}
+
+SS8=${WORK}/ss8_overfit_seed42_v2
+SS64=${WORK}/ss64_smoke_seed42_v1
+SS1K=${WORK}/ss1k_seed42_v1
+SS8_CKPT=${SS8}/checkpoints/step_000200.pt
+SS64_CKPT=${SS64}/checkpoints/step_000500.pt
+SS1K_CKPT=${SS1K}/checkpoints/step_001000.pt
+
+SLAT_TRAIN_CACHE=${WORK}/slat_train_native_ss1k_seed424344_v1
+SLAT_VAL_CACHE=${WORK}/slat_val_native_ss1k_seed424344_v1
+SLAT8=${WORK}/slat8_overfit_seed42_v1
+SLAT64=${WORK}/slat64_smoke_seed42_v1
+SLAT1K=${WORK}/slat1k_seed42_v1
+SLAT8_CKPT=${SLAT8}/checkpoints/step_000200.pt
+SLAT64_CKPT=${SLAT64}/checkpoints/step_000500.pt
+SLAT1K_CKPT=${SLAT1K}/checkpoints/step_001000.pt
+
+mkdir -p "${WORK}/logs"
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 96
+}
+
+require_env() {
+  local name=$1
+  local value=${!name:-}
+  [ -n "${value}" ] || fail "set ${name} before PHASE=${PHASE}"
+}
+
+require_file() {
+  [ -s "$1" ] || fail "required non-empty file is missing: $1"
+}
+
+require_dir() {
+  [ -d "$1" ] || fail "required directory is missing: $1"
+}
+
+run_logged() {
+  local log=$1
+  shift
+  mkdir -p "$(dirname "${log}")"
+  echo "log=${log}"
+  echo "monitor: tail -f '${log}'"
+  set +e
+  "$@" 2>&1 | tee "${log}"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  printf '%s\n' "${rc}" > "${log}.exit_code"
+  return "${rc}"
+}
+
+run_new_output() {
+  local output=$1
+  local log=$2
+  shift 2
+  if [ -s "${output}/report.json" ]; then
+    echo "reuse immutable complete output: ${output}"
+    return 0
+  fi
+  if [ -e "${output}" ]; then
+    fail "partial output exists; preserve and inspect before retry: ${output}"
+  fi
+  run_logged "${log}" "$@"
+}
+
+native_env() {
+  env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "$@"
+}
+
+cd "${ROOT_DIR}" || exit 96
+require_file "${PY}"
+
+case "${PHASE}" in
+  HELP)
+    cat <<'EOF'
+Phases:
+  C0      syntax + focused CPU tests
+  G0      real-cache projection/control + real SS/SLAT zero-init Stock audit
+  SS8     8-object SS graph/overfit smoke + teacher screening
+  SS64    64-object SS training + teacher + same-noise rollout/occupancy
+  SS1K    reviewed ~1k SS adapter-only training + validation rollout
+  L0      rebuild train/val SLAT caches with the new SS checkpoint
+  SLAT8   8-object SLAT graph/overfit smoke + teacher screening
+  SLAT64  64-object SLAT mechanism smoke + teacher screening
+  SLAT1K  reviewed ~1k SLAT adapter-only training + teacher screening
+  G4      32 objects x seeds 42/43/44 same-coordinate/same-noise Mesh
+
+Required path variables by later phases:
+  SS_TRAIN_LIFT, SS_VAL_LIFT, TRAIN_SLAT_ROOT, VAL_SLAT_ROOT,
+  TARGET_DEC_AUDIT, BOOTSTRAP_SLAT_CACHE
+
+Example:
+  GPU=5 PHASE=G0 SS_TRAIN_LIFT=/data/.../manifest.json \
+    BOOTSTRAP_SLAT_CACHE=/data/.../manifest.json bash "$0"
+EOF
+    ;;
+
+  C0)
+    run_logged "${WORK}/logs/C0_compile.log" \
+      "${PY}" -m py_compile \
+        pose_point_depth_mv/native_3d_condition.py \
+        pose_point_depth_mv/train_native_ss_flow.py \
+        pose_point_depth_mv/train_native_slat_flow.py \
+        pose_point_depth_mv/audit_native_3d_condition_g0.py \
+        pose_point_depth_mv/evaluate_native_condition_teacher.py \
+        pose_point_depth_mv/evaluate_native_ss_rollout.py \
+        pose_point_depth_mv/export_native_slat_mesh_pairs.py \
+        pose_point_depth_mv/build_direct_slat_cache.py \
+        pose_point_depth_mv/test_native_3d_condition.py || exit $?
+    run_logged "${WORK}/logs/C0_tests.log" \
+      "${PY}" -c \
+      "import inspect; import pose_point_depth_mv.test_native_3d_condition as m; tests=[(n,v) for n,v in vars(m).items() if n.startswith('test_') and inspect.isfunction(v)]; [(print(n, flush=True), v()) for n,v in tests]; print(f'{len(tests)} passed', flush=True)" || exit $?
+    bash -n pose_point_depth_mv/Native3DCondition_SS_SLAT重构训练与验证命令_20260730.txt
+    echo "C0 complete"
+    ;;
+
+  G0)
+    require_env SS_TRAIN_LIFT
+    require_env BOOTSTRAP_SLAT_CACHE
+    require_file "${SS_TRAIN_LIFT}"
+    require_file "${BOOTSTRAP_SLAT_CACHE}"
+    run_new_output "${WORK}/g0_native_condition_v2" "${WORK}/logs/G0_v2.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.audit_native_3d_condition_g0 \
+        --lifting_cache_manifest "${SS_TRAIN_LIFT}" \
+        --slat_cache_manifest "${BOOTSTRAP_SLAT_CACHE}" \
+        --output_dir "${WORK}/g0_native_condition_v2" \
+        --pretrained "${PRETRAINED}" \
+        --indices 0-1 \
+        --max_samples 2 \
+        --max_sparse_points 2048 \
+        --feature_source dino \
+        --hidden_dim 128 \
+        --check_models \
+        --device cuda || exit $?
+    ;;
+
+  SS8)
+    require_env SS_TRAIN_LIFT
+    require_file "${SS_TRAIN_LIFT}"
+    run_new_output "${SS8}" "${WORK}/logs/SS8_train.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.train_native_ss_flow \
+        --cache_manifest "${SS_TRAIN_LIFT}" \
+        --output_dir "${SS8}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 8 \
+        --max_steps 200 \
+        --save_every 200 \
+        --log_every 5 \
+        --grad_accum 1 \
+        --seed 42 \
+        --lr 1e-4 \
+        --hidden_dim 128 \
+        --feature_source dino \
+        --control_probability 0.25 \
+        --control_rank_weight 0.0 \
+        --amp_dtype bf16 || exit $?
+    require_file "${SS8_CKPT}"
+    run_new_output "${SS8}/teacher_train8_v1" "${WORK}/logs/SS8_teacher.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_condition_teacher \
+        --stage ss \
+        --cache_manifest "${SS_TRAIN_LIFT}" \
+        --checkpoint "${SS8_CKPT}" \
+        --output_dir "${SS8}/teacher_train8_v1" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 8 \
+        --seed 42 \
+        --min_object_win_rate 0.5 || exit $?
+    ;;
+
+  SS64)
+    require_env SS_TRAIN_LIFT
+    require_env SS_VAL_LIFT
+    require_file "${SS_TRAIN_LIFT}"
+    require_file "${SS_VAL_LIFT}"
+    run_new_output "${SS64}" "${WORK}/logs/SS64_train.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.train_native_ss_flow \
+        --cache_manifest "${SS_TRAIN_LIFT}" \
+        --output_dir "${SS64}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 64 \
+        --max_steps 500 \
+        --save_every 100 \
+        --log_every 5 \
+        --grad_accum 8 \
+        --seed 42 \
+        --lr 1e-4 \
+        --hidden_dim 128 \
+        --feature_source dino \
+        --control_probability 0.10 \
+        --control_rank_weight 0.0 \
+        --gradient_checkpointing \
+        --amp_dtype bf16 || exit $?
+    require_file "${SS64_CKPT}"
+    run_new_output "${SS64}/teacher_val64_v1" "${WORK}/logs/SS64_teacher.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_condition_teacher \
+        --stage ss \
+        --cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SS64_CKPT}" \
+        --output_dir "${SS64}/teacher_val64_v1" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 64 \
+        --seed 42 \
+        --min_object_win_rate 0.5 || exit $?
+    run_new_output "${SS64}/rollout_val64_seed424344_v1" "${WORK}/logs/SS64_rollout.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_rollout \
+        --cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SS64_CKPT}" \
+        --output_dir "${SS64}/rollout_val64_seed424344_v1" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 64 \
+        --joint_seeds 42,43,44 \
+        --steps 30 \
+        --min_iou_gain_mean 0 \
+        --min_iou_win_rate 0.5 || exit $?
+    ;;
+
+  SS1K)
+    require_env SS_TRAIN_LIFT
+    require_env SS_VAL_LIFT
+    require_file "${SS_TRAIN_LIFT}"
+    require_file "${SS_VAL_LIFT}"
+    run_new_output "${SS1K}" "${WORK}/logs/SS1K_train.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.train_native_ss_flow \
+        --cache_manifest "${SS_TRAIN_LIFT}" \
+        --output_dir "${SS1K}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 0 \
+        --max_steps 1000 \
+        --save_every 100 \
+        --log_every 5 \
+        --grad_accum 8 \
+        --seed 42 \
+        --lr 1e-4 \
+        --hidden_dim 128 \
+        --feature_source dino \
+        --control_probability 0.10 \
+        --control_rank_weight 0.0 \
+        --gradient_checkpointing \
+        --amp_dtype bf16 || exit $?
+    require_file "${SS1K_CKPT}"
+    run_new_output "${SS1K}/teacher_val_v1" "${WORK}/logs/SS1K_teacher.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_condition_teacher \
+        --stage ss \
+        --cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SS1K_CKPT}" \
+        --output_dir "${SS1K}/teacher_val_v1" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 64 \
+        --seed 42 \
+        --min_object_win_rate 0.5 || exit $?
+    run_new_output "${SS1K}/rollout_val64_seed424344_v1" "${WORK}/logs/SS1K_rollout.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_rollout \
+        --cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SS1K_CKPT}" \
+        --output_dir "${SS1K}/rollout_val64_seed424344_v1" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 64 \
+        --joint_seeds 42,43,44 \
+        --steps 30 \
+        --min_iou_gain_mean 0 \
+        --min_iou_win_rate 0.5 || exit $?
+    ;;
+
+  L0)
+    require_env SS_TRAIN_LIFT
+    require_env SS_VAL_LIFT
+    require_env TRAIN_SLAT_ROOT
+    require_env VAL_SLAT_ROOT
+    require_file "${SS_TRAIN_LIFT}"
+    require_file "${SS_VAL_LIFT}"
+    require_file "${SS1K_CKPT}"
+    require_dir "${TRAIN_SLAT_ROOT}"
+    require_dir "${VAL_SLAT_ROOT}"
+    if [ -e "${SLAT_TRAIN_CACHE}" ]; then
+      fail "SLAT train cache output exists; preserve/inspect it: ${SLAT_TRAIN_CACHE}"
+    fi
+    run_logged "${WORK}/logs/L0_train_cache.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.build_direct_slat_cache \
+        --lifting_manifest "${SS_TRAIN_LIFT}" \
+        --slat_root "${TRAIN_SLAT_ROOT}" \
+        --flow_checkpoint "${SS1K_CKPT}" \
+        --condition_arch native_every_block_v1 \
+        --output_dir "${SLAT_TRAIN_CACHE}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --expected_ss_step 1000 \
+        --ss_seeds 42,43,44 \
+        --ss_steps 30 \
+        --cfg_strength 7.5 \
+        --guidance_rescale 0.5 \
+        --rescale_t 3.0 \
+        --require_all_objects \
+        --amp_dtype bf16 || exit $?
+    if [ -e "${SLAT_VAL_CACHE}" ]; then
+      fail "SLAT val cache output exists; preserve/inspect it: ${SLAT_VAL_CACHE}"
+    fi
+    run_logged "${WORK}/logs/L0_val_cache.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.build_direct_slat_cache \
+        --lifting_manifest "${SS_VAL_LIFT}" \
+        --slat_root "${VAL_SLAT_ROOT}" \
+        --flow_checkpoint "${SS1K_CKPT}" \
+        --condition_arch native_every_block_v1 \
+        --output_dir "${SLAT_VAL_CACHE}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --expected_ss_step 1000 \
+        --ss_seeds 42,43,44 \
+        --ss_steps 30 \
+        --cfg_strength 7.5 \
+        --guidance_rescale 0.5 \
+        --rescale_t 3.0 \
+        --require_all_objects \
+        --amp_dtype bf16 || exit $?
+    require_file "${SLAT_TRAIN_CACHE}/manifest.json"
+    require_file "${SLAT_VAL_CACHE}/manifest.json"
+    ;;
+
+  SLAT8)
+    require_env SS_TRAIN_LIFT
+    require_env TARGET_DEC_AUDIT
+    require_file "${SLAT_TRAIN_CACHE}/manifest.json"
+    require_file "${SS_TRAIN_LIFT}"
+    require_file "${TARGET_DEC_AUDIT}"
+    run_new_output "${SLAT8}" "${WORK}/logs/SLAT8_train.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.train_native_slat_flow \
+        --cache_manifest "${SLAT_TRAIN_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_TRAIN_LIFT}" \
+        --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+        --output_dir "${SLAT8}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 8 \
+        --max_steps 200 \
+        --save_every 200 \
+        --log_every 5 \
+        --grad_accum 1 \
+        --seed 42 \
+        --lr 1e-4 \
+        --hidden_dim 128 \
+        --feature_source dino \
+        --control_probability 0.25 \
+        --control_rank_weight 0.0 \
+        --amp_dtype bf16 || exit $?
+    require_file "${SLAT8_CKPT}"
+    run_new_output "${SLAT8}/teacher_train8_v1" "${WORK}/logs/SLAT8_teacher.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_condition_teacher \
+        --stage slat \
+        --cache_manifest "${SLAT_TRAIN_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_TRAIN_LIFT}" \
+        --checkpoint "${SLAT8_CKPT}" \
+        --output_dir "${SLAT8}/teacher_train8_v1" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 8 \
+        --seed 42 \
+        --min_object_win_rate 0.5 || exit $?
+    ;;
+
+  SLAT64)
+    require_env SS_TRAIN_LIFT
+    require_env SS_VAL_LIFT
+    require_env TARGET_DEC_AUDIT
+    require_file "${SLAT_TRAIN_CACHE}/manifest.json"
+    require_file "${SLAT_VAL_CACHE}/manifest.json"
+    require_file "${TARGET_DEC_AUDIT}"
+    run_new_output "${SLAT64}" "${WORK}/logs/SLAT64_train.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.train_native_slat_flow \
+        --cache_manifest "${SLAT_TRAIN_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_TRAIN_LIFT}" \
+        --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+        --output_dir "${SLAT64}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 64 \
+        --max_steps 500 \
+        --save_every 100 \
+        --log_every 5 \
+        --grad_accum 8 \
+        --seed 42 \
+        --lr 1e-4 \
+        --hidden_dim 128 \
+        --feature_source dino \
+        --control_probability 0.10 \
+        --control_rank_weight 0.0 \
+        --gradient_checkpointing \
+        --amp_dtype bf16 || exit $?
+    require_file "${SLAT64_CKPT}"
+    run_new_output "${SLAT64}/teacher_val64_v1" "${WORK}/logs/SLAT64_teacher.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_condition_teacher \
+        --stage slat \
+        --cache_manifest "${SLAT_VAL_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SLAT64_CKPT}" \
+        --output_dir "${SLAT64}/teacher_val64_v1" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 64 \
+        --seed 42 \
+        --min_object_win_rate 0.5 || exit $?
+    ;;
+
+  SLAT1K)
+    require_env SS_TRAIN_LIFT
+    require_env SS_VAL_LIFT
+    require_env TARGET_DEC_AUDIT
+    require_file "${SLAT_TRAIN_CACHE}/manifest.json"
+    require_file "${SLAT_VAL_CACHE}/manifest.json"
+    require_file "${TARGET_DEC_AUDIT}"
+    run_new_output "${SLAT1K}" "${WORK}/logs/SLAT1K_train.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.train_native_slat_flow \
+        --cache_manifest "${SLAT_TRAIN_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_TRAIN_LIFT}" \
+        --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+        --output_dir "${SLAT1K}" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --max_objects 0 \
+        --max_steps 1000 \
+        --save_every 100 \
+        --log_every 5 \
+        --grad_accum 8 \
+        --seed 42 \
+        --lr 1e-4 \
+        --hidden_dim 128 \
+        --feature_source dino \
+        --control_probability 0.10 \
+        --control_rank_weight 0.0 \
+        --gradient_checkpointing \
+        --amp_dtype bf16 || exit $?
+    require_file "${SLAT1K_CKPT}"
+    run_new_output "${SLAT1K}/teacher_val_v1" "${WORK}/logs/SLAT1K_teacher.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.evaluate_native_condition_teacher \
+        --stage slat \
+        --cache_manifest "${SLAT_VAL_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SLAT1K_CKPT}" \
+        --output_dir "${SLAT1K}/teacher_val_v1" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 64 \
+        --seed 42 \
+        --min_object_win_rate 0.5 || exit $?
+    ;;
+
+  G4)
+    require_env SS_VAL_LIFT
+    require_file "${SLAT_VAL_CACHE}/manifest.json"
+    require_file "${SS_VAL_LIFT}"
+    require_file "${SLAT1K_CKPT}"
+    run_new_output "${SLAT1K}/mesh32_seed424344_v1" "${WORK}/logs/G4_mesh32x3.log" \
+      native_env "${PY}" -u -m pose_point_depth_mv.export_native_slat_mesh_pairs \
+        --cache_manifest "${SLAT_VAL_CACHE}/manifest.json" \
+        --lifting_cache_manifest "${SS_VAL_LIFT}" \
+        --checkpoint "${SLAT1K_CKPT}" \
+        --output_dir "${SLAT1K}/mesh32_seed424344_v1" \
+        --pretrained "${PRETRAINED}" \
+        --indices all \
+        --joint_seeds 42,43,44 \
+        --max_objects 32 \
+        --steps 25 \
+        --cfg_strength 5.0 \
+        --cfg_interval 0.5,1.0 \
+        --rescale_t 3.0 \
+        --surface_samples 20000 \
+        --bootstrap_samples 5000 \
+        --require_complete_matrix \
+        --amp_dtype bf16 || exit $?
+    ;;
+
+  *)
+    fail "unknown PHASE=${PHASE}; use PHASE=HELP"
+    ;;
+esac
+
+echo "phase ${PHASE} finished; current terminal remains open"

@@ -1,0 +1,693 @@
+Native synthetic 1k no-VGGT ablation commands
+==============================================
+
+Purpose
+-------
+Run the no-VGGT ablation on the existing reviewed 1k synthetic split while the
+real 500-object dataset is being built.
+
+The original Native v2 Full entrypoints are not modified by these commands.
+The no-VGGT path uses DINO-only visual tokens, pose/K/T, masks, point priors,
+and the existing SS/SLat targets. VGGT features, VGGT depth, and VGGT model
+execution are forbidden by the cache/checkpoint contracts.
+
+Important
+---------
+The original Full lifting cache is not passed directly to the no-VGGT trainer.
+First derive a DINO-only cache. This is a CPU/IO transformation of the existing
+cache and does not execute VGGT again.
+
+Each section is intended to be run as a separate shell command. Every command
+uses a subshell and prints its own return code; it must not close the caller's
+terminal. Choose GPUs that are actually idle before starting GPU stages.
+
+
+0. Paths and source contract
+----------------------------
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SRC=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  mkdir -p "${RUN}/logs"
+
+  test -x "${PY}"
+  test -s "${SRC}/train868_manifest.json"
+  test -s "${SRC}/val64_sourcebalanced_manifest.json"
+
+  "${PY}" - "${SRC}/train868_manifest.json" "${SRC}/val64_sourcebalanced_manifest.json" <<'PY'
+import json
+import sys
+
+for path in sys.argv[1:]:
+    payload = json.load(open(path, encoding="utf-8"))
+    assert payload["format"] == "ar_ss_flow.pose_lifting_cache.v1"
+    assert payload["passed"] if "passed" in payload else True
+    assert payload["visual_feature_dim"] == 3072
+    assert payload["feature_metadata"]["vggt_feature_dim"] == 2048
+    print(path, {
+        "sample_count": payload["sample_count"],
+        "object_count": payload["object_count"],
+        "config_hash": payload["config_hash"],
+    })
+PY
+  df -h /data/zjr
+  echo "F0 passed; original Full source cache is present"
+)
+F0_RC=$?
+echo "F0_RC=${F0_RC}; current terminal remains open"
+
+
+1. Derive no-VGGT train868 cache
+---------------------------------
+
+Run this first. A partial output directory is resumed; a complete manifest is
+validated and reused. Do not delete a partial directory.
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SRC=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/train868_manifest.json
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  OUT=${RUN}/lifting_train868_dino_only_v1
+  LOG=${RUN}/logs/F1_train868_dino_only.log
+
+  if [ -s "${OUT}/lifting_manifest.json" ] && [ -s "${OUT}/_DINO_ONLY_COMPLETE.json" ]; then
+    "${PY}" - "${OUT}/lifting_manifest.json" <<'PY'
+import sys
+from ar_ss_flow.local_pose_lifting_flow import PoseLiftingCacheDataset
+from pose_point_depth_mv.dino_only_condition import validate_dino_only_lifting_contract
+
+dataset = PoseLiftingCacheDataset(sys.argv[1])
+contract = validate_dino_only_lifting_contract(dataset)
+assert dataset.visual_feature_dim == 1024
+assert contract["vggt_feature_dim"] == 0
+assert contract["dino_feature_dim"] == 1024
+assert len(dataset) == 1417
+print({"passed": True, "samples": len(dataset), "objects": len({r["object_uid"] for r in dataset.rows}), "contract": contract})
+PY
+  elif [ -e "${OUT}" ]; then
+    echo "F1 resume partial cache: ${OUT}"
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.derive_dino_only_lifting_cache \
+      --source_manifest "${SRC}" \
+      --output_dir "${OUT}" \
+      --indices all \
+      --ss_context_tokens 4096 \
+      --resume
+  else
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.derive_dino_only_lifting_cache \
+      --source_manifest "${SRC}" \
+      --output_dir "${OUT}" \
+      --indices all \
+      --ss_context_tokens 4096
+  fi
+) 2>&1 | tee "${LOG}"
+F1_RC=${PIPESTATUS[0]}
+echo "F1_RC=${F1_RC}; current terminal remains open"
+
+
+2. Derive no-VGGT val64 cache
+------------------------------
+
+This split is object-disjoint from train868 and is used for CFG calibration
+and the final SS holdout. It is deliberately kept as a separate immutable
+cache.
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SRC=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  OUT=${RUN}/lifting_val64_dino_only_v1
+  LOG=${RUN}/logs/F2_val64_dino_only.log
+
+  if [ -s "${OUT}/lifting_manifest.json" ] && [ -s "${OUT}/_DINO_ONLY_COMPLETE.json" ]; then
+    "${PY}" - "${OUT}/lifting_manifest.json" <<'PY'
+import sys
+from ar_ss_flow.local_pose_lifting_flow import PoseLiftingCacheDataset
+from pose_point_depth_mv.dino_only_condition import validate_dino_only_lifting_contract
+
+dataset = PoseLiftingCacheDataset(sys.argv[1])
+contract = validate_dino_only_lifting_contract(dataset)
+assert dataset.visual_feature_dim == 1024
+assert contract["vggt_feature_dim"] == 0
+assert len(dataset) == 64
+print({"passed": True, "samples": len(dataset), "objects": len({r["object_uid"] for r in dataset.rows}), "contract": contract})
+PY
+  elif [ -e "${OUT}" ]; then
+    echo "F2 resume partial cache: ${OUT}"
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.derive_dino_only_lifting_cache \
+      --source_manifest "${SRC}" \
+      --output_dir "${OUT}" \
+      --indices all \
+      --ss_context_tokens 4096 \
+      --resume
+  else
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.derive_dino_only_lifting_cache \
+      --source_manifest "${SRC}" \
+      --output_dir "${OUT}" \
+      --indices all \
+      --ss_context_tokens 4096
+  fi
+) 2>&1 | tee "${LOG}"
+F2_RC=${PIPESTATUS[0]}
+echo "F2_RC=${F2_RC}; current terminal remains open"
+
+
+3. Validate both derived caches
+-------------------------------
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+
+  "${PY}" - "${RUN}/lifting_train868_dino_only_v1/lifting_manifest.json" "${RUN}/lifting_val64_dino_only_v1/lifting_manifest.json" <<'PY'
+import sys
+from ar_ss_flow.local_pose_lifting_flow import PoseLiftingCacheDataset
+from pose_point_depth_mv.dino_only_condition import validate_dino_only_lifting_contract
+
+train = PoseLiftingCacheDataset(sys.argv[1])
+val = PoseLiftingCacheDataset(sys.argv[2])
+for name, dataset in (("train", train), ("val", val)):
+    contract = validate_dino_only_lifting_contract(dataset)
+    assert dataset.visual_feature_dim == 1024
+    assert contract["vggt_feature_dim"] == 0
+    assert contract["dino_feature_dim"] == 1024
+    assert contract["patch_count"] == 1369
+    assert contract["vggt_model_executed"] is False
+    print(name, {"samples": len(dataset), "objects": len({r["object_uid"] for r in dataset.rows}), "config_hash": dataset.config_hash})
+assert {r["object_uid"] for r in train.rows}.isdisjoint({r["object_uid"] for r in val.rows})
+print("F3 passed; train/val no-VGGT contracts and object disjointness are valid")
+PY
+)
+F3_RC=$?
+echo "F3_RC=${F3_RC}; current terminal remains open"
+
+
+4. Train no-VGGT Native SS from v2 Full EMA
+---------------------------------------------
+
+This is a new no-VGGT optimization trajectory. The parent optimizer, step,
+history, and RNG are not inherited. Only the v2 Full EMA trainable state is
+used for initialization.
+
+Set NO_VGGT_SS_GPUS to an idle pair. The command below uses the same 2000-step
+budget as the v2 Full SS run.
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+  NO_VGGT_SS_GPUS=${NO_VGGT_SS_GPUS:-3,4}
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  TRAIN_LIFT=${RUN}/lifting_train868_dino_only_v1/lifting_manifest.json
+  PARENT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/checkpoints/step_002000.pt
+  OUT=${RUN}/ss868_step2000_seed42_2gpu_v1
+  LOG=${RUN}/logs/F4_ss868_step2000_seed42_2gpu.log
+
+  test -s "${TRAIN_LIFT}"
+  test -s "${PARENT}"
+  if [ -s "${OUT}/report.json" ] && [ -s "${OUT}/checkpoints/step_002000.pt" ]; then
+    echo "F4 reuse complete output: ${OUT}"
+  else
+    if [ -e "${OUT}/checkpoints/last.pt" ]; then
+      RESUME_ARGS=(--resume "${OUT}/checkpoints/last.pt")
+      echo "F4 resume: ${OUT}/checkpoints/last.pt"
+    else
+      RESUME_ARGS=(--init_checkpoint "${PARENT}" --init_weights ema)
+      echo "F4 initialize from v2 Full EMA: ${PARENT}"
+    fi
+    CUDA_VISIBLE_DEVICES="${NO_VGGT_SS_GPUS}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${TORCHRUN}" --standalone --nproc_per_node=2 \
+      -m pose_point_depth_mv.train_native_ss_genrecon_no_vggt \
+      --cache_manifest "${TRAIN_LIFT}" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices all \
+      "${RESUME_ARGS[@]}" \
+      --max_steps 2000 \
+      --save_every 200 \
+      --log_every 10 \
+      --grad_accum 8 \
+      --num_workers 0 \
+      --seed 42 \
+      --lora_rank 8 \
+      --lora_alpha 16 \
+      --condition_channels 1024 \
+      --new_lr 1e-4 \
+      --lora_lr 3e-5 \
+      --new_weight_decay 0.01 \
+      --grad_clip 1.0 \
+      --warmup_ratio 0.02 \
+      --ema_decay 0.9995 \
+      --p_uncond 0.1 \
+      --t_logit_mean 1.0 \
+      --t_logit_std 1.0 \
+      --min_condition_views 1 \
+      --max_condition_views 16 \
+      --amp_dtype bf16 \
+      --gradient_checkpointing \
+      2>&1 | tee "${LOG}"
+  fi
+)
+F4_RC=${PIPESTATUS[0]}
+echo "F4_RC=${F4_RC}; current terminal remains open"
+
+
+5. SS CFG calibration on frozen source-balanced CFG16
+------------------------------------------------------
+
+The val64 manifest freezes objects 0-15 for checkpoint selection, 16-31 for
+CFG calibration, and 32-63 for final evaluation.  The no-VGGT evaluator keeps
+manifest order; it must not UID-sort before applying these slices.  This
+command may return RC=2 if no CFG candidate passes the strict SS gate; the
+calibration.json is still diagnostic.
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${NO_VGGT_SS_EVAL_GPU:-6}
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  VAL=${RUN}/lifting_val64_dino_only_v1/lifting_manifest.json
+  CKPT=${RUN}/ss868_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt
+  OUT=${RUN}/ss_calibration_cfg16_step2000_ema_sourcebalanced_v2
+  LOG=${RUN}/logs/F5_ss_calibration_cfg16_sourcebalanced_v2.log
+
+  test -s "${VAL}"
+  test -s "${CKPT}"
+  if [ -s "${OUT}/calibration.json" ]; then
+    "${PY}" - "${OUT}/calibration.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+print(json.dumps({"format": p.get("format"), "passed": p.get("passed"), "selected": p.get("selected")}, indent=2))
+PY
+  else
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon_no_vggt \
+      --mode calibrate \
+      --cache_manifest "${VAL}" \
+      --checkpoint "${CKPT}" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --object_start 16 \
+      --object_end 32 \
+      --joint_seeds 42,43,44 \
+      --candidate_cfg_strengths 1,3,5 \
+      --weights ema \
+      --steps 25 \
+      --cfg_interval 0.5,1.0 \
+      --guidance_rescale 0.0 \
+      --rescale_t 3.0 \
+      --amp_dtype bf16 \
+      --bootstrap_samples 5000 \
+      --min_iou_gain_mean 0.0 \
+      --min_iou_win_rate 0.5 \
+      --min_recall_gain_mean 0.0 \
+      --min_latent_mse_gain_mean 0.0 \
+      --min_count_ratio 0.85 \
+      --max_count_ratio 1.20 \
+      --min_pose_control_iou_advantage 0.0 \
+      2>&1 | tee "${LOG}"
+  fi
+)
+F5_RC=${PIPESTATUS[0]}
+echo "F5_RC=${F5_RC}; current terminal remains open"
+
+
+6. SS final holdout: frozen source-balanced final32
+----------------------------------------------------
+
+This is object-disjoint from dev16. It uses the frozen calibration parameters
+and three same-noise seeds. Run only after F5 has produced passed calibration.
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${NO_VGGT_SS_EVAL_GPU:-6}
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  VAL=${RUN}/lifting_val64_dino_only_v1/lifting_manifest.json
+  CKPT=${RUN}/ss868_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt
+  CAL=${RUN}/ss_calibration_cfg16_step2000_ema_sourcebalanced_v2/calibration.json
+  OUT=${RUN}/ss_eval_final32_step2000_ema_sourcebalanced_v2
+  LOG=${RUN}/logs/F6_ss_eval_final32_sourcebalanced_v2.log
+
+  "${PY}" - "${CAL}" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["passed"] is True
+print({"calibration_passed": True, "selected": p["selected"]})
+PY
+  if [ -s "${OUT}/report.json" ]; then
+    "${PY}" - "${OUT}/report.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+print(json.dumps({"passed": p["passed"], "checks": p["checks"],
+                  "summary": p["correct"]["summary"],
+                  "pose_control": p["correct_over_pose_control_iou"]}, indent=2))
+raise SystemExit(0 if p["passed"] is True else 2)
+PY
+  else
+    if [ -e "${OUT}" ]; then
+      echo "F6 partial output exists; preserving it for diagnosis: ${OUT}"
+      exit 98
+    fi
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon_no_vggt \
+      --mode evaluate \
+      --cache_manifest "${VAL}" \
+      --checkpoint "${CKPT}" \
+      --output_dir "${OUT}" \
+      --calibration "${CAL}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --object_start 32 \
+      --object_end 64 \
+      --joint_seeds 42,43,44 \
+      --weights ema \
+      --steps 25 \
+      --cfg_interval 0.5,1.0 \
+      --guidance_rescale 0.0 \
+      --rescale_t 3.0 \
+      --amp_dtype bf16 \
+      --bootstrap_samples 5000 \
+      --min_iou_gain_mean 0.0 \
+      --min_iou_win_rate 0.5 \
+      --min_recall_gain_mean 0.0 \
+      --min_latent_mse_gain_mean 0.0 \
+      --min_count_ratio 0.85 \
+      --max_count_ratio 1.20 \
+      --min_pose_control_iou_advantage 0.0 \
+      2>&1 | tee "${LOG}"
+  fi
+)
+F6_RC=${PIPESTATUS[0]}
+echo "F6_RC=${F6_RC}; current terminal remains open"
+
+
+F7. 后台恢复正式no-VGGT Direct-SLat训练cache
+----------------------------------------------
+
+前置条件：F6正式final32必须通过。当前F6已经通过，F7部分cache保留在原
+目录中且尚无manifest.json。下面的命令会自动加入--resume，跳过已完成
+对象并继续构建；不会恢复已经废弃的探索性P3。
+
+任务使用nohup+setsid脱离SSH，并用flock和旧进程检查防止重复启动。
+NO_VGGT_SLAT_CACHE_GPU必须选择一张空闲卡，且不能与真实域S6使用的卡重叠。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+NO_VGGT_SLAT_CACHE_GPU=${NO_VGGT_SLAT_CACHE_GPU:-0}
+RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  no-vggt-f7-cache \
+  "${RUN}/logs/F7_slat_cache_train868_seed42.log" \
+  "${RUN}/logs/F7_slat_cache_background.pid" \
+  env NO_VGGT_SLAT_CACHE_GPU="${NO_VGGT_SLAT_CACHE_GPU}" \
+  bash pose_point_depth_mv/background_jobs/resume_no_vggt_f7_cache.sh
+F7_LAUNCH_RC=$?
+echo "F7_LAUNCH_RC=${F7_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 查看进度；Ctrl-C只退出tail，不停止cache构建：
+# tail -f /data/zjr/native_ss_no_vggt_mixed1k_20260807_v1/logs/F7_slat_cache_train868_seed42.log
+
+# SSH重连后查看状态：
+# cat /data/zjr/native_ss_no_vggt_mixed1k_20260807_v1/logs/F7_slat_cache_background.state
+# cat /data/zjr/native_ss_no_vggt_mixed1k_20260807_v1/logs/F7_slat_cache_background.exit_code
+
+# F7完成条件：exit_code为0，且slat_cache_train868_seed42_v1/manifest.json存在。
+
+
+F8. 构建冻结final32的target-only cache
+---------------------------------------
+
+F7完成后运行。本步只生成32个验证对象的真值target，不运行SS rollout，
+也不运行VGGT。F9正式解码审计要求完整32对象，不得缩减成smoke规模。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  LIFT=${RUN}/lifting_val64_dino_only_v1/lifting_manifest.json
+  SS_CKPT=${RUN}/ss868_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt
+  SS_REPORT=${RUN}/ss_eval_final32_step2000_ema_sourcebalanced_v2/report.json
+  SLAT_ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lh_slats_train_val_v2
+  OUT=${RUN}/slat_val32_target_only_v1
+  LOG=${RUN}/logs/F8_slat_val32_target_only.log
+
+  if [ -s "${OUT}/manifest.json" ]; then
+    echo "F8 reuse complete target-only cache: ${OUT}"
+  else
+    RESUME=()
+    if [ -e "${OUT}" ]; then RESUME=(--resume); fi
+    "${PY}" -u -m pose_point_depth_mv.build_direct_slat_cache_no_vggt \
+      --lifting_manifest "${LIFT}" \
+      --slat_root "${SLAT_ROOT}" \
+      --flow_checkpoint "${SS_CKPT}" \
+      --native_ss_report "${SS_REPORT}" \
+      --condition_arch native_ss_genrecon_v2 \
+      --output_dir "${OUT}" \
+      --indices 32-63 \
+      --ss_seeds 42,43,44 \
+      --expected_ss_step 2000 \
+      --amp_dtype bf16 \
+      --require_all_objects \
+      --target_only \
+      "${RESUME[@]}" \
+      2>&1 | tee "${LOG}"
+  fi
+)
+F8_RC=${PIPESTATUS[0]}
+echo "F8_RC=${F8_RC}; current terminal remains open"
+
+
+F9. 对val32真值target执行冻结decoder审计
+------------------------------------------
+
+这是正式SLat训练的最后准入门。F9未通过时不得启动F10。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${NO_VGGT_DECODER_AUDIT_GPU:-0}
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  CACHE=${RUN}/slat_val32_target_only_v1/manifest.json
+  OUT=${RUN}/slat_target_decoder_audit32_v1
+  LOG=${RUN}/logs/F9_slat_target_decoder_audit32.log
+
+  if [ -s "${OUT}/report.json" ]; then
+    "${PY}" - "${OUT}/report.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["passed"] is True
+assert p["summary"]["object_count"] == 32
+print(p["summary"])
+PY
+  else
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.audit_direct_slat_targets \
+      --cache_manifest "${CACHE}" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --max_objects 32 \
+      --surface_samples 20000 \
+      --max_chamfer_l1 0.10 \
+      --min_mesh_success_rate 1.0 \
+      --decision_profile strict \
+      2>&1 | tee "${LOG}"
+  fi
+)
+F9_RC=${PIPESTATUS[0]}
+echo "F9_RC=${F9_RC}; current terminal remains open"
+
+
+F10. 单卡后台训练正式no-VGGT Native-SLat v2（2000步）
+------------------------------------------------------
+
+只允许在F7、F8、F9全部通过后运行。首次启动仅加载现有v2 Full SLat EMA的
+可训练状态，不继承旧优化器和旧步数；若本目录已有checkpoints/last.pt，
+则自动从该断点继续。任务通过nohup+setsid在后台运行，SSH断开不影响训练。
+本命令只占用一张GPU，不启动torchrun/DDP；grad_accum=8，保持原双卡方案的
+global effective batch=8。单卡训练预计约为原双卡方案的两倍时间。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+NO_VGGT_SLAT_GPU=${NO_VGGT_SLAT_GPU:-4}
+RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  no-vggt-f10-slat \
+  "${RUN}/logs/F10_slat868_step2000_seed42_1gpu.log" \
+  "${RUN}/logs/F10_slat_training_background.pid" \
+  env NO_VGGT_SLAT_GPU="${NO_VGGT_SLAT_GPU}" \
+  bash pose_point_depth_mv/background_jobs/run_no_vggt_f10_slat.sh
+F10_LAUNCH_RC=$?
+echo "F10_LAUNCH_RC=${F10_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 查看进度；Ctrl-C只退出tail，不停止训练：
+# tail -f /data/zjr/native_ss_no_vggt_mixed1k_20260807_v1/logs/F10_slat868_step2000_seed42_1gpu.log
+
+# SSH重连后查看状态：
+# cat /data/zjr/native_ss_no_vggt_mixed1k_20260807_v1/logs/F10_slat_training_background.state
+# cat /data/zjr/native_ss_no_vggt_mixed1k_20260807_v1/logs/F10_slat_training_background.exit_code
+
+# F10完成条件必须同时满足：
+#   1. exit_code内容为0；
+#   2. slat868_step2000_seed42_1gpu_v1/checkpoints/step_002000.pt存在；
+#   3. slat868_step2000_seed42_1gpu_v1/report.json存在。
+
+
+11. Optional full val64 Direct-SLat cache for later evaluation
+---------------------------------------------------------------
+
+Run after F10 or in parallel with F10 if GPU capacity allows. This creates
+three same-noise seeds for the final synthetic holdout. The current repository
+has no dedicated no-VGGT v2 mesh-evaluation entrypoint yet; do not pass the v2
+no-VGGT checkpoint to the v3-only evaluator.
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${NO_VGGT_SLAT_VAL_GPU:-0}
+  RUN=/data/zjr/native_ss_no_vggt_mixed1k_20260807_v1
+  LIFT=${RUN}/lifting_val64_dino_only_v1/lifting_manifest.json
+  SS_CKPT=${RUN}/ss868_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt
+  SS_REPORT=${RUN}/ss_eval_final32_step2000_ema_sourcebalanced_v2/report.json
+  SLAT_ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lh_slats_train_val_v2
+  OUT=${RUN}/slat_cache_val64_seed424344_v1
+  LOG=${RUN}/logs/F11_slat_cache_val64_seed424344.log
+
+  test -s "${LIFT}"
+  test -s "${SS_CKPT}"
+  test -s "${SS_REPORT}"
+  if [ -s "${OUT}/manifest.json" ]; then
+    echo "F11 reuse complete cache: ${OUT}"
+  else
+    RESUME=()
+    if [ -e "${OUT}" ]; then RESUME=(--resume); fi
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.build_direct_slat_cache_no_vggt \
+      --lifting_manifest "${LIFT}" \
+      --slat_root "${SLAT_ROOT}" \
+      --flow_checkpoint "${SS_CKPT}" \
+      --native_ss_report "${SS_REPORT}" \
+      --condition_arch native_ss_genrecon_v2 \
+      --output_dir "${OUT}" \
+      --ss_seeds 42,43,44 \
+      --expected_ss_step 2000 \
+      --amp_dtype bf16 \
+      --require_all_objects \
+      "${RESUME[@]}" \
+      2>&1 | tee "${LOG}"
+  fi
+)
+F11_RC=${PIPESTATUS[0]}
+echo "F11_RC=${F11_RC}; current terminal remains open"
+
+
+Stop conditions
+---------------
+
+- F1/F2 fail: inspect cache contract or disk space; do not train.
+- F5 calibration fails: keep calibration.json for diagnosis; do not claim a
+  successful no-VGGT SS gate.
+- F6 fails: do not build the formal no-VGGT SLat training cache.
+- F7/F8/F9 fail: do not start no-VGGT SLat training.
+- A nonzero return code only ends the current subshell; the caller terminal is
+  intentionally left open.

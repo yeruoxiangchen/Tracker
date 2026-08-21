@@ -1,0 +1,847 @@
+# OmniObject3D 真实视频子集下载、事后去重与 500/64/64 冻结命令
+# 日期：2026-08-04
+# 版本：v2（覆盖“下载前过早筛选”的旧思路）
+#
+# 正确顺序：
+#   D0  核对本地 Scan.obj、远端 videos_processed 和现有 29-object pilot。
+#   D1  仅根据“远端类别归档存在 + 本地该类有 Scan.obj”冻结下载子集。
+#       此时不排除 reviewed1k 中用过的 Omni 对象。
+#   D2  逐类别归档、可恢复下载。
+#   D3  下载完成后冻结 gzip/尺寸报告。
+#   D4  解析归档目录，冻结严格的逐对象字段盘点（v1审计证据）。
+#   D4V2 从D4 v1显式分离eligible/rejected；允许有限坏对象被审计拒绝。
+#   D5  从冻结 reviewed1k split 生成 135-object 旧 Omni 排除清单。
+#   D5P 冻结 pilot29 计数账本，仅记录与 reviewed1k 的重叠，不排除 pilot。
+#   D6  在 D4V2 eligible集合上事后仅排除这 135 个对象，再冻结
+#       500 real-train + 64 real-dev + 64 untouched real-holdout。
+#       pilot29 不排除，D6 只记录它们在各 split 中的去向。
+#
+# 下载规模不是“直接宣称 1000 个可训样本”：
+#   pilot 中 35 个本地 Scan 候选只有 29 个实际 video/mesh 配对。为了在下载后
+#   排除最多 135 个旧 reviewed1k Omni，并仍保留 628 个新物理对象，
+#   覆盖率估算为：
+#
+#     ceil((500 + 64 + 64 + 135) / (29 / 35)) = 921
+#
+#   D1 因此选择 >=1000 个本地 Scan.obj 候选，给自动失败留少量余量。
+#   OpenXLab 的实际下载粒度是类别 tar.gz，无法在下载前得到精确 object 交集。
+#
+# 边界：
+#   - 本文件不包含 R8、模型训练或评估命令。
+#   - D4 v1不得覆盖；D4V2必须保留全部rejected对象及失败原因。
+#   - D6 的 split 仍是 raw video/mesh 候选，training_ready 必须为 false。
+#   - 旧 Omni 指 reviewed1k 中 119 train + 16 已消费 val，不是仅排除 119 train。
+#   - pilot29 不属于 reviewed1k 排除规则；除 battery_003 因与 reviewed1k
+#     重叠而被排除外，其余 28 个正常参与 split。
+#   - 去重同时检查规范化 object ID 和本地 Scan.obj 解析路径。
+#   - 不要一次运行整份文件；每步先检查 RC 和 JSON。
+#   - 所有失败只退出子 shell，不会关闭当前交互终端。
+#   - 既有 complete 结果复用；partial/损坏结果保留，不覆盖、不删除。
+
+
+###############################################################################
+# D0. 现有数据合同与环境预检
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  PILOT=/data/zjr/omni_real_video_pilot_20260804_v1
+  REMOTE=/data/zjr/dataset10k_20260726/manifests/omniobject3d_remote_list_20260726.txt
+  SCANS=/data/zjr/OmniObject3D/raw_scans_extracted_omni215_v1/categories
+  ARCHIVES=/data/zjr/OmniObject3D/raw/omniobject3d___OmniObject3D-New/raw/videos_processed
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+
+  test -x "${PY}" || exit 96
+  test -s "${REMOTE}" || exit 96
+  test -d "${SCANS}" || exit 96
+  test -d "${ARCHIVES}" || exit 96
+  test -s "${PILOT}/audit/R2_DOWNLOAD_SUMMARY.json" || exit 96
+  test -s "${PILOT}/R4_actual_video_object_inventory_v1/inventory.json" || exit 96
+  test -s "${PILOT}/audit/R5_SIM3_STRATIFIED_SAMPLE_PASS.json" || exit 96
+  test -s "${PILOT}/R6_raw_camera_point_cache_v1/raw_cache_report.json" || exit 96
+
+  "${PY}" - "${PILOT}" "${REMOTE}" "${SCANS}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+pilot = Path(sys.argv[1]).resolve()
+remote = Path(sys.argv[2]).resolve()
+scans = Path(sys.argv[3]).resolve()
+download = json.loads((pilot / "audit/R2_DOWNLOAD_SUMMARY.json").read_text())
+inventory = json.loads(
+    (pilot / "R4_actual_video_object_inventory_v1/inventory.json").read_text()
+)
+sim3 = json.loads(
+    (pilot / "audit/R5_SIM3_STRATIFIED_SAMPLE_PASS.json").read_text()
+)
+raw = json.loads(
+    (pilot / "R6_raw_camera_point_cache_v1/raw_cache_report.json").read_text()
+)
+assert download["passed"] is True
+assert inventory["passed"] is True and inventory["video_object_count"] == 29
+assert sim3["passed"] is True
+assert raw["passed"] is True and raw["object_count"] == 29
+assert raw["training_ready"] is False
+
+remote_count = len(
+    set(re.findall(r"/raw/videos_processed/[^/|]+\.tar\.gz", remote.read_text()))
+)
+mesh_count = sum(1 for path in scans.glob("*/*/Scan/Scan.obj") if path.is_file())
+assert remote_count >= 190
+assert mesh_count >= 5000
+print(json.dumps({
+    "pilot_scan_candidates": download["scan_object_count"],
+    "pilot_actual_video_mesh_pairs": inventory["video_object_count"],
+    "pilot_pair_rate": inventory["video_object_count"] / download["scan_object_count"],
+    "remote_video_category_archives": remote_count,
+    "local_scan_mesh_objects": mesh_count,
+    "next": "plan a category subset covering >=1000 local meshes; do not prefilter old Omni",
+}, indent=2, ensure_ascii=False))
+PY
+
+  "${PY}" -c 'import openxlab; print("openxlab_import=passed")'
+  mkdir -p "${ROOT}/manifests" "${ROOT}/audit" "${ROOT}/logs"
+  df -h /data/zjr
+  echo "D0 passed; run D1"
+)
+D0_RC=$?
+echo "D0_RC=${D0_RC}; current terminal remains open"
+
+
+###############################################################################
+# D1. 冻结下载子集：>=1000 本地 mesh 候选，不预先排除旧 Omni
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  PILOT_LIST=/data/zjr/omni_real_video_pilot_20260804_v1/manifests/r2_categories_35obj.txt
+  REMOTE=/data/zjr/dataset10k_20260726/manifests/omniobject3d_remote_list_20260726.txt
+  SCANS=/data/zjr/OmniObject3D/raw_scans_extracted_omni215_v1/categories
+  ARCHIVES=/data/zjr/OmniObject3D/raw/omniobject3d___OmniObject3D-New/raw/videos_processed
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  PLAN=${ROOT}/manifests/D1_download_plan.json
+  LIST=${ROOT}/manifests/D1_categories.txt
+
+  if [ -s "${PLAN}" ] && [ -s "${LIST}" ]; then
+    "${PY}" - "${PLAN}" "${LIST}" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+payload = Path(sys.argv[2]).read_text(encoding="utf-8")
+categories = [line for line in payload.splitlines() if line]
+assert plan["format"] == "pose_point_depth_mv.omni_real_video_download_plan.v2"
+assert plan["selection_uses_reviewed1k_exclusion"] is False
+assert plan["target_scan_mesh_candidates"] == 1000
+assert plan["scan_mesh_candidate_count"] >= 1000
+assert plan["category_count"] >= 48
+assert categories == plan["selected_categories"]
+assert hashlib.sha256(payload.encode("utf-8")).hexdigest() == plan["category_list_sha256"]
+print(json.dumps({k: plan[k] for k in (
+    "category_count", "scan_mesh_candidate_count", "estimated_archive_bytes",
+    "estimated_missing_archive_bytes", "selection_uses_reviewed1k_exclusion",
+    "category_list_sha256", "scope_guard"
+)}, indent=2, ensure_ascii=False))
+PY
+  elif [ -e "${PLAN}" ] || [ -e "${LIST}" ]; then
+    echo "D1 partial frozen plan exists; preserve and inspect: ${PLAN} ${LIST}"
+    exit 98
+  else
+    "${PY}" - "${PILOT_LIST}" "${REMOTE}" "${SCANS}" "${ARCHIVES}" "${PLAN}" "${LIST}" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+pilot_list = Path(sys.argv[1]).resolve()
+remote_list = Path(sys.argv[2]).resolve()
+scan_root = Path(sys.argv[3]).resolve()
+archive_root = Path(sys.argv[4]).resolve()
+plan_path = Path(sys.argv[5]).resolve()
+list_path = Path(sys.argv[6]).resolve()
+target_candidates = 1000
+minimum_categories = 48
+units = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+pattern = re.compile(
+    r"\|\s*(/raw/videos_processed/([^/]+)\.tar\.gz)\s*"
+    r"\|\s*([0-9.]+)\s*([KMGT]?)\s*\|"
+)
+
+available = {}
+for line in remote_list.read_text(encoding="utf-8", errors="replace").splitlines():
+    match = pattern.search(line)
+    if not match:
+        continue
+    remote_path, category, number, unit = match.groups()
+    category_root = scan_root / category
+    if not category_root.is_dir():
+        continue
+    object_ids = sorted(
+        path.name
+        for path in category_root.iterdir()
+        if path.is_dir() and (path / "Scan" / "Scan.obj").is_file()
+    )
+    if not object_ids:
+        continue
+    available[category] = {
+        "category": category,
+        "remote_path": remote_path,
+        "remote_bytes": int(float(number) * units[unit]),
+        "scan_mesh_object_count": len(object_ids),
+        "scan_mesh_object_ids": object_ids,
+    }
+
+pilot_categories = [
+    line.strip()
+    for line in pilot_list.read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+]
+missing_pilot = sorted(set(pilot_categories).difference(available))
+if missing_pilot:
+    raise RuntimeError(f"pilot categories absent from video/mesh overlap: {missing_pilot}")
+
+# 仅用归档字节效率和类别数规划下载；故意不读取 reviewed1k split。
+selected = set(pilot_categories)
+candidate_count = sum(
+    available[category]["scan_mesh_object_count"] for category in selected
+)
+ranked = sorted(
+    (row for category, row in available.items() if category not in selected),
+    key=lambda row: (
+        row["remote_bytes"] / row["scan_mesh_object_count"],
+        row["remote_bytes"],
+        row["category"],
+    ),
+)
+for row in ranked:
+    if candidate_count >= target_candidates and len(selected) >= minimum_categories:
+        break
+    selected.add(row["category"])
+    candidate_count += row["scan_mesh_object_count"]
+if candidate_count < target_candidates or len(selected) < minimum_categories:
+    raise RuntimeError(
+        f"insufficient candidates/categories: {candidate_count}/{len(selected)}"
+    )
+
+categories = sorted(selected)
+rows = []
+for category in categories:
+    row = dict(available[category])
+    archive = archive_root / f"{category}.tar.gz"
+    row["archive"] = str(archive)
+    row["archive_present_bytes"] = archive.stat().st_size if archive.is_file() else 0
+    row["already_downloaded"] = archive.is_file() and archive.stat().st_size > 0
+    rows.append(row)
+
+list_payload = "".join(f"{category}\n" for category in categories)
+list_sha256 = hashlib.sha256(list_payload.encode("utf-8")).hexdigest()
+payload = {
+    "format": "pose_point_depth_mv.omni_real_video_download_plan.v2",
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "target_scan_mesh_candidates": target_candidates,
+    "minimum_category_count": minimum_categories,
+    "category_count": len(rows),
+    "scan_mesh_candidate_count": sum(row["scan_mesh_object_count"] for row in rows),
+    "estimated_archive_bytes": sum(row["remote_bytes"] for row in rows),
+    "estimated_missing_archive_bytes": sum(
+        row["remote_bytes"] for row in rows if not row["already_downloaded"]
+    ),
+    "selection_uses_reviewed1k_exclusion": False,
+    "selected_categories": categories,
+    "category_list_sha256": list_sha256,
+    "categories": rows,
+    "selection_policy": (
+        "retain audited pilot categories, then add categories by compressed bytes "
+        "per local Scan.obj until >=1000 mesh candidates and >=48 categories; "
+        "reviewed1k object IDs are intentionally not consulted before download"
+    ),
+    "scope_guard": (
+        "Download plan only. Actual video IDs are unknown until archive inventory; "
+        "old reviewed1k Omni objects are filtered only after that inventory."
+    ),
+}
+plan_path.parent.mkdir(parents=True, exist_ok=True)
+list_path.write_text(list_payload, encoding="utf-8")
+plan_path.write_text(
+    json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+)
+print(json.dumps({k: payload[k] for k in (
+    "category_count", "scan_mesh_candidate_count", "estimated_archive_bytes",
+    "estimated_missing_archive_bytes", "selection_uses_reviewed1k_exclusion",
+    "category_list_sha256", "scope_guard"
+)}, indent=2, ensure_ascii=False))
+PY
+  fi
+
+  sha256sum "${PLAN}" "${LIST}"
+  echo "D1 passed; inspect estimated_missing_archive_bytes, then run D2"
+)
+D1_RC=$?
+echo "D1_RC=${D1_RC}; current terminal remains open"
+
+
+###############################################################################
+# D2. 前台、逐归档、可恢复下载
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  PLAN=${ROOT}/manifests/D1_download_plan.json
+  LIST=${ROOT}/manifests/D1_categories.txt
+  TARGET=/data/zjr/OmniObject3D/raw
+  ARCHIVES=${TARGET}/omniobject3d___OmniObject3D-New/raw/videos_processed
+  LOG=${ROOT}/logs/D2_download.log
+
+  test -s "${PLAN}" || exit 96
+  test -s "${LIST}" || exit 96
+  "${PY}" - "${PLAN}" "${LIST}" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+payload = Path(sys.argv[2]).read_text(encoding="utf-8")
+assert plan["format"] == "pose_point_depth_mv.omni_real_video_download_plan.v2"
+assert plan["selection_uses_reviewed1k_exclusion"] is False
+assert plan["scan_mesh_candidate_count"] >= 1000
+assert hashlib.sha256(payload.encode("utf-8")).hexdigest() == plan["category_list_sha256"]
+PY
+
+  if ps -ef | rg 'download_omniobject3d.py.*videos_processed' | rg -v 'rg ' >/dev/null; then
+    echo "D2 another videos_processed downloader is already active; do not duplicate it"
+    ps -ef | rg 'download_omniobject3d.py.*videos_processed' | rg -v 'rg ' || true
+    exit 97
+  fi
+
+  NEEDED=$("${PY}" -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["estimated_missing_archive_bytes"]))' "${PLAN}")
+  AVAILABLE_KB=$(df -Pk /data/zjr | awk 'NR==2 {print $4}')
+  REQUIRED_KB=$(( (NEEDED / 1024) * 12 / 10 + 20 * 1024 * 1024 ))
+  echo "download_needed_bytes=${NEEDED} available_kb=${AVAILABLE_KB} required_kb=${REQUIRED_KB}"
+  test "${AVAILABLE_KB}" -ge "${REQUIRED_KB}" || exit 96
+
+  mkdir -p "$(dirname "${LOG}")"
+  FAILURES=0
+  INDEX=0
+  TOTAL=$(awk 'NF && $1 !~ /^#/' "${LIST}" | wc -l)
+  while IFS= read -r CATEGORY; do
+    [ -n "${CATEGORY}" ] || continue
+    case "${CATEGORY}" in \#*) continue ;; esac
+    INDEX=$((INDEX + 1))
+    ARCHIVE=${ARCHIVES}/${CATEGORY}.tar.gz
+    REMOTE_PATH=/raw/videos_processed/${CATEGORY}.tar.gz
+    echo "[D2] ${INDEX}/${TOTAL} category=${CATEGORY} start=$(date -u +%FT%TZ)"
+
+    if [ -s "${ARCHIVE}" ]; then
+      if gzip -t "${ARCHIVE}"; then
+        echo "[D2] reuse gzip-verified archive: ${ARCHIVE}"
+      else
+        echo "[D2] corrupt/partial archive preserved: ${ARCHIVE}"
+        FAILURES=$((FAILURES + 1))
+      fi
+      continue
+    fi
+    if [ -e "${ARCHIVE}" ]; then
+      echo "[D2] empty/non-regular target preserved: ${ARCHIVE}"
+      FAILURES=$((FAILURES + 1))
+      continue
+    fi
+
+    if ! "${PY}" -u pose_point_depth_mv/dataset_tools/download_omniobject3d.py \
+      download \
+      --dataset-repo omniobject3d/OmniObject3D-New \
+      --source-path "${REMOTE_PATH}" \
+      --target-path "${TARGET}"; then
+      echo "[D2] download failed; preserve partial and continue: ${CATEGORY}"
+      FAILURES=$((FAILURES + 1))
+      continue
+    fi
+    if ! test -s "${ARCHIVE}" || ! gzip -t "${ARCHIVE}"; then
+      echo "[D2] downloaded archive failed verification; preserve: ${ARCHIVE}"
+      FAILURES=$((FAILURES + 1))
+      continue
+    fi
+    echo "[D2] complete category=${CATEGORY} bytes=$(stat -c %s "${ARCHIVE}")"
+  done < "${LIST}"
+
+  echo "D2_failure_count=${FAILURES}"
+  test "${FAILURES}" -eq 0 || exit 2
+) 2>&1 | tee /data/zjr/omni_real_video500_download_20260804_v2/logs/D2_download.log
+
+D2_RC=${PIPESTATUS[0]}
+echo "D2_RC=${D2_RC}"
+if [ "${D2_RC}" -eq 0 ]; then
+  echo "D2 complete; run D3"
+elif [ "${D2_RC}" -eq 97 ]; then
+  echo "D2 not started because another downloader is active"
+else
+  echo "D2 incomplete; inspect the log and rerun D2 without deleting partial files"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# D2-MONITOR. 另一终端只读监控
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+date -u
+ps -ef | rg 'download_omniobject3d.py.*videos_processed' | rg -v 'rg ' || true
+tail -n 80 /data/zjr/omni_real_video500_download_20260804_v2/logs/D2_download.log 2>/dev/null || true
+df -h /data/zjr
+echo "current terminal remains open"
+
+
+###############################################################################
+# D3. 下载后全量 gzip 完整性和归档尺寸冻结
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  PLAN=${ROOT}/manifests/D1_download_plan.json
+  LIST=${ROOT}/manifests/D1_categories.txt
+  ARCHIVES=/data/zjr/OmniObject3D/raw/omniobject3d___OmniObject3D-New/raw/videos_processed
+  OUTPUT=${ROOT}/audit/D3_DOWNLOAD_SUMMARY.json
+
+  if [ -s "${OUTPUT}" ]; then
+    "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); print(json.dumps({k:p[k] for k in ("passed","category_count","archive_complete_count","scan_object_count","total_archive_bytes","scope_guard")},indent=2,ensure_ascii=False)); assert p["passed"] is True' "${OUTPUT}"
+  elif [ -e "${OUTPUT}" ]; then
+    echo "D3 partial output exists; preserve and inspect: ${OUTPUT}"
+    exit 98
+  else
+    "${PY}" - "${PLAN}" "${LIST}" "${ARCHIVES}" "${OUTPUT}" <<'PY'
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+plan_path = Path(sys.argv[1]).resolve()
+list_path = Path(sys.argv[2]).resolve()
+archive_root = Path(sys.argv[3]).resolve()
+output = Path(sys.argv[4]).resolve()
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+categories = [line.strip() for line in list_path.read_text().splitlines() if line.strip()]
+assert categories == plan["selected_categories"]
+planned = {row["category"]: row for row in plan["categories"]}
+rows = []
+for index, category in enumerate(categories, start=1):
+    archive = archive_root / f"{category}.tar.gz"
+    present = archive.is_file() and archive.stat().st_size > 0
+    gzip_rc = subprocess.run(["gzip", "-t", str(archive)], check=False).returncode if present else 96
+    source = planned[category]
+    rows.append({
+        "category": category,
+        "archive": str(archive),
+        "archive_present": present,
+        "archive_bytes": archive.stat().st_size if present else 0,
+        "gzip_test_rc": int(gzip_rc),
+        "scan_object_count": source["scan_mesh_object_count"],
+        "scan_object_ids": source["scan_mesh_object_ids"],
+    })
+    print(f"[D3] {index}/{len(categories)} {category} gzip_rc={gzip_rc}", flush=True)
+
+payload = {
+    "format": "pose_point_depth_mv.omni_real_video_download_summary.v2",
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "download_plan": str(plan_path),
+    "selection_uses_reviewed1k_exclusion": False,
+    "category_count": len(rows),
+    "archive_complete_count": sum(
+        row["archive_present"] and row["gzip_test_rc"] == 0 for row in rows
+    ),
+    "scan_object_count": sum(row["scan_object_count"] for row in rows),
+    "total_archive_bytes": sum(row["archive_bytes"] for row in rows),
+    "categories": rows,
+    "scope_guard": (
+        "Archive integrity only. Actual video object IDs and reviewed1k overlap "
+        "are deliberately evaluated after this stage."
+    ),
+}
+payload["passed"] = bool(rows) and (
+    payload["archive_complete_count"] == payload["category_count"]
+    and payload["scan_object_count"] >= 1000
+)
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print(json.dumps({k: payload[k] for k in (
+    "passed", "category_count", "archive_complete_count", "scan_object_count",
+    "total_archive_bytes", "scope_guard"
+)}, indent=2, ensure_ascii=False))
+if not payload["passed"]:
+    raise SystemExit(2)
+PY
+  fi
+)
+D3_RC=$?
+echo "D3_RC=${D3_RC}; current terminal remains open"
+
+
+###############################################################################
+# D4. 下载后盘点归档内实际 video object/Scan.obj 交集
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  ARCHIVES=/data/zjr/OmniObject3D/raw/omniobject3d___OmniObject3D-New/raw/videos_processed
+  SCANS=/data/zjr/OmniObject3D/raw_scans_extracted_omni215_v1/categories
+  LIST=${ROOT}/manifests/D1_categories.txt
+  DOWNLOAD=${ROOT}/audit/D3_DOWNLOAD_SUMMARY.json
+  OUT=${ROOT}/D4_actual_video_mesh_inventory_v1
+  LOG=${ROOT}/logs/D4_actual_video_mesh_inventory.log
+
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True and p["selection_uses_reviewed1k_exclusion"] is False' "${DOWNLOAD}"
+  if [ -s "${OUT}/inventory.json" ]; then
+    "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); print(json.dumps({k:p[k] for k in ("passed","category_count","video_object_count","passed_object_count","scope_guard")},indent=2,ensure_ascii=False)); assert p["passed"] is True' "${OUT}/inventory.json"
+  elif [ -e "${OUT}" ]; then
+    echo "D4 partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_omni_real_video_cache \
+      inventory \
+      --archive_root "${ARCHIVES}" \
+      --category_list "${LIST}" \
+      --scan_root "${SCANS}" \
+      --p7_report "${DOWNLOAD}" \
+      --output_dir "${OUT}"
+  fi
+) 2>&1 | tee /data/zjr/omni_real_video500_download_20260804_v2/logs/D4_actual_video_mesh_inventory.log
+
+D4_RC=${PIPESTATUS[0]}
+echo "D4_RC=${D4_RC}"
+if [ "${D4_RC}" -eq 0 ]; then
+  echo "D4 strict inventory passed; run D4V2"
+elif [ "${D4_RC}" -eq 2 ]; then
+  echo "D4 strict inventory contains rejected objects; preserve v1 and run D4V2"
+else
+  echo "D4 runtime failed; inspect the log before D4V2"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# D4V2. 从冻结D4 v1生成eligible/rejected盘点，不覆盖v1
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  SOURCE=${ROOT}/D4_actual_video_mesh_inventory_v1/inventory.json
+  OUT=${ROOT}/D4_actual_video_mesh_inventory_v2
+
+  "${PY}" -m pose_point_depth_mv.dataset_tools.freeze_omni_real_raw_split \
+    eligibility \
+    --source_inventory "${SOURCE}" \
+    --output_dir "${OUT}" \
+    --required_eligible_count 628
+)
+D4V2_RC=$?
+echo "D4V2_RC=${D4V2_RC}"
+if [ "${D4V2_RC}" -eq 0 ]; then
+  echo "D4V2 eligible/rejected inventory frozen; continue with D5/D5P/D6"
+else
+  echo "D4V2 failed; preserve v1 and v2 outputs and inspect inventory.json"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# D5. 冻结 reviewed1k 已使用 Omni 排除集：119 train + 16 consumed val = 135
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  SPLIT_ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1
+  TRAIN=${SPLIT_ROOT}/train868_manifest.json
+  VAL=${SPLIT_ROOT}/val64_sourcebalanced_manifest.json
+  SPLIT_AUDIT=${SPLIT_ROOT}/split_audit.json
+  SCANS=/data/zjr/OmniObject3D/raw_scans_extracted_omni215_v1/categories
+  OUTPUT=${ROOT}/audit/D5_REVIEWED1K_OMNI_EXCLUSION.json
+
+  if [ -s "${OUTPUT}" ]; then
+    "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); print(json.dumps({k:p[k] for k in ("passed","train_omni_count","consumed_val_omni_count","excluded_object_count","object_id_hash")},indent=2)); assert p["passed"] is True and p["excluded_object_count"]==135' "${OUTPUT}"
+  elif [ -e "${OUTPUT}" ]; then
+    echo "D5 partial output exists; preserve and inspect: ${OUTPUT}"
+    exit 98
+  else
+    "${PY}" - "${TRAIN}" "${VAL}" "${SPLIT_AUDIT}" "${SCANS}" "${OUTPUT}" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+train_path = Path(sys.argv[1]).resolve()
+val_path = Path(sys.argv[2]).resolve()
+audit_path = Path(sys.argv[3]).resolve()
+scan_root = Path(sys.argv[4]).resolve()
+output = Path(sys.argv[5]).resolve()
+train = json.loads(train_path.read_text(encoding="utf-8"))
+val = json.loads(val_path.read_text(encoding="utf-8"))
+audit = json.loads(audit_path.read_text(encoding="utf-8"))
+assert audit["passed"] is True
+
+def omni_uids(manifest):
+    return sorted({
+        str(row["object_uid"])
+        for row in manifest["samples"]
+        if str(row.get("object_uid", "")).startswith("omni_")
+    })
+
+train_uids = omni_uids(train)
+val_uids = omni_uids(val)
+assert len(train_uids) == 119
+assert len(val_uids) == 16
+assert set(train_uids).isdisjoint(val_uids)
+
+scan_by_id = {}
+for object_root in scan_root.glob("*/*"):
+    scan = object_root / "Scan" / "Scan.obj"
+    if not scan.is_file():
+        continue
+    object_id = object_root.name
+    if object_id in scan_by_id:
+        raise RuntimeError(f"duplicate local Scan object ID: {object_id}")
+    scan_by_id[object_id] = scan.resolve()
+
+rows = []
+for phase, values in (("reviewed1k_train", train_uids), ("reviewed1k_consumed_val", val_uids)):
+    for uid in values:
+        object_id = uid.removeprefix("omni_")
+        scan = scan_by_id.get(object_id)
+        if scan is None:
+            raise RuntimeError(f"reviewed1k Omni object has no local Scan.obj: {uid}")
+        rows.append({
+            "source_phase": phase,
+            "reviewed1k_object_uid": uid,
+            "real_object_id": object_id,
+            "scan_obj": str(scan),
+        })
+
+object_ids = sorted(row["real_object_id"] for row in rows)
+object_id_hash = hashlib.sha256("".join(f"{value}\n" for value in object_ids).encode()).hexdigest()
+payload = {
+    "format": "pose_point_depth_mv.reviewed1k_omni_exclusion.v1",
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "train_manifest": str(train_path),
+    "val_manifest": str(val_path),
+    "split_audit": str(audit_path),
+    "train_omni_count": len(train_uids),
+    "consumed_val_omni_count": len(val_uids),
+    "excluded_object_count": len(rows),
+    "object_id_hash": object_id_hash,
+    "objects": rows,
+    "passed": len(rows) == 135 and len(set(object_ids)) == 135,
+}
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print(json.dumps({k: payload[k] for k in (
+    "passed", "train_omni_count", "consumed_val_omni_count",
+    "excluded_object_count", "object_id_hash"
+)}, indent=2))
+if not payload["passed"]:
+    raise SystemExit(2)
+PY
+  fi
+)
+D5_RC=$?
+echo "D5_RC=${D5_RC}; current terminal remains open"
+
+
+###############################################################################
+# D5P. 冻结 protocol_pilot29 计数账本；不把 pilot 作为排除集
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  PILOT_INVENTORY=/data/zjr/omni_real_video_pilot_20260804_v1/R4_actual_video_object_inventory_v1/inventory.json
+  REVIEWED_EXCLUSION=${ROOT}/audit/D5_REVIEWED1K_OMNI_EXCLUSION.json
+  OUTPUT=${ROOT}/audit/D5P_PROTOCOL_PILOT29_ACCOUNTING.json
+
+  if [ -s "${OUTPUT}" ]; then
+    "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); print(json.dumps({k:p[k] for k in ("passed","pilot_object_count","reviewed1k_overlap_count","exclusion_applied","formal_split_allowed","object_id_hash")},indent=2)); assert p["passed"] is True and p["pilot_object_count"]==29 and p["exclusion_applied"] is False and p["formal_split_allowed"] is True' "${OUTPUT}"
+  elif [ -e "${OUTPUT}" ]; then
+    echo "D5P partial output exists; preserve and inspect: ${OUTPUT}"
+    exit 98
+  else
+    "${PY}" - "${PILOT_INVENTORY}" "${REVIEWED_EXCLUSION}" "${OUTPUT}" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+pilot_path = Path(sys.argv[1]).resolve()
+reviewed_path = Path(sys.argv[2]).resolve()
+output = Path(sys.argv[3]).resolve()
+pilot = json.loads(pilot_path.read_text(encoding="utf-8"))
+reviewed = json.loads(reviewed_path.read_text(encoding="utf-8"))
+assert pilot["passed"] is True and pilot["video_object_count"] == 29
+assert reviewed["passed"] is True and reviewed["excluded_object_count"] == 135
+
+rows = []
+for source in pilot["objects"]:
+    assert source["passed"] is True
+    rows.append({
+        "category": str(source["category"]),
+        "object_id": str(source["object_id"]),
+        "scan_obj": str(Path(source["scan_obj"]).resolve()),
+        "pilot_inventory_archive": str(source["archive"]),
+    })
+
+pilot_ids = [row["object_id"] for row in rows]
+pilot_scans = [row["scan_obj"] for row in rows]
+if len(set(pilot_ids)) != 29 or len(set(pilot_scans)) != 29:
+    raise RuntimeError("protocol pilot contains duplicate object IDs or Scan.obj paths")
+
+reviewed_ids = {str(row["real_object_id"]) for row in reviewed["objects"]}
+reviewed_scans = {str(Path(row["scan_obj"]).resolve()) for row in reviewed["objects"]}
+overlap_ids = sorted(set(pilot_ids).intersection(reviewed_ids))
+overlap_scans = sorted(set(pilot_scans).intersection(reviewed_scans))
+if overlap_ids != ["battery_003"] or len(overlap_scans) != 1:
+    raise RuntimeError(
+        f"unexpected pilot/reviewed1k overlap: ids={overlap_ids}, scans={overlap_scans}"
+    )
+
+object_id_hash = hashlib.sha256(
+    "".join(f"{value}\n" for value in sorted(pilot_ids)).encode()
+).hexdigest()
+payload = {
+    "format": "pose_point_depth_mv.omni_real_protocol_pilot_accounting.v1",
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "pilot_inventory": str(pilot_path),
+    "reviewed1k_exclusion": str(reviewed_path),
+    "pilot_object_count": len(rows),
+    "reviewed1k_overlap_count": len(overlap_ids),
+    "reviewed1k_overlap_object_ids": overlap_ids,
+    "object_id_hash": object_id_hash,
+    "objects": sorted(rows, key=lambda row: row["object_id"]),
+    "exclusion_applied": False,
+    "formal_split_allowed": True,
+    "passed": (
+        len(rows) == 29
+        and overlap_ids == ["battery_003"]
+    ),
+}
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print(json.dumps({k: payload[k] for k in (
+    "passed", "pilot_object_count", "reviewed1k_overlap_count",
+    "reviewed1k_overlap_object_ids", "exclusion_applied",
+    "formal_split_allowed", "object_id_hash"
+)}, indent=2, ensure_ascii=False))
+if not payload["passed"]:
+    raise SystemExit(2)
+PY
+  fi
+)
+D5P_RC=$?
+echo "D5P_RC=${D5P_RC}; current terminal remains open"
+
+
+###############################################################################
+# D6. 从D4V2 eligible集合排除旧reviewed1k，冻结500/64/64 raw split v2
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  INVENTORY=${ROOT}/D4_actual_video_mesh_inventory_v2/inventory.json
+  REVIEWED_EXCLUSION=${ROOT}/audit/D5_REVIEWED1K_OMNI_EXCLUSION.json
+  PILOT_ACCOUNTING=${ROOT}/audit/D5P_PROTOCOL_PILOT29_ACCOUNTING.json
+  OUT=${ROOT}/D6_novel500_dev64_holdout64_v2
+
+  "${PY}" -m pose_point_depth_mv.dataset_tools.freeze_omni_real_raw_split \
+    split \
+    --eligibility_inventory "${INVENTORY}" \
+    --reviewed_exclusion "${REVIEWED_EXCLUSION}" \
+    --pilot_accounting "${PILOT_ACCOUNTING}" \
+    --output_dir "${OUT}" \
+    --train_count 500 \
+    --dev_count 64 \
+    --holdout_count 64 \
+    --seed 20260804 \
+    --expected_reviewed_count 135 \
+    --expected_pilot_count 29
+)
+D6_RC=$?
+echo "D6_RC=${D6_RC}"
+if [ "${D6_RC}" -eq 0 ]; then
+  echo "D6 raw split frozen; stop here and build the distortion-aware canonical cache next"
+elif [ "${D6_RC}" -eq 2 ]; then
+  echo "D6 has fewer than 628 objects after reviewed1k filtering; expand downloads"
+else
+  echo "D6 failed; preserve output and inspect split_report.json"
+fi
+echo "current terminal remains open"
+
+
+# 本文件到 D6 结束。
+# D6_RC=0 仍不允许直接训练；它只冻结了D4V2 eligible集合中、仅排除
+# reviewed1k旧Omni后的物理对象边界。rejected对象永久禁止进入split，
+# pilot29中不与reviewed1k重叠的对象保留在候选集中。

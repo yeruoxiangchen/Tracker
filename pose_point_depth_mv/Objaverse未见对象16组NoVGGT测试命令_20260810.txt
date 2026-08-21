@@ -1,0 +1,102 @@
+# Objaverse未见对象16组No-VGGT测试
+# ==================================
+#
+# 目标：补充当前 Omni Benchmark32/Holdout64 之外的 Objaverse 域测试。
+# 数据边界：
+# - 从 reviewed mixed1k 的冻结 test.json 中选择16个 Objaverse对象；
+# - 每对象固定一条8帧候选序列；source_group配额为 legacy/gap/pilot=10/3/3；
+# - 选择只依赖 seed、source_group、object_uid、uid 的SHA256，不读模型结果；
+# - 实际条件视图由冻结 point-prior seed 产生，预期2/4/8视图分布写入O0 manifest；
+# - 同时审计原train/val/test和当前mixed训练lifting对象不重叠。
+#
+# 最终测试：当前 mixed real376+synth868 no-VGGT模型，seed42，对canonical GT Mesh；
+# 指标：Chamfer-L1/L2、F-score@0.01/0.02/0.05、normal consistency和Mesh结构；
+# 不做ICP或逐结果归一化。该16例测试 formal=false，不替代正式Holdout64。
+# 第一版不包含ReconViaGen/Pixal3D外部基线，报告会明确记录这一点。
+# 2026-08-10修正：旧O7 v1遗漏decoder到source-GLB的固定轴变换；旧文件保留，
+# 当前脚本改写到O7b axis-fixed v2，不覆盖旧O7。
+
+
+###############################################################################
+# A. 推荐：一条命令后台顺序运行全部O0-O7阶段
+###############################################################################
+
+cd /home/zjr/Tracker
+
+OBJAVERSE16_GPU=${OBJAVERSE16_GPU:-4}
+ROOT=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1
+LOG=${ROOT}/logs/Objaverse16_no_vggt_test.log
+PID=${ROOT}/logs/Objaverse16_no_vggt_test.pid
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  objaverse16-no-vggt-test \
+  "${LOG}" \
+  "${PID}" \
+  env OBJAVERSE16_GPU="${OBJAVERSE16_GPU}" OBJAVERSE16_ROOT="${ROOT}" \
+  bash pose_point_depth_mv/background_jobs/run_objaverse16_no_vggt_test.sh
+
+echo "后台任务不依赖当前终端"
+echo "监视: tail -f '${LOG}'"
+echo "current terminal remains open"
+
+
+###############################################################################
+# B. 监视与状态检查；Ctrl-C只退出tail/watch，不终止后台任务
+###############################################################################
+
+tail -f /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_no_vggt_test.log
+
+# 每10秒查看进程、阶段尾部、完成码和最终报告：
+watch -n 10 '
+date
+echo "=== process ==="
+PID_FILE=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_no_vggt_test.pid
+if [ -s "${PID_FILE}" ]; then ps -p "$(cat "${PID_FILE}")" -o pid,ppid,sid,stat,etime,time,pcpu,pmem,rss,cmd; fi
+echo "=== recent log ==="
+tail -n 12 /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_no_vggt_test.log 2>/dev/null
+echo "=== completion ==="
+cat /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/logs/Objaverse16_no_vggt_test.exit_code 2>/dev/null || echo "exit_code尚未生成"
+test -s /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O7b_canonical_mesh_eval_axisfixed_20k_v2/report.json && echo "O7b报告已生成" || echo "O7b报告尚未生成"
+'
+
+
+###############################################################################
+# C. 不后台运行：在当前终端直接跑完整流程
+###############################################################################
+
+cd /home/zjr/Tracker
+OBJAVERSE16_GPU=${OBJAVERSE16_GPU:-4} \
+OBJAVERSE16_ROOT=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1 \
+bash pose_point_depth_mv/background_jobs/run_objaverse16_no_vggt_test.sh
+
+
+###############################################################################
+# D. 先只冻结并检查16对象，不启动GPU阶段
+###############################################################################
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/objaverse16_no_vggt_mixed_20260810_v1
+mkdir -p "${ROOT}"
+
+"${PY}" -u -m pose_point_depth_mv.freeze_objaverse16_test \
+  --output_manifest "${ROOT}/O0_frozen_objaverse_test16_v1.json" \
+  --seed 20260810 \
+  --point_prior_seed 20260810 \
+  --group_quotas legacy897=10,gap_objaverse288=3,pilot_objaverse217=3 \
+  --prior_view_choices 2,4,8 \
+  --resume
+
+
+###############################################################################
+# 主要产物
+###############################################################################
+# 冻结选择：
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O0_frozen_objaverse_test16_v1.json
+#
+# 预测Mesh：
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O6_native_no_vggt_mixed_seed42_v1/meshes/
+#
+# canonical GT Mesh、逐例指标和总报告：
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O7b_canonical_mesh_eval_axisfixed_20k_v2/
+# /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O7b_canonical_mesh_eval_axisfixed_20k_v2/report.json

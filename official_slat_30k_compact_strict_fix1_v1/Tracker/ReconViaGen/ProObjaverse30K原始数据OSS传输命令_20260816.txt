@@ -1,0 +1,120 @@
+ProObjaverse official 30K 原始数据 -> OSS 传输命令
+============================================================
+
+一、直接启动（推荐，后台运行）
+------------------------------------------------------------
+
+cd /home/zjr/Tracker
+
+tmux new-session -d -s proobj30koss \
+  'bash /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_proobjaverse_30k_oss_transfer.sh'
+
+
+二、监视
+------------------------------------------------------------
+
+tail -n 100 -F \
+  /data/zjr/ProObjaverse-300K-ReconViaGen-30K-state/oss_transfer_c9175c52_20260816_v1/transfer.log
+
+也可以进入 tmux：
+
+tmux attach -t proobj30koss
+
+退出观察但不停止任务：Ctrl-b，然后按 d。
+
+
+三、如果网络中断
+------------------------------------------------------------
+
+直接重新执行第一节的 tmux 命令即可。若同名 tmux 仍存在，先确认其状态：
+
+tmux ls
+
+传输脚本使用：
+
+- ossutil --update；
+- 本地 snapshot；
+- CRC64；
+- 大文件 checkpoint；
+- 版本化、不可混用的 OSS prefix。
+
+因此重跑只会续传未成功或本地发生变化的对象，不会从头重传已完成的
+payload。脚本有 flock，不能同时启动两个传输实例。
+
+
+四、固定资产和目标
+------------------------------------------------------------
+
+源数据：
+
+/data/zjr/ProObjaverse-300K-ReconViaGen-30K
+
+冻结 selection：
+
+/data/zjr/ProObjaverse-300K-ReconViaGen-30K-state/combined_audit/combined_selection_30k.json
+
+OSS：
+
+oss://yxc814/proobjaverse-transfer/proobjaverse_30k_raw_c9175c52_20260816_v1
+
+固定合同：
+
+- 30,000 UID；
+- 30,000 renders_random_env tar；
+- 30,000 official lh-slat npz；
+- 60,000 payload objects；
+- 125,437,607,123 bytes（约 116.82 GiB）；
+- 不包含训练 cache；
+- 不启动 cache builder 或模型训练。
+
+
+五、成功标准
+------------------------------------------------------------
+
+日志末尾必须出现：
+
+PROOBJAVERSE 30K OSS TRANSFER + AUDIT COMPLETE
+
+远端审计必须同时满足：
+
+- missing_count = 0；
+- extra_count = 0；
+- duplicate_count = 0；
+- size_mismatch_count = 0；
+- hash_mismatch_count = 0；
+- non_md5_etag_count = 0。
+
+只有全部通过后，脚本才会最后上传：
+
+oss://yxc814/proobjaverse-transfer/proobjaverse_30k_raw_c9175c52_20260816_v1/COMPLETE.json
+
+本地证据位于：
+
+/data/zjr/ProObjaverse-300K-ReconViaGen-30K-state/oss_transfer_c9175c52_20260816_v1/
+
+包括：
+
+- local_inventory.jsonl（每文件 path/size/MD5/SHA256）；
+- local_inventory_report.json；
+- remote_payload_ls.txt；
+- remote_inventory_audit.json；
+- COMPLETE.json；
+- transfer.log。
+
+
+六、前台运行（仅调试）
+------------------------------------------------------------
+
+cd /home/zjr/Tracker
+bash pose_point_depth_mv/background_jobs/run_proobjaverse_30k_oss_transfer.sh
+
+
+七、可调整但通常不需要的参数
+------------------------------------------------------------
+
+HASH_WORKERS=4 OSS_JOBS=16 OSS_PARALLEL=4 \
+  bash pose_point_depth_mv/background_jobs/run_proobjaverse_30k_oss_transfer.sh
+
+HASH_WORKERS控制首次本地MD5+SHA256清单生成；OSS_JOBS控制小文件并发上传。
+如源盘明显繁忙，可将HASH_WORKERS降到2；如上传带宽未满，可将OSS_JOBS逐步升到24，
+不要一开始设置得过高。

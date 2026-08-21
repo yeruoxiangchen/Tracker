@@ -1,0 +1,9 @@
+[Unit]
+Description=Snoopy fixed8/time-uniform8/quality-spherical8 SS30K SLat30K reconstructions
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zjr/Tracker
+ExecStart=/bin/bash /home/zjr/Tracker/manual_mesh_reconstruction/run_snoopy_three_selections_20260819.sh
+TimeoutStartSec=infinity
+

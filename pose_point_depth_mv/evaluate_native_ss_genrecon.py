@@ -39,6 +39,12 @@ from pose_point_depth_mv.native_ss_genrecon import (
 METRICS = ("iou_gain", "precision_gain", "recall_gain", "latent_mse_gain")
 
 
+def load_evaluation_dataset(manifest: str, *, indices: str = "all") -> Any:
+    """Legacy dataset hook; official compact wrappers may replace this factory."""
+
+    return PoseLiftingCacheDataset(manifest, indices=indices)
+
+
 def parse_csv(value: str, cast) -> list[Any]:
     result = [cast(item.strip()) for item in str(value).split(",") if item.strip()]
     if not result or len(result) != len(set(result)):
@@ -53,6 +59,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--calibration", default="")
+    parser.add_argument(
+        "--allow_cross_manifest_calibration",
+        action="store_true",
+        help=(
+            "allow a calibration made on a disjoint manifest when checkpoint, "
+            "sampling and official target-domain identities remain exact"
+        ),
+    )
     parser.add_argument("--pretrained", default="Stable-X/trellis-vggt-v0-2")
     parser.add_argument("--indices", default="all")
     parser.add_argument("--object_start", type=int, default=0)
@@ -434,7 +448,7 @@ def main() -> None:
     validate_args(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)
-    dataset = PoseLiftingCacheDataset(args.cache_manifest, indices=args.indices)
+    dataset = load_evaluation_dataset(args.cache_manifest, indices=args.indices)
     selected = select_object_indices(
         dataset.rows, start=int(args.object_start), end=int(args.object_end)
     )
@@ -567,9 +581,39 @@ def main() -> None:
         key: (calibrated_protocol.get(key), value)
         for key, value in bindings.items()
         if calibrated_protocol.get(key) != value
+        and not (
+            key == "cache_manifest_sha256"
+            and bool(args.allow_cross_manifest_calibration)
+        )
     }
     if mismatch:
         raise ValueError(f"evaluation differs from calibration protocol={mismatch}")
+    if bool(args.allow_cross_manifest_calibration):
+        calibrated_contract = calibrated_protocol.get("cache_feature_contract")
+        calibrated_targets = (
+            calibrated_contract.get("official_ss_targets")
+            if isinstance(calibrated_contract, dict)
+            else None
+        )
+        calibrated_domain = (
+            calibrated_targets.get("domain_contract")
+            if isinstance(calibrated_targets, dict)
+            else None
+        )
+        evaluated_targets = cache_contract.get("official_ss_targets")
+        evaluated_domain = (
+            evaluated_targets.get("domain_contract")
+            if isinstance(evaluated_targets, dict)
+            else None
+        )
+        if (
+            not isinstance(calibrated_domain, dict)
+            or not isinstance(evaluated_domain, dict)
+            or calibrated_domain != evaluated_domain
+        ):
+            raise RuntimeError(
+                "cross-manifest calibration official SS domain differs"
+            )
     overlap = sorted(set(protocol["object_uids"]).intersection(calibrated_protocol["object_uids"]))
     if overlap:
         raise RuntimeError(f"calibration/evaluation objects overlap: {overlap[:8]}")

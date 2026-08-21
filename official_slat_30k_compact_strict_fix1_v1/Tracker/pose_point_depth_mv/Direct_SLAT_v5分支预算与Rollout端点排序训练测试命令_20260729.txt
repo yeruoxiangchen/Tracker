@@ -1,0 +1,649 @@
+# Direct-SLAT V5.1：LoRA/support 分支预算 + 常显存终点 rollout 排序
+# 2026-07-29
+#
+# V4 Fresh Blind32 的结论是“弱正向、正式门未通过”，不是程序失败：
+# - Chamfer mean +0.00013156，median +0.00004072，win 56.25%
+# - bootstrap mean 95% CI 下界 -0.00003437，formal_pass=false
+#
+# V5 保留两个可检验机制：
+# 1. 将部署 Full residual 拆成 LoRA(stock->LoRA) 与
+#    support-increment(LoRA->joint Full)，分别做 stock-RMS 相对预算，
+#    最后仍保留总 residual cap。
+# 2. V4 的多步 endpoint 只拟合 target；V5 要求 Full x0 proxy loss 比
+#    同状态 Stock x0 proxy loss 至少好一个固定 margin。
+#
+# 2026-07-29 zero-init 修正：
+# - support 缺失、显式关闭或 support_scale=0 均直接走 exact Stock bypass；
+# - V5 联合分支和 LoRA-only 分支同时做 straight-through zero-init anchor。
+# 旧 V5 的 all_visited_v1 在确定性 horizon=8、大稀疏样本上同时保留八套
+# joint Full + LoRA-only 图，双卡 DDP 的每个 rank 都超过单卡 24 GB。
+# V5.1 仍生成完整 2/4/8-step 数值轨迹，但中间状态使用 no_grad+detach，
+# 只在终点保留一套监督图；输出改为全新 v3，禁止把旧 V5 step40 当作同语义续训。
+#
+# 不变：
+# - frozen corrected SS / physical encoder / native SLAT condition / mesh decoder；
+# - post-CFG v2、smooth RMS、CFG active interval；
+# - 897-object 先行，不直接启动 10k 模型长训。
+#
+# GPU：
+# - smoke/评估 1 卡，训练 2 卡；本文件不会使用超过 2 张卡。
+# - 与 Mixed10k 渲染合计不得超过项目 4-GPU 预算。
+
+
+###############################################################################
+# 公共变量（每个新终端先执行）
+###############################################################################
+
+cd /home/zjr/Tracker
+set +e
+set -o pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+
+# 运行前必须按 nvidia-smi 改成真正空闲的卡。
+GPU=${GPU:-4}
+TRAIN_GPUS=${TRAIN_GPUS:-4,5}
+
+TRAIN_CACHE=/data/zjr/ar_slat_direct_train_all_step000900_seed424344_lhslatv2_20260723
+VAL_CACHE=/data/zjr/ar_slat_direct_val_all_step000900_seed424344_lhslatv2_20260723
+TARGET_DEC_AUDIT=${VAL_CACHE}/target_decoder_audit32_v2/report.json
+
+WORK=/data/zjr/direct_slat_v5_1_terminal_rollout_20260729
+SMOKE=${WORK}/train20_indices0_3_seed42_1gpu_v3
+SMOKE_CKPT=${SMOKE}/checkpoints/step_000020.pt
+TRAIN100=${WORK}/train897_step100_seed42_2gpu_v3
+TRAIN100_CKPT=${TRAIN100}/checkpoints/step_000100.pt
+LONG200=${WORK}/train897_step200_from_step100_seed42_2gpu_v3
+TRAIN200_CKPT=${LONG200}/checkpoints/step_000200.pt
+
+DELTA_SCALE=1.0
+DELTA_CAP=0.10
+LORA_DELTA_SCALE=1.0
+LORA_DELTA_CAP=0.03
+SUPPORT_DELTA_SCALE=1.0
+SUPPORT_DELTA_CAP=0.07
+
+RAW_EXCESS_WEIGHT=0.10
+WRONG_STOCK_WEIGHT=0.25
+WRONG_PROB=0.20
+DROPOUT_WEIGHT=0.05
+DROPOUT_PROB=0.20
+ROLLOUT_WEIGHT=0.25
+ROLLOUT_PROB=0.40
+ENDPOINT_WEIGHT=0.05
+ENDPOINT_RANK_WEIGHT=0.25
+ENDPOINT_RANK_MARGIN=0.0005
+
+TRAIN_CFG_STRENGTH=5.0
+TRAIN_CFG_LO=0.5
+TRAIN_CFG_HI=1.0
+
+MATRIX_UIDS=0d18146b4fdd40ef9dfeb08e19fc4335_seq000,0cd491abba6140dda5eea7c4c2452979_seq000,29ddf51d78ae455caba970b9cd3eb75c_seq001,092bb80346414104abd5cace71892752_seq000,04d712a0dae0421cae9083484f4332ee_seq001,262afaaf596a4cf683f74b5768bd4db8_seq000
+
+mkdir -p "${WORK}"
+
+run_logged() {
+  LOG_PATH=$1
+  shift
+  set +e
+  "$@" 2>&1 | tee "${LOG_PATH}"
+  COMMAND_RC=${PIPESTATUS[0]}
+  printf '%s\n' "${COMMAND_RC}" > "${LOG_PATH}.exit_code"
+  return "${COMMAND_RC}"
+}
+
+V5_ARGS=(
+  --pretrained "${PRETRAINED}"
+  --lr 5e-6
+  --weight_decay 0
+  --grad_clip 1.0
+  --lora_rank 16
+  --lora_alpha 32
+  --adapter_hidden_dim 128
+  --max_slat_points 40960
+  --support_scale 1.0
+  --training_semantics branch_budget_rollout_v5
+  --slat_guided_delta_policy post_cfg_v2
+  --slat_delta_bound_mode smooth_rms_v2
+  --support_interval_policy cfg_active_only_v1
+  --slat_residual_combination_policy lora_support_budget_v2
+  --slat_delta_scale "${DELTA_SCALE}"
+  --slat_delta_rms_ratio_cap "${DELTA_CAP}"
+  --slat_lora_delta_scale "${LORA_DELTA_SCALE}"
+  --slat_lora_delta_rms_ratio_cap "${LORA_DELTA_CAP}"
+  --slat_support_delta_scale "${SUPPORT_DELTA_SCALE}"
+  --slat_support_delta_rms_ratio_cap "${SUPPORT_DELTA_CAP}"
+  --delta_norm_weight 1e-4
+  --raw_delta_excess_weight "${RAW_EXCESS_WEIGHT}"
+  --wrong_support_rank_weight 0
+  --wrong_support_margin 0
+  --wrong_support_probability "${WRONG_PROB}"
+  --wrong_support_stock_weight "${WRONG_STOCK_WEIGHT}"
+  --support_dropout_weight "${DROPOUT_WEIGHT}"
+  --support_dropout_probability "${DROPOUT_PROB}"
+  --rollout_consistency_weight "${ROLLOUT_WEIGHT}"
+  --rollout_probability "${ROLLOUT_PROB}"
+  --rollout_step_size 0
+  --rollout_horizons 2,4,8
+  --rollout_supervision_policy terminal_only_constant_memory_v1
+  --rollout_schedule_steps 25
+  --rollout_rescale_t 3.0
+  --endpoint_x0_weight "${ENDPOINT_WEIGHT}"
+  --rollout_endpoint_rank_weight "${ENDPOINT_RANK_WEIGHT}"
+  --rollout_endpoint_rank_margin "${ENDPOINT_RANK_MARGIN}"
+  --train_cfg_strength "${TRAIN_CFG_STRENGTH}"
+  --train_cfg_interval "${TRAIN_CFG_LO}" "${TRAIN_CFG_HI}"
+  --sampling_mode object_balanced
+  --t_schedule native_schedule
+  --amp_dtype bf16
+  --gradient_checkpointing
+  --verify_cache_hashes
+)
+
+
+###############################################################################
+# S0. 静态检查、CPU 回归、CLI
+###############################################################################
+
+(
+  set +e
+  RC=0
+  cd /home/zjr/Tracker || RC=96
+  for REQUIRED in \
+    "${TRAIN_CACHE}/manifest.json" \
+    "${VAL_CACHE}/manifest.json" \
+    "${TARGET_DEC_AUDIT}"; do
+    if [ ! -s "${REQUIRED}" ]; then
+      echo "S0 missing: ${REQUIRED}"
+      RC=96
+    fi
+  done
+  if [ "${RC}" -eq 0 ]; then
+    "${PY}" -m py_compile \
+      pose_point_depth_mv/direct_slat_flow.py \
+      pose_point_depth_mv/train_direct_slat_flow.py \
+      pose_point_depth_mv/eval_direct_slat_flow.py \
+      pose_point_depth_mv/export_direct_slat_mesh_pairs.py \
+      pose_point_depth_mv/freeze_direct_slat_matched_mesh_blind.py || RC=$?
+  fi
+  if [ "${RC}" -eq 0 ]; then
+    "${PY}" -m unittest \
+      pose_point_depth_mv.test_direct_slat_flow \
+      pose_point_depth_mv.test_direct_slat_data \
+      pose_point_depth_mv.test_direct_slat_matched_mesh_blind \
+      pose_point_depth_mv.test_direct_slat_release || RC=$?
+  fi
+  if [ "${RC}" -eq 0 ]; then
+    "${PY}" -m pose_point_depth_mv.train_direct_slat_flow --help >/dev/null || RC=$?
+    "${PY}" -m pose_point_depth_mv.eval_direct_slat_flow --help >/dev/null || RC=$?
+    "${PY}" -m pose_point_depth_mv.export_direct_slat_mesh_pairs --help >/dev/null || RC=$?
+  fi
+  echo "S0_RC=${RC}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# S1. 单卡 20-step 真模型 smoke
+###############################################################################
+
+# seed42 前20个 micro-step 覆盖 wrong/dropout 和 rollout horizon 2/4/8。
+# 每个 rollout 事件必须是“生成 horizon 个状态、只监督1个终点”。
+# 若这里 OOM 或 supervised_state_count != 1，不允许直接跳到双卡长训。
+
+if [ -s "${SMOKE}/report.json" ] && [ -s "${SMOKE_CKPT}" ]; then
+  echo "reuse immutable S1: ${SMOKE}"
+elif [ -e "${SMOKE}" ]; then
+  echo "S1 partial output exists; preserve and inspect: ${SMOKE}"
+else
+  run_logged "${SMOKE}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.train_direct_slat_flow \
+      --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+      --output_dir "${SMOKE}" \
+      --indices 0,3 \
+      --max_steps 20 \
+      --save_every 20 \
+      --log_every 1 \
+      --grad_accum 1 \
+      --seed 42 \
+      "${V5_ARGS[@]}"
+  S1_RC=$?
+  echo "S1_RC=${S1_RC}"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# S2. smoke 的版本、分支预算、endpoint-rank 审计
+###############################################################################
+
+S2_RC=0
+if [ ! -s "${SMOKE}/report.json" ] || [ ! -s "${SMOKE_CKPT}" ]; then
+  echo "S2 blocked: run S1 first"
+  S2_RC=96
+else
+  "${PY}" -c \
+    'import json,math,sys,torch
+r=json.load(open(sys.argv[1]))
+c=torch.load(sys.argv[2],map_location="cpu")
+a=c["args"]; counts=r["mechanism_training_audit"]["counts"]; h=r["history"]
+assert r["completed"] is True and r["step"]==20
+assert a["training_semantics"]=="branch_budget_rollout_v5"
+assert a["slat_residual_combination_policy"]=="lora_support_budget_v2"
+assert float(a["slat_lora_delta_rms_ratio_cap"])==0.03
+assert float(a["slat_support_delta_rms_ratio_cap"])==0.07
+assert float(a["slat_delta_rms_ratio_cap"])==0.10
+assert a["rollout_horizons"]=="2,4,8"
+assert a["rollout_supervision_policy"]=="terminal_only_constant_memory_v1"
+assert counts["wrong_support_events"]>0
+assert counts["support_dropout_events"]>0
+assert counts["rollout_events"]>0
+assert counts["rollout_endpoint_rank_passes"]>=0
+assert {int(x["rollout_horizon"]) for x in h if x["rollout_evaluated"]}=={2,4,8}
+assert {int(x["rollout_supervised_state_count"]) for x in h
+        if x["rollout_evaluated"]}=={1}
+assert any(float(x["lora_branch_effective_delta_rms"])>0 for x in h[1:])
+assert any(float(x["support_branch_effective_delta_rms"])>0 for x in h[1:])
+for row in h:
+  for key in ("loss","flow_loss","stock_loss","grad_norm",
+              "endpoint_x0_loss","endpoint_stock_x0_loss",
+              "rollout_endpoint_rank_loss","rollout_endpoint_advantage",
+              "branch_delta_cosine","cuda_peak_allocated_mib",
+              "cuda_peak_reserved_mib"):
+    assert math.isfinite(float(row[key]))
+print(json.dumps({
+  "passed":True,
+  "step":r["step"],
+  "counts":counts,
+  "means":r["mechanism_training_audit"]["means"],
+  "endpoint_rank_pass_rate":
+    r["mechanism_training_audit"]["rollout_endpoint_rank_pass_rate"],
+},indent=2))' \
+    "${SMOKE}/report.json" "${SMOKE_CKPT}"
+  S2_RC=$?
+fi
+echo "S2_RC=${S2_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# S3. 双卡 897-object / step100（S0-S2 通过后人工批准）
+###############################################################################
+
+# export APPROVE_V5_1_STEP100=1
+
+EXPECTED_V5_TRAIN100=/data/zjr/direct_slat_v5_1_terminal_rollout_20260729/train897_step100_seed42_2gpu_v3
+
+if [ "${TRAIN100:-}" != "${EXPECTED_V5_TRAIN100}" ]; then
+  echo "S3 blocked: stale shell variables point outside V5.1 v3:"
+  echo "  actual:   ${TRAIN100:-[unset]}"
+  echo "  expected: ${EXPECTED_V5_TRAIN100}"
+  echo "Run this command file from its beginning to refresh all variables."
+elif [ "${APPROVE_V5_1_STEP100:-0}" != 1 ]; then
+  echo "S3 not started; run: export APPROVE_V5_1_STEP100=1"
+elif [ "$(awk -F, '{print NF}' <<<"${TRAIN_GPUS}")" -ne 2 ]; then
+  echo "S3 blocked: TRAIN_GPUS must contain exactly two GPU ids"
+elif [ -s "${TRAIN100}/report.json" ] && [ -s "${TRAIN100_CKPT}" ]; then
+  echo "reuse immutable S3: ${TRAIN100}"
+elif [ "${RESUME_V5_1_STEP100:-0}" = 1 ] \
+  && [ -s "${TRAIN100}/checkpoints/last.pt" ]; then
+  S3_RESUME_CKPT=${TRAIN100}/checkpoints/last.pt
+  echo "resume S3: ${S3_RESUME_CKPT}"
+  run_logged "${TRAIN100}.resume.log" env \
+    CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${TORCHRUN}" --standalone --nproc_per_node=2 \
+      -m pose_point_depth_mv.train_direct_slat_flow \
+      --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+      --output_dir "${TRAIN100}" \
+      --resume "${S3_RESUME_CKPT}" \
+      --max_steps 100 \
+      --save_every 20 \
+      --log_every 5 \
+      --grad_accum 8 \
+      --seed 42 \
+      "${V5_ARGS[@]}"
+  S3_RC=$?
+  echo "S3_RESUME_RC=${S3_RC}"
+elif [ -e "${TRAIN100}" ]; then
+  echo "S3 partial output exists; preserve and inspect: ${TRAIN100}"
+else
+  run_logged "${TRAIN100}.log" env \
+    CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${TORCHRUN}" --standalone --nproc_per_node=2 \
+      -m pose_point_depth_mv.train_direct_slat_flow \
+      --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+      --output_dir "${TRAIN100}" \
+      --max_steps 100 \
+      --save_every 20 \
+      --log_every 5 \
+      --grad_accum 8 \
+      --seed 42 \
+      "${V5_ARGS[@]}"
+  S3_RC=$?
+  echo "S3_RC=${S3_RC}"
+fi
+echo "current terminal remains open"
+
+# 在另一个终端监视 S3：
+#
+# watch -n 20 bash -lc '
+# date -u
+# BASE=/data/zjr/direct_slat_v5_1_terminal_rollout_20260729/train897_step100_seed42_2gpu_v3
+# LOG=${BASE}.resume.log
+# [ -s "${LOG}" ] || LOG=${BASE}.log
+# CKPT=${BASE}/checkpoints
+# ps -eo pid,etime,%cpu,%mem,cmd | rg "train_direct_slat_flow|torchrun" | rg -v "rg " || true
+# printf "latest training record: "
+# rg "^\\[direct_slat_train\\]" "${LOG}" 2>/dev/null | tail -n 1 || true
+# printf "latest checkpoints:\n"
+# find "${CKPT}" -maxdepth 1 -type f -name "step_*.pt" -printf "%f\n" 2>/dev/null | sort -V | tail -n 5
+# nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+# '
+
+
+###############################################################################
+# S4. step100 / 8-object teacher-forced 诊断（不是科学主门）
+###############################################################################
+
+TEACHER8=${TRAIN100}/eval_val8_activecfg_seed42_t0579_v1
+
+if [ ! -s "${TRAIN100_CKPT}" ]; then
+  echo "S4 blocked: step100 checkpoint is missing"
+elif [ -s "${TEACHER8}/report.json" ]; then
+  sed -n '1,180p' "${TEACHER8}/summary.txt"
+elif [ -e "${TEACHER8}" ]; then
+  echo "S4 partial output exists; preserve and inspect: ${TEACHER8}"
+else
+  run_logged "${TEACHER8}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.eval_direct_slat_flow \
+      --cache_manifest "${VAL_CACHE}/manifest.json" \
+      --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --checkpoint "${TRAIN100_CKPT}" \
+      --output_dir "${TEACHER8}" \
+      --pretrained "${PRETRAINED}" \
+      --max_objects 8 \
+      --noise_seeds 42 \
+      --t_values 0.5,0.7,0.9 \
+      --amp_dtype bf16 \
+      --bootstrap_samples 2000 \
+      --min_object_win_rate 0.50 \
+      --decision_profile report_only
+  S4_RC=$?
+  echo "S4_RC=${S4_RC}"
+  test -s "${TEACHER8}/summary.txt" && sed -n '1,180p' "${TEACHER8}/summary.txt"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# S5. step100 / 6-object same-noise Mesh + 分支诊断
+###############################################################################
+
+MESH6=${TRAIN100}/mesh6_components_seed42_v1
+
+if [ ! -s "${TRAIN100_CKPT}" ]; then
+  echo "S5 blocked: step100 checkpoint is missing"
+elif [ -s "${MESH6}/report.json" ]; then
+  sed -n '1,220p' "${MESH6}/summary.txt"
+elif [ -e "${MESH6}" ]; then
+  echo "S5 partial output exists; preserve and inspect: ${MESH6}"
+else
+  run_logged "${MESH6}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+      --cache_manifest "${VAL_CACHE}/manifest.json" \
+      --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --checkpoint "${TRAIN100_CKPT}" \
+      --output_dir "${MESH6}" \
+      --pretrained "${PRETRAINED}" \
+      --uids "${MATRIX_UIDS}" \
+      --joint_seeds 42 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --surface_samples 20000 \
+      --bootstrap_samples 5000 \
+      --amp_dtype bf16 \
+      --noise_identity_mode object_uid_v1 \
+      --comparison_branches stock,lora_only,adapter_only,full
+  S5_RC=$?
+  echo "S5_RC=${S5_RC}"
+  test -s "${MESH6}/summary.txt" && sed -n '1,220p' "${MESH6}/summary.txt"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# S6. 只在 step100 Mesh 无系统退化时续训到 step200
+###############################################################################
+
+# S5 只有 6 objects × 1 seed，是 checkpoint 诊断，不是 Full > Stock 证明。
+# 满足“无灾难退化 + 至少两项主/次指标均值非负”后，人工执行：
+# export APPROVE_V5_1_STEP200=1
+
+if [ "${APPROVE_V5_1_STEP200:-0}" != 1 ]; then
+  echo "S6 not started; review S4/S5, then export APPROVE_V5_1_STEP200=1"
+elif [ ! -s "${TRAIN100_CKPT}" ]; then
+  echo "S6 blocked: step100 checkpoint is missing"
+elif [ "$(awk -F, '{print NF}' <<<"${TRAIN_GPUS}")" -ne 2 ]; then
+  echo "S6 blocked: TRAIN_GPUS must contain exactly two GPU ids"
+elif [ -s "${LONG200}/report.json" ] && [ -s "${TRAIN200_CKPT}" ]; then
+  echo "reuse immutable S6: ${LONG200}"
+elif [ -e "${LONG200}" ]; then
+  echo "S6 partial output exists; preserve and inspect: ${LONG200}"
+else
+  run_logged "${LONG200}.log" env \
+    CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${TORCHRUN}" --standalone --nproc_per_node=2 \
+      -m pose_point_depth_mv.train_direct_slat_flow \
+      --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+      --output_dir "${LONG200}" \
+      --resume "${TRAIN100_CKPT}" \
+      --max_steps 200 \
+      --save_every 20 \
+      --log_every 5 \
+      --grad_accum 8 \
+      --seed 42 \
+      "${V5_ARGS[@]}"
+  S6_RC=$?
+  echo "S6_RC=${S6_RC}"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# S7. step200 / 32-object × 3-seed development Mesh
+###############################################################################
+
+# 该集合已经参与过历史 Direct-SLAT 分析，只能用于候选选择，formal=false。
+
+DEV32=${LONG200}/mesh_dev32_seed424344_v1
+
+if [ ! -s "${TRAIN200_CKPT}" ]; then
+  echo "S7 blocked: step200 checkpoint is missing"
+elif [ -s "${DEV32}/report.json" ]; then
+  sed -n '1,220p' "${DEV32}/summary.txt"
+elif [ -e "${DEV32}" ]; then
+  echo "S7 partial output exists; preserve and inspect: ${DEV32}"
+else
+  run_logged "${DEV32}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+      --cache_manifest "${VAL_CACHE}/manifest.json" \
+      --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --checkpoint "${TRAIN200_CKPT}" \
+      --output_dir "${DEV32}" \
+      --pretrained "${PRETRAINED}" \
+      --max_objects 32 \
+      --joint_seeds 42,43,44 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --surface_samples 20000 \
+      --bootstrap_samples 10000 \
+      --amp_dtype bf16 \
+      --noise_identity_mode object_uid_v1
+  S7_RC=$?
+  echo "S7_RC=${S7_RC}"
+  test -s "${DEV32}/summary.txt" && sed -n '1,220p' "${DEV32}/summary.txt"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# S8. 可选：全新 object-disjoint cache 上冻结正式 blind
+###############################################################################
+
+# 不得把 V4 Blind32 或本文件的 MESH6/DEV32 对象再次称为 fresh blind。
+# 只有准备好新的、此前未查看 Mesh 的 cache 时才设置：
+#
+# export V5_1_FRESH_CACHE=/data/zjr/<new_untouched_direct_slat_cache>
+# export CANDIDATE_CKPT="${TRAIN200_CKPT}"
+# export CANDIDATE_STEP=200
+# export APPROVE_V5_1_FRESH_BLIND=1
+
+V4_BLIND_REPORT=/data/zjr/direct_slat_v4_step200_matched_blind32_seed424344_20260729_v1/mesh_formal_v1/report.json
+V5_1_FRESH_CACHE=${V5_1_FRESH_CACHE:-}
+CANDIDATE_CKPT=${CANDIDATE_CKPT:-${TRAIN200_CKPT}}
+CANDIDATE_STEP=${CANDIDATE_STEP:-200}
+BLIND_ROOT=${WORK}/fresh_blind_step${CANDIDATE_STEP}_seed424344_v1
+BLIND_PROTOCOL=${BLIND_ROOT}/protocol/protocol.json
+BLIND_MESH=${BLIND_ROOT}/mesh
+
+if [ "${APPROVE_V5_1_FRESH_BLIND:-0}" != 1 ]; then
+  echo "S8 not started; a genuinely untouched cache is required"
+elif [ -z "${V5_1_FRESH_CACHE}" ] || [ ! -s "${V5_1_FRESH_CACHE}/manifest.json" ]; then
+  echo "S8 blocked: V5_1_FRESH_CACHE/manifest.json is missing"
+elif [ ! -s "${CANDIDATE_CKPT}" ]; then
+  echo "S8 blocked: candidate checkpoint is missing"
+elif [ ! -s "${V4_BLIND_REPORT}" ] || [ ! -s "${DEV32}/report.json" ]; then
+  echo "S8 blocked: prior-object exclusion reports are missing"
+else
+  if [ ! -s "${BLIND_PROTOCOL}" ]; then
+    "${PY}" -u -m pose_point_depth_mv.freeze_direct_slat_matched_mesh_blind \
+      --cache_manifest "${V5_1_FRESH_CACHE}/manifest.json" \
+      --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --checkpoint "${CANDIDATE_CKPT}" \
+      --exclude_report "${V4_BLIND_REPORT}" \
+      --exclude_report "${DEV32}/report.json" \
+      --exclude_report "${MESH6}/report.json" \
+      --output_dir "${BLIND_ROOT}/protocol" \
+      --protocol_name direct_slat_v5_1_fresh_blind32_seed424344_v1 \
+      --expected_checkpoint_step "${CANDIDATE_STEP}" \
+      --expected_objects 32 \
+      --joint_seeds 42,43,44 \
+      --selection_seed 20260730 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --surface_samples 20000 \
+      --bootstrap_samples 10000 \
+      --amp_dtype bf16
+  fi
+  if [ -s "${BLIND_PROTOCOL}" ] && [ ! -e "${BLIND_MESH}" ]; then
+    run_logged "${BLIND_MESH}.log" env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+        --cache_manifest "${V5_1_FRESH_CACHE}/manifest.json" \
+        --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+        --checkpoint "${CANDIDATE_CKPT}" \
+        --output_dir "${BLIND_MESH}" \
+        --pretrained "${PRETRAINED}" \
+        --frozen_protocol "${BLIND_PROTOCOL}" \
+        --comparison_branches stock,full
+    S8_RC=$?
+    echo "S8_RC=${S8_RC}"
+  fi
+fi
+
+echo "formal report: ${BLIND_MESH}/report.json"
+echo "说明：formal_pass=false/SCIENCE_RC=3 是科学门失败，不是程序崩溃。"
+echo "current terminal remains open"
+
+
+###############################################################################
+# 最终决策
+###############################################################################
+
+# 1. S4 teacher gain 只能选 checkpoint，不能证明 Mesh 改善。
+# 2. S5/S7 若均值方向不稳或 Full 只贴总 cap，不再续训到 step400/1000。
+# 3. 只有 S8 的 fresh formal_pass=true，才允许进入 Mixed10k 的短程 scaling smoke。
+# 4. 即使 S8 通过，先做 10k 的 100-step/固定预算 smoke；仍不直接长训。
+# 5. 旧 V5 all_visited checkpoint 不能 resume 到 V5.1；V5.1 必须从
+#    zero-init stock-equivalent 起训。rollout_supervision_policy 已纳入 resume 硬绑定。

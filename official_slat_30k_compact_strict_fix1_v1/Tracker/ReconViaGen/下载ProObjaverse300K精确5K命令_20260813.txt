@@ -1,0 +1,59 @@
+cd /home/zjr/Tracker
+set -o pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OUT=/data/zjr/ProObjaverse-300K-ReconViaGen-5K
+REVISION=c9175c52d4a45feb9536bec2f1168c50ecdc7765
+
+# 数据和Hugging Face/Xet缓存均放在/data/zjr，避免占用home分区。
+export HF_HOME=${HF_HOME:-/data/zjr/huggingface}
+export HF_HUB_CACHE=${HF_HUB_CACHE:-${HF_HOME}/hub}
+export HF_XET_CACHE=${HF_XET_CACHE:-${HF_HOME}/xet}
+export HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-120}
+export HF_HUB_ETAG_TIMEOUT=${HF_HUB_ETAG_TIMEOUT:-30}
+export HF_HUB_DISABLE_PROGRESS_BARS=1
+
+mkdir -p "${OUT}/logs" "${HF_HUB_CACHE}" "${HF_XET_CACHE}"
+
+# D0：先查询官方仓库，冻结精确5000个render-tar + slat-npz的UID交集；不下载大文件。
+"${PY}" -u ReconViaGen/download_proobjaverse_subset.py \
+  --output-root "${OUT}" \
+  --revision "${REVISION}" \
+  --count 5000 \
+  --seed 20260813 \
+  --candidate-margin 500 \
+  --plan-only \
+  2>&1 | tee "${OUT}/logs/plan.log"
+D0_RC=${PIPESTATUS[0]}
+echo "D0_RC=${D0_RC}"
+
+# D1：下载冻结后的5000对。可断点续传，中断后重跑同一命令。
+if [ "${D0_RC}" -ne 0 ]; then
+  echo "D1 blocked: selection planning failed"
+  D1_RC=96
+else
+  "${PY}" -u ReconViaGen/download_proobjaverse_subset.py \
+    --output-root "${OUT}" \
+    --revision "${REVISION}" \
+    --count 5000 \
+    --seed 20260813 \
+    --candidate-margin 500 \
+    --max-workers 8 \
+    --retries 5 \
+    2>&1 | tee "${OUT}/logs/download.log"
+  D1_RC=${PIPESTATUS[0]}
+fi
+echo "D1_RC=${D1_RC}"
+
+if [ "${D1_RC}" -eq 0 ]; then
+  "${PY}" -c \
+    'import json,sys
+p=json.load(open(sys.argv[1])); assert p["complete"] is True
+assert p["selected_pair_count"]==5000 and p["completed_pair_count"]==5000
+print(json.dumps(p,indent=2,ensure_ascii=False))' \
+    "${OUT}/download_report.json"
+fi
+
+echo "dataset root: ${OUT}"
+echo "selection: ${OUT}/selection.json"
+echo "report: ${OUT}/download_report.json"

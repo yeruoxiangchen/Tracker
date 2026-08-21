@@ -1,0 +1,1076 @@
+Objaverse补充576完成后：D8汇总、语义审查、reviewed Mixed1k冻结
+=================================================================
+
+使用约定
+--------
+
+1. 每个编号下的圆括号块都是一条独立命令，逐块复制到终端执行。
+2. D8.0--D8.6 都是短 CPU/IO 命令，直接在当前终端打印，不需要监视。
+3. D8.2 后只需人工填写 255 行 semantic_subject_label；`1`表示接受、`0`表示拒绝，
+   也兼容正式英文标签。rejection_reason 可留空，reviewer 由 D8.4 统一补齐。
+4. D9/D10 是长 GPU cache 任务，使用 user service；启动命令和监视命令分开。
+5. 任一步非零即停止，不要跳过。所有正式输出都是新不可变目录。
+6. 576 是 sequence 数；当前对象级事实是 288 attempted、255 至少一条 accepted。
+
+
+D8.0 代码、单元测试与16-shard汇总硬门（直接运行）
+=====================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" -m py_compile \
+    pose_point_depth_mv/dataset_tools/prepare_objaverse_semantic_review.py \
+    pose_point_depth_mv/dataset_tools/freeze_reviewed_mixed1k_dataset.py \
+    pose_point_depth_mv/dataset_tools/test_freeze_reviewed_mixed1k_dataset.py
+
+  "${PY}" -m unittest -v \
+    pose_point_depth_mv.dataset_tools.test_prepare_objaverse_semantic_review \
+    pose_point_depth_mv.dataset_tools.test_freeze_reviewed_mixed1k_dataset
+
+  "${PY}" - <<'PY'
+import json
+from pathlib import Path
+from collections import Counter, defaultdict
+
+from pose_point_depth_mv.dataset_tools.freeze_reviewed_mixed1k_dataset import (
+    completed_render_manifests,
+    load_manifest,
+    object_uid,
+)
+
+root = Path('/data/zjr/dataset10k_20260726/gap_objaverse288_cyclescuda_v1')
+manifests, markers = completed_render_manifests(
+    root, source='objaverse', expected_shards=16
+)
+counts = defaultdict(lambda: {'accepted': 0, 'failed': 0})
+failure_counts = Counter()
+accepted_sequences = 0
+failed_sequences = 0
+for path in manifests:
+    payload = load_manifest(path)
+    for row in payload['samples']:
+        counts[object_uid(row)]['accepted'] += 1
+        accepted_sequences += 1
+    for row in payload.get('failures', []):
+        counts[object_uid(row)]['failed'] += 1
+        failed_sequences += 1
+        failure_counts[str(row.get('reason', row.get('failure_class', 'unknown')))] += 1
+
+summary = {
+    'completed_markers': len(markers),
+    'attempted_sequences': accepted_sequences + failed_sequences,
+    'accepted_sequences': accepted_sequences,
+    'failed_sequences': failed_sequences,
+    'attempted_objects': len(counts),
+    'objects_with_accepted_sequence': sum(v['accepted'] > 0 for v in counts.values()),
+    'objects_with_two_accepted': sum(v['accepted'] == 2 for v in counts.values()),
+    'objects_with_one_accepted': sum(v['accepted'] == 1 for v in counts.values()),
+    'objects_with_zero_accepted': sum(v['accepted'] == 0 for v in counts.values()),
+    'failure_counts': dict(sorted(failure_counts.items())),
+}
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+expected = {
+    'completed_markers': 16,
+    'attempted_sequences': 576,
+    'accepted_sequences': 484,
+    'failed_sequences': 92,
+    'attempted_objects': 288,
+    'objects_with_accepted_sequence': 255,
+    'objects_with_two_accepted': 229,
+    'objects_with_one_accepted': 26,
+    'objects_with_zero_accepted': 33,
+}
+for key, value in expected.items():
+    assert summary[key] == value, (key, summary[key], value)
+print('D8.0 PASS: all 16 markers are hash-bound; object-level inventory is exact')
+PY
+)
+
+
+D8.1 生成255-object四视图语义审查表（直接运行）
+================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RENDER=/data/zjr/dataset10k_20260726/gap_objaverse288_cyclescuda_v1
+  REVIEW=/home/zjr/Tracker/pose_point_depth_mv/objaverse_gap288_semantic_review_20260730_v1
+
+  if [ -s "${REVIEW}/candidates.json" ] && [ -s "${REVIEW}/review_decisions.csv" ]; then
+    echo "reuse pending immutable review workspace: ${REVIEW}"
+  elif [ -e "${REVIEW}" ]; then
+    echo "D8.1 blocked: partial review workspace exists: ${REVIEW}"
+    exit 98
+  else
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_objaverse_semantic_review \
+      prepare-render \
+      --render_root "${RENDER}" \
+      --source_group gap_objaverse288 \
+      --review_prefix G \
+      --output_dir "${REVIEW}" \
+      --batch_size 20 \
+      --columns 2
+  fi
+
+  "${PY}" - "${REVIEW}/candidates.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+print(json.dumps(p['summary'], indent=2, ensure_ascii=False))
+assert p['status'] == 'pending_review'
+assert p['summary']['candidate_count'] == 255, p['summary']
+assert len(p['candidates']) == 255
+assert len({row['review_id'] for row in p['candidates']}) == 255
+print('D8.1 PASS')
+PY
+
+  echo "contact sheets: ${REVIEW}/batches/gap_objaverse288"
+  echo "blank decision table: ${REVIEW}/review_decisions.csv"
+)
+
+
+D8.2 创建人工决定副本（直接运行一次，然后人工编辑CSV）
+=====================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  REVIEW=pose_point_depth_mv/objaverse_gap288_semantic_review_20260730_v1
+  FINAL_CSV=${REVIEW}/review_decisions_reviewed.csv
+
+  if [ -e "${FINAL_CSV}" ]; then
+    echo "preserve existing reviewed decision table: ${FINAL_CSV}"
+  else
+    cp -a "${REVIEW}/review_decisions.csv" "${FINAL_CSV}"
+    echo "created: ${FINAL_CSV}"
+  fi
+  echo "只需逐行填写 semantic_subject_label"
+  echo "允许标签: 1=接受 / 0=拒绝；也兼容 keep_single_subject / reject_scene_or_fragment / uncertain_review"
+  echo "rejection_reason 和 reviewer 可留空；D8.4 会统一记录 reviewer"
+  echo "contact sheets: ${REVIEW}/batches/gap_objaverse288"
+)
+
+
+D8.3 人工决定完整性硬门（填完CSV后直接运行）
+=============================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REVIEW=pose_point_depth_mv/objaverse_gap288_semantic_review_20260730_v1
+
+  "${PY}" - "${REVIEW}/candidates.json" \
+    "${REVIEW}/review_decisions_reviewed.csv" <<'PY'
+import csv, json, sys
+from collections import Counter
+
+candidates = json.load(open(sys.argv[1]))['candidates']
+with open(sys.argv[2], newline='', encoding='utf-8') as handle:
+    reader = csv.DictReader(handle)
+    fieldnames = list(reader.fieldnames or [])
+    rows = list(reader)
+aliases = {
+    '1': 'keep_single_subject',
+    '0': 'reject_scene_or_fragment',
+    'keep_single_subject': 'keep_single_subject',
+    'reject_scene_or_fragment': 'reject_scene_or_fragment',
+    'uncertain_review': 'uncertain_review',
+}
+candidate_ids = [str(row['review_id']) for row in candidates]
+row_ids = [str(row.get('review_id', '')).strip() for row in rows]
+problems = {
+    'row_count': len(rows),
+    'candidate_count': len(candidates),
+    'duplicate_review_ids': len(row_ids) - len(set(row_ids)),
+    'missing_or_invalid_labels': sum(
+        str(row.get('semantic_subject_label', '')).strip() not in aliases for row in rows
+    ),
+    'coverage_match': set(row_ids) == set(candidate_ids),
+    'decision_counts_raw': dict(sorted(Counter(
+        str(row.get('semantic_subject_label', '')).strip() for row in rows
+    ).items())),
+    'decision_counts_normalized': dict(sorted(Counter(
+        aliases.get(str(row.get('semantic_subject_label', '')).strip(), 'INVALID')
+        for row in rows
+    ).items())),
+}
+print(json.dumps(problems, indent=2, ensure_ascii=False))
+ok = (
+    len(rows) == 255
+    and len(candidate_ids) == 255
+    and problems['duplicate_review_ids'] == 0
+    and problems['missing_or_invalid_labels'] == 0
+    and problems['coverage_match']
+)
+assert ok, 'D8.3 blocked: semantic decisions are incomplete or inconsistent'
+print('D8.3 PASS')
+PY
+)
+
+
+D8.4 冻结第二轮Objaverse语义结论（D8.3通过后直接运行）
+========================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REVIEW=pose_point_depth_mv/objaverse_gap288_semantic_review_20260730_v1
+  FINAL=pose_point_depth_mv/objaverse_gap288_semantic_review_final_20260730_v1
+
+  if [ -s "${FINAL}/report.json" ] && [ -s "${FINAL}/accepted_objects.json" ]; then
+    echo "reuse immutable finalized semantic review: ${FINAL}"
+  elif [ -e "${FINAL}" ]; then
+    echo "D8.4 blocked: partial finalized review exists: ${FINAL}"
+    exit 98
+  else
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_objaverse_semantic_review \
+      finalize \
+      --candidates "${REVIEW}/candidates.json" \
+      --review_csv "${REVIEW}/review_decisions_reviewed.csv" \
+      --default_reviewer user_visual_review_20260730 \
+      --output_dir "${FINAL}"
+  fi
+
+  "${PY}" - "${FINAL}/report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+print(json.dumps(r, indent=2, ensure_ascii=False))
+assert r['status'] == 'complete'
+assert r['summary']['reviewed_count'] == 255
+assert sum(r['summary'][key] for key in (
+    'accepted_count', 'rejected_count', 'uncertain_count'
+)) == 255
+print('D8.4 PASS')
+PY
+)
+
+
+D8.5 汇总最终准入对象数（直接运行）
+==================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" - <<'PY'
+import json
+from pathlib import Path
+
+from pose_point_depth_mv.dataset_tools.freeze_reviewed_mixed1k_dataset import (
+    completed_render_manifests,
+    load_manifest,
+)
+
+old = json.load(open(
+    'pose_point_depth_mv/objaverse1114_semantic_review_final_20260730_v1/accepted_objects.json'
+))
+gap = json.load(open(
+    'pose_point_depth_mv/objaverse_gap288_semantic_review_final_20260730_v1/accepted_objects.json'
+))
+omni_manifests, omni_markers = completed_render_manifests(
+    Path('/data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4'),
+    source='omni',
+    expected_shards=5,
+)
+omni = {
+    row['object_uid']
+    for path in omni_manifests
+    for row in load_manifest(path)['samples']
+}
+summary = {
+    'reviewed_objaverse_previous': len(old),
+    'reviewed_objaverse_gap': len(gap),
+    'completed_marker_omni_shards': len(omni_markers),
+    'completed_marker_omni': len(omni),
+    'total_admitted_objects_before_source_dedup': len(old) + len(gap) + len(omni),
+}
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+assert len(old) == 738
+assert len(gap) == 169
+assert len(omni_markers) == 5
+assert len(omni) == 153
+assert 950 <= summary['total_admitted_objects_before_source_dedup'] <= 1200, (
+    '仍不足约1k，停止冻结并只补小批fresh Objaverse', summary
+)
+print('D8.5 PASS')
+PY
+)
+
+
+D8.6 冻结reviewed约1k的train/val/test（约1分钟，当前终端直接运行）
+=================================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  OUT=/data/zjr/reviewed_mixed1k_semantic_v1_20260730
+
+  "${PY}" -u -m pose_point_depth_mv.dataset_tools.freeze_reviewed_mixed1k_dataset \
+    --legacy_objaverse_manifest \
+      /data/zjr/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/manifests/train.json \
+    --objaverse_review \
+      /home/zjr/Tracker/pose_point_depth_mv/objaverse1114_semantic_review_final_20260730_v1/accepted_objects.json \
+    --objaverse_review \
+      /home/zjr/Tracker/pose_point_depth_mv/objaverse_gap288_semantic_review_final_20260730_v1/accepted_objects.json \
+    --objaverse_render_root \
+      /data/zjr/dataset10k_20260726/pilot_objaverse256_cyclescuda_v2 \
+    --objaverse_render_root \
+      /data/zjr/dataset10k_20260726/gap_objaverse288_cyclescuda_v1 \
+    --omni_render_root \
+      /data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4 \
+    --exclude_manifest \
+      /data/zjr/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/manifests/val.json \
+    --exclude_manifest \
+      /data/zjr/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/manifests/holdout.json \
+    --expected_objaverse_shards_per_root 16 \
+    --expected_omni_shards_per_root 5 \
+    --val_objects 64 \
+    --test_objects 64 \
+    --min_objects 950 \
+    --max_objects 1200 \
+    --seed 20260730 \
+    --output_dir "${OUT}"
+)
+
+
+D8.7 验收冻结报告（直接运行）
+================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/reviewed_mixed1k_semantic_v1_20260730
+
+  "${PY}" - "${ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+report = json.load(open(root / 'report.json'))
+print(json.dumps({
+    'passed': report['passed'],
+    'summary': report['summary'],
+    'hard_guards': report['hard_guards'],
+    'manifest_sha256': report['manifest_sha256'],
+    'train_sha256': report['train_sha256'],
+    'val_sha256': report['val_sha256'],
+    'test_sha256': report['test_sha256'],
+}, indent=2, ensure_ascii=False))
+assert report['passed'] is True
+assert all(report['hard_guards'].values()), report['hard_guards']
+assert report['summary']['split_object_counts']['val'] == 64
+assert report['summary']['split_object_counts']['test'] == 64
+assert 950 <= report['summary']['object_count'] <= 1200
+for name in ('manifest.json', 'train.json', 'val.json', 'test.json'):
+    assert (root / name).is_file(), name
+print('D8.7 PASS: reviewed Mixed1k may enter cache construction')
+PY
+)
+
+
+D9.0 Native代码短测试（D8.7通过后直接运行）
+=============================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" -m py_compile \
+    trellis_point_prior_mv/build_point_prior_dataset.py \
+    reconvggt_ar_adapter_a/build_pointpose_ss_cache.py \
+    pose_point_depth_mv/native_3d_condition.py \
+    pose_point_depth_mv/train_native_ss_flow.py \
+    pose_point_depth_mv/train_native_slat_flow.py \
+    pose_point_depth_mv/audit_native_3d_condition_g0.py \
+    pose_point_depth_mv/evaluate_native_condition_teacher.py \
+    pose_point_depth_mv/evaluate_native_ss_rollout.py \
+    pose_point_depth_mv/export_native_slat_mesh_pairs.py \
+    pose_point_depth_mv/build_direct_slat_cache.py
+
+  "${PY}" -c "import inspect; import pose_point_depth_mv.test_native_3d_condition as m; tests=[(n,v) for n,v in vars(m).items() if n.startswith('test_') and inspect.isfunction(v)]; [(print(n,flush=True),v()) for n,v in tests]; print(f'{len(tests)} passed',flush=True)"
+)
+
+
+D9 输入cache修订说明
+=====================
+
+旧 v1 命令曾将 reviewed split manifest 直接传给 pose-lifting builder，跳过了
+point prior 和 14 维 PointPose physical cache，因此在真正 GPU 计算前报
+`physical feature schema mismatch: cache=()`。D9 v2 又绑定了未完成对象级SS repair的
+raw freeze。保留 v1/v2 目录和日志，最终修正链路全部
+写入：
+
+  /data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+
+正确顺序是：
+
+  raw reviewed split -> object-level SS repair -> point prior
+  -> PointPose physical cache -> pose lifting
+
+
+D8.8 对象级SS target修复（长GPU任务，GPU 5）
+================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SOURCE=/data/zjr/reviewed_mixed1k_semantic_v1_20260730
+  OUT=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730
+  LOG=${OUT}.log
+  UNIT=tracker-native3d-reviewed1k-object-ss-repair-v1
+
+  test -s "${SOURCE}/report.json"
+  if [ -s "${OUT}/report.json" ]; then
+    "${PY}" - "${OUT}/report.json" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+assert report.get('passed') is True, report.get('failures', [])[:10]
+print(json.dumps(report['summary'], indent=2, ensure_ascii=False))
+print('D8.8 reuse PASS')
+PY
+  elif systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service"
+  elif [ -e "${OUT}" ] && [ "${RESUME_REPAIR:-0}" != 1 ]; then
+    echo "D8.8 partial output exists; inspect it, then rerun with RESUME_REPAIR=1"
+    exit 98
+  else
+    RESUME_ARGS=()
+    if [ -e "${OUT}" ]; then
+      RESUME_ARGS+=(--resume)
+    fi
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      /usr/bin/env \
+        CUDA_VISIBLE_DEVICES=5 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m \
+        pose_point_depth_mv.dataset_tools.repair_reviewed_frozen_object_ss \
+        --source_root "${SOURCE}" \
+        --output_root "${OUT}" \
+        --encoder_pretrained \
+          microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16 \
+        --decoder_pretrained Stable-X/trellis-vggt-v0-2 \
+        --target_mode decoder_projected \
+        --surface_points 160000 \
+        --voxel_resolution 64 \
+        --canonical_margin 0.9 \
+        --seed 42 \
+        --device cuda \
+        --latent_dtype float16 \
+        --log_every 10 \
+        "${RESUME_ARGS[@]}"
+  fi
+  echo "log: ${LOG}"
+)
+
+
+D8.8监视命令（另一个终端）
+=========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native3d-reviewed1k-object-ss-repair-v1.service || true; tail -n 12 /data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730.log 2>/dev/null || true'
+
+
+D8.9 repaired freeze硬门（D8.8完成后直接运行）
+==============================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730
+
+  "${PY}" - "${ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+report = json.load(open(root / 'report.json'))
+summary = report['summary']
+assert report.get('passed') is True, report.get('failures', [])[:10]
+assert summary == {
+    'object_count': 1060,
+    'sample_count': 1733,
+    'reused_repaired_objects': 587,
+    'rebuilt_objects': 473,
+    'failure_count': 0,
+}, summary
+for name in ('manifest', 'train', 'val', 'test'):
+    payload = json.load(open(root / f'{name}.json'))
+    assert payload['ss_repair']['repair_format'] == 'object_level_ss_repair.v1'
+    assert all(row.get('ss_repair_target_sha256') for row in payload['samples'])
+    assert all(row.get('ss_repair_z_sha256') for row in payload['samples'])
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+print('D8.9 PASS')
+PY
+)
+
+
+D9.1 启动train point-prior构建（CPU长任务）
+============================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SOURCE=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/train.json
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+  OUT=${ROOT}/point_prior_train
+  LOG=${OUT}.log
+  UNIT=tracker-native3d-reviewed1k-prior-train-v3
+
+  test -s /data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/report.json
+  if [ -s "${OUT}/manifest.json" ] && [ -s "${OUT}/build_report.json" ]; then
+    echo "reuse complete train point prior: ${OUT}"
+  elif systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service"
+  elif [ -e "${OUT}" ]; then
+    echo "D9.1 blocked: partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    mkdir -p "${ROOT}"
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      "${PY}" -u trellis_point_prior_mv/build_point_prior_dataset.py \
+        --source_manifest "${SOURCE}" \
+        --output_dir "${OUT}" \
+        --indices all \
+        --max_frames 8 \
+        --seed 42 \
+        --grid_transform pixal3d_rotation \
+        --num_prior_views_choices 2,4,8 \
+        --point_count_choices 50,100,300,800,1500 \
+        --min_support 1 \
+        --min_support_ratio 0.45 \
+        --dropout_min 0.0 \
+        --dropout_max 0.65 \
+        --coord_jitter 1 \
+        --outlier_ratio 0.03 \
+        --front_depth_epsilon 0.02 \
+        --log_every 10
+  fi
+  echo "log: ${LOG}"
+)
+
+
+D9.1监视命令（另一个终端）
+=========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native3d-reviewed1k-prior-train-v3.service || true; tail -n 12 /data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/point_prior_train.log 2>/dev/null || true'
+
+
+D9.2 构建val64 point-prior（短CPU任务，可与D9.1并行）
+=====================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SOURCE=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/val.json
+  OUT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/point_prior_val64
+
+  test -s /data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/report.json
+  if [ -s "${OUT}/manifest.json" ] && [ -s "${OUT}/build_report.json" ]; then
+    echo "reuse complete val point prior: ${OUT}"
+  elif [ -e "${OUT}" ]; then
+    echo "D9.2 blocked: partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    "${PY}" -u trellis_point_prior_mv/build_point_prior_dataset.py \
+        --source_manifest "${SOURCE}" \
+        --output_dir "${OUT}" \
+        --indices all \
+        --max_frames 8 \
+        --seed 42 \
+        --grid_transform pixal3d_rotation \
+        --num_prior_views_choices 2,4,8 \
+        --point_count_choices 50,100,300,800,1500 \
+        --min_support 1 \
+        --min_support_ratio 0.45 \
+        --dropout_min 0.0 \
+        --dropout_max 0.65 \
+        --coord_jitter 1 \
+        --outlier_ratio 0.03 \
+        --front_depth_epsilon 0.02 \
+        --log_every 1
+  fi
+)
+
+
+D9.3 启动train PointPose physical cache构建（CPU长任务）
+==========================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+  SOURCE=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/train.json
+  PRIOR=${ROOT}/point_prior_train/manifest.json
+  OUT=${ROOT}/pointpose_train
+  LOG=${OUT}.log
+  UNIT=tracker-native3d-reviewed1k-pointpose-train-v3
+
+  test -s "${PRIOR}"
+  if [ -s "${OUT}/manifest.json" ] && [ -s "${OUT}/cache_audit.json" ]; then
+    echo "reuse complete train PointPose cache: ${OUT}"
+  elif systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service"
+  elif [ -e "${OUT}" ]; then
+    echo "D9.3 blocked: partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      "${PY}" -u reconvggt_ar_adapter_a/build_pointpose_ss_cache.py \
+        --source_manifest "${SOURCE}" \
+        --prior_manifest "${PRIOR}" \
+        --output_dir "${OUT}" \
+        --indices all \
+        --log_every 10
+  fi
+  echo "log: ${LOG}"
+)
+
+
+D9.3监视命令（另一个终端）
+=========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native3d-reviewed1k-pointpose-train-v3.service || true; tail -n 12 /data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/pointpose_train.log 2>/dev/null || true'
+
+
+D9.4 构建val64 PointPose physical cache（短CPU任务）
+=================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+  SOURCE=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/val.json
+  PRIOR=${ROOT}/point_prior_val64/manifest.json
+  OUT=${ROOT}/pointpose_val64
+
+  test -s "${PRIOR}"
+  if [ -s "${OUT}/manifest.json" ] && [ -s "${OUT}/cache_audit.json" ]; then
+    echo "reuse complete val PointPose cache: ${OUT}"
+  elif [ -e "${OUT}" ]; then
+    echo "D9.4 blocked: partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    "${PY}" -u reconvggt_ar_adapter_a/build_pointpose_ss_cache.py \
+      --source_manifest "${SOURCE}" \
+      --prior_manifest "${PRIOR}" \
+      --output_dir "${OUT}" \
+      --indices all \
+      --log_every 1
+  fi
+)
+
+
+D9.5 PointPose cache完成硬门（D9.1--D9.4完成后直接运行）
+========================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  FROZEN=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+
+  "${PY}" - "${FROZEN}" "${ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+
+from reconvggt_ar_adapter_a.pointpose_ss_condition import (
+    PHYSICAL_FEATURE_NAMES,
+    feature_schema_hash,
+)
+
+frozen = Path(sys.argv[1])
+root = Path(sys.argv[2])
+result = {}
+for split, suffix in (('train', 'train'), ('val', 'val64')):
+    source_path = (frozen / f'{split}.json').resolve()
+    source = json.load(open(source_path))
+    prior = json.load(open(root / f'point_prior_{suffix}' / 'manifest.json'))
+    cache = json.load(open(root / f'pointpose_{suffix}' / 'manifest.json'))
+    expected_uids = {str(row['uid']) for row in source['samples']}
+    prior_uids = {str(row['uid']) for row in prior['samples']}
+    cache_uids = {str(row['uid']) for row in cache['samples']}
+    audit = json.load(open(root / f'pointpose_{suffix}' / 'cache_audit.json'))
+    result[split] = {
+        'source_samples': len(expected_uids),
+        'prior_samples': len(prior_uids),
+        'pointpose_samples': len(cache_uids),
+        'objects': len({str(row['object_uid']) for row in source['samples']}),
+        'hard_failures': audit.get('hard_failures'),
+    }
+    assert expected_uids == prior_uids == cache_uids, result[split]
+    assert Path(prior['source_manifest']).resolve() == source_path
+    assert Path(cache['source_manifest']).resolve() == source_path
+    assert Path(cache['prior_manifest']).resolve() == (
+        root / f'point_prior_{suffix}' / 'manifest.json'
+    ).resolve()
+    assert tuple(cache['feature_names']) == PHYSICAL_FEATURE_NAMES
+    assert cache['feature_schema_hash'] == feature_schema_hash()
+    assert audit.get('hard_failures') == 0, result[split]
+    cache_root = Path(cache['output_dir'])
+    assert all((cache_root / row['physical_grid']).is_file() for row in cache['samples'])
+print(json.dumps(result, indent=2, ensure_ascii=False))
+print('D9.5 PASS')
+PY
+)
+
+
+D9.6 启动完整train lifting cache（长任务，GPU 1）
+================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+  SOURCE=${ROOT}/pointpose_train/manifest.json
+  OUT=${ROOT}/lifting_train
+  LOG=${OUT}.log
+  UNIT=tracker-native3d-reviewed1k-lift-train-v3
+
+  test -s "${SOURCE}"
+  if [ -s "${OUT}/manifest.json" ] && [ -s "${OUT}/cache_audit.json" ]; then
+    echo "reuse complete train lifting cache: ${OUT}"
+  elif systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service"
+  elif [ -e "${OUT}" ]; then
+    echo "D9.6 blocked: partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      /usr/bin/env \
+        CUDA_VISIBLE_DEVICES=1 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u ar_ss_flow/build_pose_lifting_cache.py \
+        --source_cache_manifest "${SOURCE}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --vggt_pretrained Stable-X/vggt-object-v0-1 \
+        --indices all \
+        --max_samples 0 \
+        --device cuda \
+        --save_correct_geometry \
+        --log_every 5
+  fi
+  echo "log: ${LOG}"
+)
+
+
+D9.6监视命令（另一个终端）
+=========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native3d-reviewed1k-lift-train-v3.service || true; tail -n 12 /data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lifting_train.log 2>/dev/null || true'
+
+
+D9.7 启动val64 lifting cache（长任务，GPU 4，可与D9.6并行）
+===========================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+  SOURCE=${ROOT}/pointpose_val64/manifest.json
+  OUT=${ROOT}/lifting_val64
+  LOG=${OUT}.log
+  UNIT=tracker-native3d-reviewed1k-lift-val64-v3
+
+  test -s "${SOURCE}"
+  if [ -s "${OUT}/manifest.json" ] && [ -s "${OUT}/cache_audit.json" ]; then
+    echo "reuse complete val lifting cache: ${OUT}"
+  elif systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service"
+  elif [ -e "${OUT}" ]; then
+    echo "D9.7 blocked: partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      /usr/bin/env \
+        CUDA_VISIBLE_DEVICES=4 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u ar_ss_flow/build_pose_lifting_cache.py \
+        --source_cache_manifest "${SOURCE}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --vggt_pretrained Stable-X/vggt-object-v0-1 \
+        --indices all \
+        --max_samples 0 \
+        --device cuda \
+        --save_correct_geometry \
+        --log_every 1
+  fi
+  echo "log: ${LOG}"
+)
+
+
+D9.7监视命令（另一个终端）
+=========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native3d-reviewed1k-lift-val64-v3.service || true; tail -n 12 /data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lifting_val64.log 2>/dev/null || true'
+
+
+D9.8 两个lifting cache完成硬门（完成后直接运行）
+================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  FROZEN=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730
+  TRAIN=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lifting_train
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lifting_val64
+
+  "${PY}" - "${FROZEN}" "${TRAIN}" "${VAL}" <<'PY'
+import json, sys
+from pathlib import Path
+
+frozen = Path(sys.argv[1])
+cache_roots = {'train': Path(sys.argv[2]), 'val': Path(sys.argv[3])}
+result = {}
+for split, root in cache_roots.items():
+    source = json.load(open(frozen / f'{split}.json'))
+    cache = json.load(open(root / 'manifest.json'))
+    audit = json.load(open(root / 'cache_audit.json'))
+    expected_uids = {str(row['uid']) for row in source['samples']}
+    cache_uids = {str(row['uid']) for row in cache['samples']}
+    expected_objects = len({row['object_uid'] for row in source['samples']})
+    result[split] = {
+        'expected_objects': expected_objects,
+        'cache_objects': cache['object_count'],
+        'cache_samples': cache['sample_count'],
+        'failure_count': cache['failure_count'],
+        'cache_audit_passed': audit.get('passed'),
+    }
+    assert cache_uids == expected_uids, result[split]
+    assert cache['object_count'] == expected_objects, result[split]
+    assert cache['sample_count'] == len(expected_uids), result[split]
+    assert cache['failure_count'] == 0, result[split]
+    assert audit.get('passed') is True, result[split]
+    assert all((root / row['cache_file']).is_file() for row in cache['samples'])
+print(json.dumps(result, indent=2, ensure_ascii=False))
+print('D9.8 PASS')
+PY
+)
+
+
+D10.1 启动train+val本地limited-view SLAT target构建（长任务，GPU 5）
+===================================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  FROZEN=/data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730
+  INPUT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+  TRAIN_LIFT=${INPUT}/lifting_train/manifest.json
+  VAL_LIFT=${INPUT}/lifting_val64/manifest.json
+  OUT=${INPUT}/lh_slats_train_val_v2
+  LOG=${OUT}.protocol_metadata_retry_20260730.log
+  UNIT=tracker-native3d-reviewed1k-lhslat-v4
+  ENCODER=/data/zjr/models/microsoft_TRELLIS-image-large/ckpts/slat_enc_swin8_B_64l8_fp16
+  DINO_REPO=/home/zjr/.cache/torch/hub/facebookresearch_dinov2_main
+  DINO_CKPT=/home/zjr/.cache/torch/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth
+  MESH_DEC=/home/zjr/.cache/huggingface/hub/models--Stable-X--trellis-vggt-v0-2/snapshots/647659a5ad5fbf67e22793e7b5e2cee4b30c5d13/ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16.safetensors
+
+  test -s "${TRAIN_LIFT}"
+  test -s "${VAL_LIFT}"
+  test -s "${ENCODER}.json"
+  test -s "${ENCODER}.safetensors"
+  test -s "${DINO_REPO}/hubconf.py"
+  test -s "${DINO_CKPT}"
+  test -s "${MESH_DEC}"
+
+  "${PY}" - "${FROZEN}/train.json" "${FROZEN}/val.json" <<'PY'
+import json, sys
+from pose_point_depth_mv.build_local_lh_slats import (
+    index_render_samples,
+    object_inputs,
+)
+
+index, bindings = index_render_samples(sys.argv[1:])
+for object_uid, rows in sorted(index.items()):
+    object_inputs(object_uid, rows, max_views=16)
+print(json.dumps({
+    'D10_protocol_and_object_ss_repair_preflight': 'PASS',
+    'object_count': len(index),
+    'render_manifests': [
+        {
+            'path': row['path'],
+            'sample_count': row['sample_count'],
+            'protocol': row['protocol'],
+            'protocol_audit': row['protocol_audit'],
+        }
+        for row in bindings
+    ],
+}, indent=2, ensure_ascii=False))
+PY
+
+  if [ -s "${OUT}/rank_000_report.json" ]; then
+    echo "existing SLAT target report found; run D10.2 before reuse: ${OUT}"
+  elif systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service"
+  elif [ -e "${OUT}" ]; then
+    echo "D10.1 blocked: partial output exists; preserve and inspect before explicit --resume"
+    exit 98
+  else
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      /usr/bin/env \
+        CUDA_VISIBLE_DEVICES=5 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.build_local_lh_slats \
+        --render_manifests "${FROZEN}/train.json,${FROZEN}/val.json" \
+        --lifting_manifests "${TRAIN_LIFT},${VAL_LIFT}" \
+        --output_dir "${OUT}" \
+        --encoder_prefix "${ENCODER}" \
+        --mesh_decoder_weights "${MESH_DEC}" \
+        --dinov2_repo "${DINO_REPO}" \
+        --dinov2_checkpoint "${DINO_CKPT}" \
+        --dinov2_model dinov2_vitl14_reg \
+        --device cuda \
+        --image_size 518 \
+        --view_batch_size 2 \
+        --min_views 8 \
+        --max_views 16 \
+        --min_visible_view_fraction_mean 0.25 \
+        --min_mask_support_view_fraction_mean 0.10 \
+        --min_mask_support_ge2_ratio 0.50 \
+        --min_mask_support_ge4_ratio 0.20 \
+        --max_zero_mask_support_ratio 0.25 \
+        --min_camera_corruption_mask_support_drop_mean 0.05 \
+        --min_camera_corruption_mask_support_drop_median 0.02 \
+        --min_camera_corruption_positive_object_rate 0.70
+  fi
+  echo "log: ${LOG}"
+)
+
+
+D10.1监视命令（另一个终端）
+==========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native3d-reviewed1k-lhslat-v4.service || true; tail -n 12 /data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lh_slats_train_val_v2.protocol_metadata_retry_20260730.log 2>/dev/null || true'
+
+
+D10.2 SLAT target覆盖率硬门（完成后直接运行）
+=============================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3
+
+  "${PY}" - "${ROOT}/lh_slats_train_val_v2" \
+    "${ROOT}/lifting_train/manifest.json" \
+    "${ROOT}/lifting_val64/manifest.json" <<'PY'
+import json, sys
+from pathlib import Path
+import numpy as np
+
+root = Path(sys.argv[1])
+required = set()
+for path in sys.argv[2:]:
+    payload = json.load(open(path))
+    required.update(str(row.get('object_uid', row['uid'])) for row in payload['samples'])
+report = json.load(open(root / 'rank_000_report.json'))
+files = {path.stem: path for path in root.glob('shard-*/*.npz')}
+summary = {
+    'report_passed': report.get('passed'),
+    'required_objects': len(required),
+    'materialized_objects': len(files),
+    'missing_objects': sorted(required - set(files))[:20],
+    'extra_objects': sorted(set(files) - required)[:20],
+    'projection_camera_corruption_summary': report.get(
+        'projection_camera_corruption_summary'
+    ),
+}
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+assert report.get('passed') is True, report.get('failures', [])[:10]
+assert set(files) == required, summary
+for uid in sorted(required)[:16]:
+    with np.load(files[uid]) as payload:
+        assert payload['coords'].ndim == 2 and payload['coords'].shape[1] == 3
+        assert payload['feats'].shape == (len(payload['coords']), 8)
+        assert np.isfinite(payload['feats']).all()
+print('D10.2 PASS')
+PY
+)
+
+
+停止点
+------
+
+D8.7、D9.8、D10.2 全部通过后，才把以下路径传给 Native3DCondition 训练：
+
+  SS_TRAIN_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lifting_train/manifest.json
+  SS_VAL_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lifting_val64/manifest.json
+  TRAIN_SLAT_ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lh_slats_train_val_v2
+  VAL_SLAT_ROOT=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/lh_slats_train_val_v2
+
+不要在第二轮语义 CSV 未完成时运行 D8.4 之后的命令；不要把255个render accepted对象
+自动全部加入训练。

@@ -1,0 +1,166 @@
+说明：本流程直接复用已经完成的 M9 Benchmark32 五路 Mesh，不等待 M11。
+选择规则与 H1 一致：
+
+  1. 在完整 32 个开发对象中，按当前 No-VGGT/Full 的绝对 Mesh 指标排名选最佳 2 例；
+  2. 再从剩余 30 例中用固定 seed 随机抽 2 例。
+
+“31/32”是当前方法相对 ReconViaGen 的胜例数，不是筛选后的对象数；
+排名和随机抽样都以完整 32 例为母体。
+
+旧 M9 report 生成于逐对象 records 写入功能之前，因此 B1 只需复用现有
+五路 Mesh 补算一次对象级指标；不重跑任何模型推理。
+
+结果仅用于开发期人工观察，不代替 Holdout64，不形成正式论文结论。
+
+当前 No-VGGT 的外观不再读取 OBJ 顶点颜色。B2 会在同一命令内自动重放所选4例的
+Full/Stock SLat，经同一个冻结 TRELLIS Gaussian decoder，并把 Full GS 外观烘焙到
+匹配的冻结 Mesh decoder 输出。这个带纹理 GLB 会直接替换主六路对比中的
+`渲染/自身纹理或顶点颜色/02_当前NoVGGT`，不是另建一张 GS 图就结束。
+原始 RGB 仅作参考，不会被投影到 Mesh 上伪造纹理；统一 clay Mesh 与物理 T_O2W
+投影仍使用原始 No-VGGT Mesh，因而不改变几何和位姿诊断。
+
+投影链固定为：
+
+  Mesh_O -> 物理T_O2W -> Mesh_W -> 原始T_W2C
+         -> K_raw + COLMAP相机畸变 -> 原始1920x1080 RGB
+
+黄色轮廓是原始图像mask；各方法颜色是Mesh投影轮廓和半透明区域。
+
+
+B0. 静态检查与CPU测试
+=====================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+MPLCONFIGDIR=/tmp/matplotlib \
+${PY} -m py_compile \
+  pose_point_depth_mv/prepare_omni_real_holdout_mesh_review.py \
+  pose_point_depth_mv/evaluate_native_no_vggt_gaussian_appearance.py \
+  pose_point_depth_mv/evaluate_omni_real_no_vggt_final.py
+B0_COMPILE_RC=$?
+
+MPLCONFIGDIR=/tmp/matplotlib \
+${PY} -m unittest -v \
+  pose_point_depth_mv.test_prepare_omni_real_holdout_mesh_review \
+  pose_point_depth_mv.test_native_no_vggt_gaussian_appearance
+B0_TEST_RC=$?
+
+echo "B0_COMPILE_RC=${B0_COMPILE_RC}"
+echo "B0_TEST_RC=${B0_TEST_RC}"
+echo "current terminal remains open"
+
+
+B1. 复用现有五路Mesh补算Benchmark32逐对象指标
+=================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+LABEL=${ROOT}/D11_benchmark32_mesh_o_labels_v2/runtime_o_label_manifest.json
+NO_VGGT=${ROOT}/M9_benchmark32_native_no_vggt_mixed1244_seed42_v1/inference_manifest.json
+REAL_FULL=${ROOT}/S7_benchmark32_native_v2_realadapt_step1000_seed42_v1/inference_manifest.json
+SYNTH_FULL=${ROOT}/D13_benchmark32_native_v2_full_seed42_v2/inference_manifest.json
+RECON=${ROOT}/D14_benchmark32_reconviagen_original_seed42_v1/inference_manifest.json
+PIXAL=${ROOT}/D15_benchmark32_pixal3d_official_seed42_v1/inference_manifest.json
+METRIC_OUT=${ROOT}/M9R_benchmark32_fiveway_with_records_20260809_v1
+
+if [ -s "${METRIC_OUT}/report.json" ]; then
+  echo "reuse Benchmark32 per-object metric report: ${METRIC_OUT}/report.json"
+elif [ -e "${METRIC_OUT}" ]; then
+  echo "B1 blocked: partial metric output exists; preserve and inspect: ${METRIC_OUT}"
+else
+  MPLCONFIGDIR=/tmp/matplotlib \
+  "${PY}" -u -m pose_point_depth_mv.evaluate_omni_real_no_vggt_final \
+    --label_manifest "${LABEL}" \
+    --no_vggt_manifest "${NO_VGGT}" \
+    --real_full_manifest "${REAL_FULL}" \
+    --synthetic_full_manifest "${SYNTH_FULL}" \
+    --reconviagen_manifest "${RECON}" \
+    --pixal3d_manifest "${PIXAL}" \
+    --output_dir "${METRIC_OUT}" \
+    --protocol_scope development_benchmark32 \
+    --expected_objects 32 \
+    --surface_samples 20000
+fi
+
+echo "metric report: ${METRIC_OUT}/report.json"
+echo "current terminal remains open"
+
+
+B2. 首次生成主流程已替换GS外观的最佳2+固定随机2例
+====================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-4}
+REPORT=/data/zjr/omni_real_video500_download_20260804_v2/M9R_benchmark32_fiveway_with_records_20260809_v1/report.json
+OUT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/Benchmark32最佳2随机2_GS替换当前NoVGGT纹理流程_20260810_v3
+
+if [ ! -s "${REPORT}" ]; then
+  echo "B2 blocked: run B1 first: ${REPORT}"
+else
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  TORCH_CUDA_ARCH_LIST=8.6 \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  "${PY}" -u -m pose_point_depth_mv.prepare_omni_real_holdout_mesh_review \
+    --final_report "${REPORT}" \
+    --output_dir "${OUT}" \
+    --development_best_plus_random \
+    --top_count 2 \
+    --random_count 2 \
+    --random_seed 20260809 \
+    --view_count 6 \
+    --image_size 384 \
+    --renderer_backend nvdiffrast
+fi
+
+echo "HTML: ${OUT}/index.html"
+echo "总报告: ${OUT}/report.json"
+echo "选择清单: ${OUT}/选择清单.json"
+echo "current terminal remains open"
+
+
+B3. B2中途终止后继续同一目录
+=============================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-4}
+REPORT=/data/zjr/omni_real_video500_download_20260804_v2/M9R_benchmark32_fiveway_with_records_20260809_v1/report.json
+OUT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/Benchmark32最佳2随机2_GS替换当前NoVGGT纹理流程_20260810_v3
+
+CUDA_VISIBLE_DEVICES="${GPU}" \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+TORCH_CUDA_ARCH_LIST=8.6 \
+MPLCONFIGDIR=/tmp/matplotlib \
+"${PY}" -u -m pose_point_depth_mv.prepare_omni_real_holdout_mesh_review \
+  --final_report "${REPORT}" \
+  --output_dir "${OUT}" \
+  --development_best_plus_random \
+  --top_count 2 \
+  --random_count 2 \
+  --random_seed 20260809 \
+  --view_count 6 \
+  --image_size 384 \
+  --renderer_backend nvdiffrast \
+  --resume
+
+echo "HTML: ${OUT}/index.html"
+echo "current terminal remains open"

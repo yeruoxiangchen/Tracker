@@ -1,0 +1,162 @@
+SS Flow 16^3 Sparse-anchor Conditioning 最终评估顺序
+日期：2026-07-13
+
+阶段定位
+========
+
+这是 sparse-point 主路线的最后一次有界评估。目标不是让几十个点识别完整物体，而是证明：
+
+  正确 sparse point 能改善其局部几何；
+  可靠 outside 区域能抑制错误 occupancy；
+  无证据区域保持 stock 能力。
+
+不得再以全局 Flow MSE 或 random other-object shuffle 作为唯一判据。
+
+A0：现有 B1 checkpoint attribution（不训练）
+==========================================
+
+固定三个 B1 checkpoint、image、noise 和 t，评估：
+
+  full correct
+  full other-object shuffled
+  mask-only
+  point-only（去除共享 mask_patch_fraction）
+  null pose/ray/UV
+
+输出 condition delta、Flow MSE、correct/shuffled cosine、局部 point support 和 outside 指标。
+该阶段只解释 B1 的通用收益来源，不选择 checkpoint，也不恢复 B1 训练。
+
+A1：量化 sparse input 可分性
+============================
+
+负样本使用可控破坏，不只使用其他物体：
+
+  correct point + correct pose
+  同一点云平移 1/2/3 voxel
+  同一点云小角度旋转
+  同一 2D ray 上扰乱 depth
+  patch/ray permutation
+  point dropout 25%/50%/75%
+  other-object point（辅助）
+
+分别报告 16^3 cell 和 2D projection 上的：
+
+  occupied/support cell count
+  point distance field difference
+  mask-hit/outside ratio
+  depth consistency
+  correct-corrupted feature RMS/cosine
+  简单 train-only linear probe 的 validation AUC
+
+若 controlled corruption 在输入层都不可分，停止 sparse-anchor 主路线并检查坐标/点质量。
+
+A2：构建互斥的 16^3 物理标签
+================================
+
+positive：
+
+  sparse point confidence 达标；
+  与 GT occupied/surface 邻域一致（GT 只用于训练标签审计）；
+  使用半径 1--2 voxel 的 confidence-weighted splat/distance field。
+
+negative：
+
+  多视图可见；
+  mask/visual-hull 明确 outside；
+  GT unoccupied；
+  与 positive 不重叠。
+
+neutral：其余所有 voxel。
+
+硬检查 positive/negative overlap=0、三类计数非零、冲突率、覆盖率和逐对象分布。
+
+A3：loss 可微性审计
+===================
+
+优先检查：
+
+  SS x0 -> frozen decoder occupancy logits
+  occupancy logits -> sparse physical adapter 参数
+
+需要分别验证 positive、negative、neutral loss 对 adapter 的 gradient finite/nonzero。
+threshold、argwhere、离散 coords 和 connected component 只用于评估，不能直接作为训练 loss。
+
+若 decoder logits 路径不可微或显存不可接受，退化为 spatially weighted flow-matching proxy，
+并在实验名称和报告中明确它不是 occupancy loss。
+
+A4：直接 SS Flow 16^3 sparse-anchor adapter
+===========================================
+
+输入：
+
+  point occupancy/confidence/distance
+  support/visible/outside/visual-hull
+  canonical XYZ
+
+结构：
+
+  noisy SS latent 16^3 token 作 query；
+  physical 16^3 token 作 key/value 或同位置 gated residual；
+  原 SS Flow 完全冻结；
+  adapter output zero-init；
+  explicit physical gate 保证 off/null bit-exact stock。
+
+先不启用普通 Flow LoRA，不修改 bridge/get_cond，不训练 SLAT。
+
+A5：训练目标
+============
+
+若 occupancy logits 可微：
+
+  L = L_flow_correct
+    + lambda_pos * L_positive_occupancy
+    + lambda_neg * L_outside_negative
+    + lambda_preserve * L_neutral_stock
+    + lambda_delta * L_delta_norm
+
+其中 neutral stock preservation 比较 adapter 与 frozen stock velocity，避免少量锚点改写完整物体。
+
+若只能使用 flow proxy：
+
+  positive/negative 区域增加 target flow-matching 权重；
+  neutral 区域蒸馏 stock velocity；
+  不宣称直接优化 occupancy。
+
+A6：实验门控
+============
+
+1. 单样本 s5：stock exact、gradient、finite、mapping PASS。
+2. 单对象 overfit：correct 必须改善局部 point support，controlled corruption 不得同样改善。
+3. overfit16 三 seed：fixed noise、多 t、多个 corruption 强度。
+4. 只有 overfit16 三 seed全部 PASS 才运行 fresh overfit64。
+5. overfit64 PASS 后才允许 object-disjoint validation。
+
+核心指标
+========
+
+主指标：
+
+  prior-neighborhood occupancy recall
+  point-to-predicted-surface distance
+  reliable-outside false-positive rate
+  correct-minus-corrupted local gain
+  neutral-region velocity/occupancy preservation
+
+辅助指标：
+
+  global Flow MSE
+  global coordinate IoU/precision/recall
+  component count
+  other-object shuffled
+
+硬停止条件
+============
+
+以下任一成立即停止 sparse-anchor 主路线，转入 pose_lifting 主线：
+
+1. 输入层 controlled corruption 不可分。
+2. correct 与 corrupted 在局部物理指标上无稳定差异。
+3. 只有 global/mask 通用收益，没有 point-neighborhood 收益。
+4. overfit16 无法跨三个 seed 和至少 4/5 个 t 通过。
+5. neutral/outside 明显退化，且降低 adapter scale 后仍不能修复。
+

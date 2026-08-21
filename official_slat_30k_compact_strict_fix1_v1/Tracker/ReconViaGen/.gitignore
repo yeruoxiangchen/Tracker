@@ -1,0 +1,10 @@
+*.pyc
+.vscode/
+__pycache__/
+weights/
+tmp/
+.gradio/
+core
+lightning_logs/
+checkpoints/
+show_case/

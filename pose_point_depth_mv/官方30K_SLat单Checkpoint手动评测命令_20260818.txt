@@ -1,0 +1,160 @@
+official 30K no-VGGT SLat：单Checkpoint手动评测
+============================================================
+
+只保留以下顺序：
+
+  1. 让当前step10K四个GPU worker完成，但禁止旧调度器自动进入30K。
+  2. 手动测试step30K。
+  3. 手动测试step60K。
+  4. 最后仅完成step10K的CPU aggregate/strict comparison。
+
+不测70K，不自动切换checkpoint，不默认运行Train64/legacy Dev64训练重叠诊断。
+
+
+一、现在立即启动step10K完成守卫（不会停止四个10K worker）
+============================================================
+
+当前若存在第一次旧版arm留下的state，可以直接再次运行；新版会严格核对PID和
+/proc starttime后复用它，不要手工删除state：
+
+  cd /home/zjr/Tracker
+  bash \
+    pose_point_depth_mv/background_jobs/control_slat29861_old_automatic_after_step10_workers.sh \
+    arm
+
+预期输出包含：
+
+  reusing validated scheduler state: parent=...
+  STEP10K COMPLETION GUARD ARMED
+
+原理：独立tmux guardian每秒检查四个worker的原子report.json。达到4/4后，guardian
+立即终止旧自动调度、关闭旧tmux并释放旧holder。它不会给尚未完成的GPU worker发
+信号。旧调度无法自动进入step30K。
+
+
+二、监视完整step10K阶段
+============================================================
+
+  cd /home/zjr/Tracker
+  watch -n 10 bash \
+    pose_point_depth_mv/background_jobs/show_proobjaverse_slat29861_manual_progress.sh \
+    10000
+
+需要关注：
+
+  predicted_pair_records=.../144
+  predicted_worker_reports=.../4
+  CURRENT_STAGE=predicted_support_mesh_generation
+  step10_completion_guard=running
+  old_scheduler_guard_target_pid=... stat=...
+
+按Ctrl+C只退出监视，不停止任务。
+
+
+三、4/4 worker report完成后，确认旧自动调度已被守卫终止
+============================================================
+
+guardian会自动处理，不需要和旧调度抢时间。监视器先显示：
+
+  predicted_worker_reports=4/4
+
+随后应显示：
+
+  step10_completion_guard=not_running_or_finished
+  old_scheduler_guard_state=not_armed_or_already_finished
+
+并可查看guardian日志：
+
+  tail -n 80 \
+    /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/slat30k_targetv2_guard.log
+
+预期最后包含：
+
+  OLD AUTOMATIC SCHEDULER STOPPED AFTER STEP10K WORKERS
+  No step30K task was launched by the old scheduler.
+
+只有guardian异常退出且4/4已经完成时，才使用手动兜底：
+
+  cd /home/zjr/Tracker
+  bash \
+    pose_point_depth_mv/background_jobs/control_slat29861_old_automatic_after_step10_workers.sh \
+    finish
+
+
+四、手动启动step30K
+============================================================
+
+  cd /home/zjr/Tracker
+  bash \
+    pose_point_depth_mv/background_jobs/launch_proobjaverse_slat29861_manual_checkpoint.sh \
+    30000
+
+step30K复用已验证的Native-SS coords，完整计算A/B/C，并生成第一份严格锁定GT
+target的Stock-floor。预计约75--85分钟。
+
+监视：
+
+  watch -n 10 bash \
+    pose_point_depth_mv/background_jobs/show_proobjaverse_slat29861_manual_progress.sh \
+    30000
+
+完成标志：
+
+  strict_comparison=complete
+  CURRENT_STAGE=complete
+
+
+五、step30K完成后，手动启动step60K
+============================================================
+
+  cd /home/zjr/Tracker
+  bash \
+    pose_point_depth_mv/background_jobs/launch_proobjaverse_slat29861_manual_checkpoint.sh \
+    60000
+
+step60K严格复用step30K的A/B和Native-SS coords，只计算随checkpoint变化的C。
+预计约25--35分钟。
+
+监视：
+
+  watch -n 10 bash \
+    pose_point_depth_mv/background_jobs/show_proobjaverse_slat29861_manual_progress.sh \
+    60000
+
+
+六、step60K完成后，最后完成step10K
+============================================================
+
+  cd /home/zjr/Tracker
+  bash \
+    pose_point_depth_mv/background_jobs/launch_proobjaverse_slat29861_manual_checkpoint.sh \
+    10000
+
+因为step10K的4个worker report已经完成，该命令不会占GPU、不会重新生成A/B/C，
+只执行：
+
+  predicted-support aggregate
+  strict ReconViaGen comparison
+  step10K manual summary
+
+监视：
+
+  watch -n 10 bash \
+    pose_point_depth_mv/background_jobs/show_proobjaverse_slat29861_manual_progress.sh \
+    10000
+
+
+七、查看某个手动任务的原始日志
+============================================================
+
+  tail -F \
+    /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/manual_step30000_targetlocked_v2.log
+
+将30000替换成60000或10000即可。
+
+
+范围声明
+============================================================
+
+当前legacy Dev48对象属于29,861-object checkpoint训练UID集合。本流程属于训练重叠
+兼容性和endpoint配对诊断，不得写成30K held-out泛化结论。

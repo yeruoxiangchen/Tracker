@@ -1,0 +1,464 @@
+{
+  "format": "manual_mesh_reconstruction.package_manifest.v1",
+  "created_at_utc": "2026-08-21T13:42:09.722565+00:00",
+  "passed": true,
+  "package_root": "/home/zjr/Tracker/manual_mesh_reconstruction",
+  "git": {
+    "branch": "main",
+    "head": "722296bc754509ce92149b89c908d7231bc603d8",
+    "working_tree_dirty": true
+  },
+  "source_regular_file_count": 46,
+  "source_total_bytes": 857447,
+  "source_files": {
+    "README.md": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/README.md",
+      "bytes": 28983,
+      "sha256": "e4d898d102549c1f5d1336fe3f8634f1c05d352ad41a872833c06d6bfa8a249d"
+    },
+    "__init__.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/__init__.py",
+      "bytes": 412,
+      "sha256": "e99bf8ae3d1b85491acc4e79b34d3862fa6fae9d27dacd01db21b804a5dd4683"
+    },
+    "__main__.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/__main__.py",
+      "bytes": 94,
+      "sha256": "3ee9ebc58aacb0eeb862eb6aca13c973f3b85490fcff49950f52d773bc144531"
+    },
+    "alignment_refinement.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/alignment_refinement.py",
+      "bytes": 35987,
+      "sha256": "5dcef75040cb399588115f60c611b239bdca7ccfd3a113fa66c9a3034325cec4"
+    },
+    "audit_existing_outputs.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/audit_existing_outputs.py",
+      "bytes": 2612,
+      "sha256": "07ef60261452959ba2d2fe3642398ee2a26f1fc3b4b40341fbb5b7801071de0b"
+    },
+    "audit_package.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/audit_package.py",
+      "bytes": 5552,
+      "sha256": "4f8139156389217531e8c05b653dc8a66267dcbaf3485e44ebc02a11eaef647d"
+    },
+    "batch_optimize_o2w_20260821.sh": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/batch_optimize_o2w_20260821.sh",
+      "bytes": 5235,
+      "sha256": "cc6db79febba280edfe0acf721a5896ae4007b1b91fbbc68fc10f292a3ddcbf1"
+    },
+    "canonicalization.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/canonicalization.py",
+      "bytes": 36437,
+      "sha256": "a16ab85dda152e449654b1d646276ec2eb739d5b1630072a5f53b67fcc3f2323"
+    },
+    "common.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/common.py",
+      "bytes": 4994,
+      "sha256": "28a90a0c5b76d2e8bed1f911a20bc532bd077ab2f5c6e775452ff852ec097394"
+    },
+    "contours.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/contours.py",
+      "bytes": 11991,
+      "sha256": "9ab1659dadb58a63e5c0b3ef5c8aeae2d94f1a68bc1d3bb141f8405ba3e76e85"
+    },
+    "current_model.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/current_model.py",
+      "bytes": 38472,
+      "sha256": "877fbe188ac4a17a5113c61ab8d9af5de7c4d1a4e34e597279b37d8ce719499e"
+    },
+    "data_adapters/__init__.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/data_adapters/__init__.py",
+      "bytes": 213,
+      "sha256": "dbd6b068a79f450ded4e39d57d612b7224d3871c51150ab2b728710fd8fac985"
+    },
+    "data_adapters/cli.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/data_adapters/cli.py",
+      "bytes": 7327,
+      "sha256": "02feccd324b72f954a0dec7ed4c92f93227347d7b98c3291c5220492c546f283"
+    },
+    "data_adapters/colmap.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/data_adapters/colmap.py",
+      "bytes": 20247,
+      "sha256": "654e78da44a7ec016132bb49e5cb48551ad0d1ad7b463b91a703ad374c907f1e"
+    },
+    "data_adapters/common.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/data_adapters/common.py",
+      "bytes": 17389,
+      "sha256": "2501b1257e0c68b1c621ab22688aa2f502fb07640e533a8d65d733cca6c47671"
+    },
+    "data_adapters/objectron.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/data_adapters/objectron.py",
+      "bytes": 22946,
+      "sha256": "07a81333c066ebbb67cd5223fd01dc0ecaed8cf54b003fc8a780883ed6bf83e2"
+    },
+    "data_adapters/phone.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/data_adapters/phone.py",
+      "bytes": 19713,
+      "sha256": "a24a347178d105ce0f1620bdf89408e828af23f4fc42f9517d1c735b3f5f2b2a"
+    },
+    "defaults.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/defaults.py",
+      "bytes": 3920,
+      "sha256": "f390695e4e8fec3212d142068910bde65f3b638d10f94b50361b3f28757c267b"
+    },
+    "dino_condition.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/dino_condition.py",
+      "bytes": 8900,
+      "sha256": "81918c3fbd41636c0fe4d22ef59f72e88f64b8829ed17167263b6db482e7ec42"
+    },
+    "mesh_coordinates.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/mesh_coordinates.py",
+      "bytes": 4733,
+      "sha256": "c7f08687285f83a5457fb4a868f9a9a766248ad6bc886f4ca767a84aedefa702"
+    },
+    "migrate_existing_outputs.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/migrate_existing_outputs.py",
+      "bytes": 5769,
+      "sha256": "b3087fdf27f1ca2b15fc09b3180c5c1af40d117be6b71dafd58b1286e3fa16b4"
+    },
+    "model_geometry.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/model_geometry.py",
+      "bytes": 16096,
+      "sha256": "cf37e5f100b0a185700cecf765f023cb2a1a1e4e7b2d95b4d89082f55abc43cf"
+    },
+    "model_inputs.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/model_inputs.py",
+      "bytes": 14590,
+      "sha256": "251204c199436fbf4fc742a70f041ed5086a1e0e7fd78461ce6f79dbc61cceb9"
+    },
+    "optimize_o2w.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/optimize_o2w.py",
+      "bytes": 64885,
+      "sha256": "c4a286a33efbe8f2e417d764852b07bd19dba815bd0edf32101a8d5cf9257b93"
+    },
+    "pipeline.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/pipeline.py",
+      "bytes": 28020,
+      "sha256": "f1e57516213999dde9089b50ac2918f35913db5b543a361a120823e50fe5e44a"
+    },
+    "pose_mask.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/pose_mask.py",
+      "bytes": 16520,
+      "sha256": "f6bbaf6caee66f71b13674d21b936631593f6a6685724a2a287fa7010ffb7529"
+    },
+    "preview_backend.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/preview_backend.py",
+      "bytes": 6568,
+      "sha256": "4c7713f632c53f219ad26ba23f3cb869de4f962b32fff2bef7998e1f9e764df1"
+    },
+    "projection.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/projection.py",
+      "bytes": 12773,
+      "sha256": "cbd5270a336a71ee132ed9fb936296992624e191bf958e626a36095e3ffa9f2d"
+    },
+    "raw_cache.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/raw_cache.py",
+      "bytes": 24456,
+      "sha256": "677109e69c34f5054f3a898ecc2c99cbcfc18ed6729b8b20e7cefcd2e9e0e69b"
+    },
+    "reconviagen.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/reconviagen.py",
+      "bytes": 9801,
+      "sha256": "1c4c2dcf0d8f89d5b96e542fdbe87b768e0ee3a5316e0d97abb9887559ef8c27"
+    },
+    "render_mesh.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/render_mesh.py",
+      "bytes": 5963,
+      "sha256": "03d860bc153bf6add6c52a36faac7aa256b26a61edd603b1a2e095d3f754a72b"
+    },
+    "run_reconstruction.sh": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/run_reconstruction.sh",
+      "bytes": 915,
+      "sha256": "3ca60326d4de2c4440952ae55126aea9379da43807fd8362dcd82305118d2dfe"
+    },
+    "run_snoopy_three_selections_20260819.sh": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/run_snoopy_three_selections_20260819.sh",
+      "bytes": 2126,
+      "sha256": "94a97889903c8087f2b8b0fc290e4e4471ec14d022bdb6c153de2e567aab97af"
+    },
+    "runtime_o.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/runtime_o.py",
+      "bytes": 107597,
+      "sha256": "8d5cb6126d51a7858296ffd24c6beb17107e75e35661193260c229a80c2fcee5"
+    },
+    "sam2_tiny_video_worker.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/sam2_tiny_video_worker.py",
+      "bytes": 11701,
+      "sha256": "1a6ec4bad4965dcee778c6646526baaaa59adfa683ffd924cbb414404e2f3875"
+    },
+    "sam2_worker_client.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/sam2_worker_client.py",
+      "bytes": 8275,
+      "sha256": "8c103401085517d0ea4cc9faa97693b7cdcc3cbf817337dd148e51558e7fbc01"
+    },
+    "server.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/server.py",
+      "bytes": 162893,
+      "sha256": "bf2a1cfd720a39284261cea276279ed342b8a8237671b944190fad2e1433ed3a"
+    },
+    "snoopy-three-selections-20260819.service": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/snoopy-three-selections-20260819.service",
+      "bytes": 286,
+      "sha256": "2135362529982e64697048f30d88276fe60c9561ac3b8af06f8f9bad53a40d8e"
+    },
+    "tests/test_dataset_adapters.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/tests/test_dataset_adapters.py",
+      "bytes": 8995,
+      "sha256": "908a57dacc69a3b090b86380eefcfd9ecd5d172e52a5192f6cdd6314f378feae"
+    },
+    "tests/test_manual_contracts.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/tests/test_manual_contracts.py",
+      "bytes": 17389,
+      "sha256": "79856590249370346dadcbc3c66def2eb7fef800483b84e76c33570108390680"
+    },
+    "tests/test_o2w_refinement.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/tests/test_o2w_refinement.py",
+      "bytes": 9587,
+      "sha256": "b65fb035702152a5c80b260e5b4d8b7a2625e48a935e8572785581f215a8be0d"
+    },
+    "tests/test_runtime_safety.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/tests/test_runtime_safety.py",
+      "bytes": 3928,
+      "sha256": "7060097f449efc85aa54153e48fbd3ae2964df142a825bb01d1d55c22c9cf95c"
+    },
+    "tests/test_server.py": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/tests/test_server.py",
+      "bytes": 36564,
+      "sha256": "b67e2381fd935001f75e39accadd283bd7f21c02fb8682c1b430830e6e4e40a5"
+    },
+    "unity/ARMeshScreenSpaceOutline.shader": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/unity/ARMeshScreenSpaceOutline.shader",
+      "bytes": 2947,
+      "sha256": "d363c4d7dba415bc2eb799fd8ca993fc34d6aea21adadd325855c971e8f5e068"
+    },
+    "unity/ARMeshSilhouetteMask.shader": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/unity/ARMeshSilhouetteMask.shader",
+      "bytes": 922,
+      "sha256": "088402504b67cc8273c1a7a5881130f95adc1086f0de51b8060ad06027aaba9a"
+    },
+    "输入图像优化O2W与旧Mesh复用命令_20260821.txt": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/输入图像优化O2W与旧Mesh复用命令_20260821.txt",
+      "bytes": 1724,
+      "sha256": "56cbc668c2b68374574133caec5f7b559d0d87cc0874e56edd8ad6c9b754d14c"
+    }
+  },
+  "copied_implementation_provenance": {
+    "runtime_o.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/runtime_o.py",
+        "bytes": 107597,
+        "sha256": "8d5cb6126d51a7858296ffd24c6beb17107e75e35661193260c229a80c2fcee5"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/dataset_tools/prepare_omni_real_runtime_inputs.py",
+        "bytes": 93322,
+        "sha256": "8b6613be4847b39fec12fc552dcbc76082300c38bec390b40285e4030c102172"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "model_inputs.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/model_inputs.py",
+        "bytes": 14590,
+        "sha256": "251204c199436fbf4fc742a70f041ed5086a1e0e7fd78461ce6f79dbc61cceb9"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/dataset_tools/prepare_omni_real_dino_only_model_inputs.py",
+        "bytes": 14507,
+        "sha256": "bb56bf9eba6243b4249f0150d5dbf7cac512d09e9fa5aa94164517a47cd33f56"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "model_geometry.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/model_geometry.py",
+        "bytes": 16096,
+        "sha256": "cf37e5f100b0a185700cecf765f023cb2a1a1e4e7b2d95b4d89082f55abc43cf"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/dataset_tools/prepare_omni_real_model_inputs.py",
+        "bytes": 16171,
+        "sha256": "8a598799b35a7749c5230af06e0de6c2dc41f08e137aaf7cb30d00a59286187b"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "current_model.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/current_model.py",
+        "bytes": 38472,
+        "sha256": "877fbe188ac4a17a5113c61ab8d9af5de7c4d1a4e34e597279b37d8ce719499e"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/infer_real_proobjaverse_official_ss_slat.py",
+        "bytes": 37546,
+        "sha256": "7a612bdbbf4ac49da427b33689f86e861087e8eb22c292c6b56b92338b6e8a68"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "reconviagen.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/reconviagen.py",
+        "bytes": 9801,
+        "sha256": "1c4c2dcf0d8f89d5b96e542fdbe87b768e0ee3a5316e0d97abb9887559ef8c27"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/infer_omni_real_reconviagen.py",
+        "bytes": 9524,
+        "sha256": "4452001fab9bbb7b5f35a2c3e2950f25a5d71ebbf95008eed6b245812018151a"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "mesh_coordinates.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/mesh_coordinates.py",
+        "bytes": 4733,
+        "sha256": "c7f08687285f83a5457fb4a868f9a9a766248ad6bc886f4ca767a84aedefa702"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/trellis_mesh_coordinate_contract.py",
+        "bytes": 4733,
+        "sha256": "c7f08687285f83a5457fb4a868f9a9a766248ad6bc886f4ca767a84aedefa702"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "contours.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/contours.py",
+        "bytes": 11991,
+        "sha256": "9ab1659dadb58a63e5c0b3ef5c8aeae2d94f1a68bc1d3bb141f8405ba3e76e85"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/render_runtime_o_mesh_camera_contours.py",
+        "bytes": 8979,
+        "sha256": "842370a7a8f7685c0163f8f64168e5c85fe4ad2e5d2ddebe66412a39c604022a"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "render_mesh.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/render_mesh.py",
+        "bytes": 5963,
+        "sha256": "03d860bc153bf6add6c52a36faac7aa256b26a61edd603b1a2e095d3f754a72b"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/render_ar_object_mesh_previews.py",
+        "bytes": 5924,
+        "sha256": "cceeed6f8fcebd8ef8ddcad214b41ff409d2d4a46903b15dee6f3ada54008191"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "canonicalization.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/canonicalization.py",
+        "bytes": 36437,
+        "sha256": "a16ab85dda152e449654b1d646276ec2eb739d5b1630072a5f53b67fcc3f2323"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/real_object_canonicalization.py",
+        "bytes": 36437,
+        "sha256": "a16ab85dda152e449654b1d646276ec2eb739d5b1630072a5f53b67fcc3f2323"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "pose_mask.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/pose_mask.py",
+        "bytes": 16520,
+        "sha256": "f6bbaf6caee66f71b13674d21b936631593f6a6685724a2a287fa7010ffb7529"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/pose_mask_object_canonicalization.py",
+        "bytes": 11378,
+        "sha256": "b201f61682abc5a5cdd7ae4ab1e0079fda10ec1377d1c5f60bd7d511a3112f77"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "common.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/common.py",
+        "bytes": 4994,
+        "sha256": "28a90a0c5b76d2e8bed1f911a20bc532bd077ab2f5c6e775452ff852ec097394"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/omni_real_benchmark_common.py",
+        "bytes": 4994,
+        "sha256": "28a90a0c5b76d2e8bed1f911a20bc532bd077ab2f5c6e775452ff852ec097394"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "raw_cache.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/raw_cache.py",
+        "bytes": 24456,
+        "sha256": "677109e69c34f5054f3a898ecc2c99cbcfc18ed6729b8b20e7cefcd2e9e0e69b"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/dataset_tools/prepare_omni_real_video_cache.py",
+        "bytes": 24456,
+        "sha256": "677109e69c34f5054f3a898ecc2c99cbcfc18ed6729b8b20e7cefcd2e9e0e69b"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    },
+    "dino_condition.py": {
+      "local": {
+        "path": "/home/zjr/Tracker/manual_mesh_reconstruction/dino_condition.py",
+        "bytes": 8900,
+        "sha256": "81918c3fbd41636c0fe4d22ef59f72e88f64b8829ed17167263b6db482e7ec42"
+      },
+      "source_at_extraction": {
+        "path": "/home/zjr/Tracker/pose_point_depth_mv/dino_only_condition.py",
+        "bytes": 8900,
+        "sha256": "81918c3fbd41636c0fe4d22ef59f72e88f64b8829ed17167263b6db482e7ec42"
+      },
+      "relationship": "copied then imports/entrypoint adapted inside isolated package"
+    }
+  },
+  "shared_validated_model_backends": {
+    "pose_point_depth_mv/native_ss_genrecon_no_vggt.py": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/native_ss_genrecon_no_vggt.py",
+      "bytes": 7803,
+      "sha256": "ae790d8cd17702dd341561e863302df8235b98505e7a8b89edfd371855df8054"
+    },
+    "pose_point_depth_mv/native_slat_genrecon_no_vggt.py": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/native_slat_genrecon_no_vggt.py",
+      "bytes": 3347,
+      "sha256": "32e12cb3bb6709313095f2c5ab7a3c510ee091476d4ebab3b561005ae59205bb"
+    },
+    "pose_point_depth_mv/native_slat_genrecon_v2.py": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/native_slat_genrecon_v2.py",
+      "bytes": 18994,
+      "sha256": "88a480a751adea51a2f023ea6a0f3772577400d222ceea3f71fe858f70774648"
+    },
+    "pose_point_depth_mv/proobjaverse_official_ss.py": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/proobjaverse_official_ss.py",
+      "bytes": 13214,
+      "sha256": "9c24cce2c83d4d8950f01da0bcb9195a1ad2178925290aa6552fae7ba96fa3a0"
+    },
+    "pose_point_depth_mv/evaluate_proobjaverse_official_native_ss_stock_slat.py": {
+      "path": "/home/zjr/Tracker/pose_point_depth_mv/evaluate_proobjaverse_official_native_ss_stock_slat.py",
+      "bytes": 93334,
+      "sha256": "e3fbd2c77f4d04ca0012d8b6423c282e520d498e9c9d69af9e21117750582229"
+    },
+    "ReconViaGen/trellis/pipelines/trellis_image_to_3d.py": {
+      "path": "/home/zjr/Tracker/ReconViaGen/trellis/pipelines/trellis_image_to_3d.py",
+      "bytes": 48617,
+      "sha256": "67d309b21df4130192562dfece473323c1d191b783227c491b91119d16d52303"
+    }
+  },
+  "shared_backend_policy": "manual orchestration/inference entrypoints are isolated here; validated network definitions and ReconViaGen runtime remain read-only dependencies to prevent architecture drift",
+  "existing_outputs": {
+    "migration_manifest": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/output/已有SS30K_SLat30K结果/MIGRATION_MANIFEST.json",
+      "bytes": 9363,
+      "sha256": "de136707628d2734d4207e88c4354bdc26dfdda0b5a29362c3b908c4e83b83b3"
+    },
+    "model_identity_audit": {
+      "path": "/home/zjr/Tracker/manual_mesh_reconstruction/output/已有SS30K_SLat30K结果/MODEL_IDENTITY_AUDIT.json",
+      "bytes": 3252,
+      "sha256": "633d7d9193321a7df38176237747e3b93bcbb3364667ebe7532886bfe348ae11"
+    },
+    "copied_directory_count": 8,
+    "regular_file_count": 2754,
+    "total_bytes": 7813012837
+  }
+}

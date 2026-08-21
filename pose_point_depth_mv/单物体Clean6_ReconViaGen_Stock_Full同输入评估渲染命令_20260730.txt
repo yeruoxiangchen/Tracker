@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+#
+# 当前 Direct-SLAT v5.1 step100 的单物体 Clean6 探索性评估：
+#   A. 冻结选择与训练/验证隔离预检；
+#   B. 相同缓存输入下导出 Direct stock / Full；
+#   C. 将同一批 RGB + mask 送入原版 ReconViaGen；
+#   D. 统一 Mesh 指标；
+#   E. GT / ReconViaGen / stock / Full 刚性位姿对齐四列渲染。
+#
+# 只使用一张 GPU。示例：
+#   GPU=4 bash pose_point_depth_mv/单物体Clean6_ReconViaGen_Stock_Full同输入评估渲染命令_20260730.txt
+#
+# 本组是透明选择的 exploratory human-review set，不是 fresh blind 正式证明。
+
+set -uo pipefail
+
+cd /home/zjr/Tracker || exit 96
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-4}
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+
+SELECTION=/home/zjr/Tracker/pose_point_depth_mv/clean_single_object6_smoke_20260730.json
+DIRECT_ROOT=/data/zjr/direct_slat_clean_single_object6_v5_1_step100_seed42_20260730_v1
+DIRECT_REPORT=${DIRECT_ROOT}/report.json
+RECON_ROOT=/data/zjr/reconviagen_original_clean_single_object6_step100_seed42_20260730_v1
+EVAL_ROOT=/data/zjr/reconviagen_stock_full_clean_single_object6_step100_seed42_20260730_v1
+RENDER_ROOT=${EVAL_ROOT}/render_gt_recon_stock_full_rigidpose_v1
+LOG_ROOT=/data/zjr/reconviagen_stock_full_clean_single_object6_step100_seed42_20260730_v1_logs
+
+run_logged() {
+  local LOG_PATH=$1
+  shift
+  mkdir -p "$(dirname "${LOG_PATH}")"
+  "$@" 2>&1 | tee "${LOG_PATH}"
+  return "${PIPESTATUS[0]}"
+}
+
+if [ ! -x "${PY}" ] || [ ! -s "${SELECTION}" ]; then
+  echo "C0 blocked: Python or frozen Clean6 selection is missing"
+  exit 96
+fi
+
+###############################################################################
+# C0. 绑定、视角分层、单物体源文件和 train/val 隔离预检
+###############################################################################
+
+"${PY}" -c \
+  'import collections,hashlib,json,sys
+from pathlib import Path
+
+selection=json.load(open(sys.argv[1]))
+assert selection["format"]=="pose_point_depth_mv.clean_single_object_smoke.v1"
+assert selection["formal"] is False and len(selection["selected"])==6
+
+def sha(path):
+    h=hashlib.sha256()
+    with open(path,"rb") as f:
+        for chunk in iter(lambda:f.read(1024*1024),b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+for item in selection["bindings"].values():
+    path=Path(item["path"])
+    assert path.is_file(), path
+    assert sha(path)==item["sha256"], path
+for row in selection["selected"]:
+    path=Path(row["source_glb"])
+    assert path.is_file(), path
+    assert sha(path)==row["source_glb_sha256"], path
+
+val_cache=json.load(open(selection["bindings"]["direct_slat_val_cache"]["path"]))
+train_cache=json.load(open(selection["bindings"]["direct_slat_train_cache"]["path"]))
+val_uids={str(x["uid"]) for x in val_cache["samples"]}
+train_objects={str(x["object_uid"]) for x in train_cache["samples"]}
+selected_uids={str(x["uid"]) for x in selection["selected"]}
+selected_objects={str(x["object_uid"]) for x in selection["selected"]}
+assert len(selected_uids)==len(selected_objects)==6
+assert selected_uids <= val_uids
+assert not (selected_objects & train_objects)
+
+lifting=json.load(open(selection["bindings"]["source_lifting_manifest"]["path"]))
+view_by_uid={str(x["uid"]):int(x["view_count"]) for x in lifting["samples"]}
+assert all(view_by_uid[x["uid"]]==int(x["view_count"]) for x in selection["selected"])
+counts=collections.Counter(int(x["view_count"]) for x in selection["selected"])
+assert counts=={2:2,4:2,8:2}
+
+print(json.dumps({
+  "passed":True,
+  "formal":False,
+  "objects":6,
+  "view_counts":dict(sorted(counts.items())),
+  "train_object_overlap":0,
+  "selected":[
+    {"uid":x["uid"],"views":x["view_count"],"label":x["review_label"]}
+    for x in selection["selected"]
+  ],
+},indent=2,ensure_ascii=False))' \
+  "${SELECTION}"
+C0_RC=$?
+echo "C0_RC=${C0_RC}"
+[ "${C0_RC}" -eq 0 ] || exit "${C0_RC}"
+
+VAL_CACHE=$(
+  "${PY}" -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["bindings"]["direct_slat_val_cache"]["path"])' \
+    "${SELECTION}"
+)
+TRAIN_CACHE=$(
+  "${PY}" -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["bindings"]["direct_slat_train_cache"]["path"])' \
+    "${SELECTION}"
+)
+CHECKPOINT=$(
+  "${PY}" -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["bindings"]["direct_slat_checkpoint"]["path"])' \
+    "${SELECTION}"
+)
+CLEAN_UIDS=$(
+  "${PY}" -c \
+    'import json,sys; print(",".join(x["uid"] for x in json.load(open(sys.argv[1]))["selected"]))' \
+    "${SELECTION}"
+)
+
+###############################################################################
+# C1. Direct stock / Full，6 objects × seed42
+###############################################################################
+
+if [ -s "${DIRECT_REPORT}" ]; then
+  echo "reuse complete Direct Clean6: ${DIRECT_REPORT}"
+elif [ -e "${DIRECT_ROOT}" ]; then
+  echo "C1 blocked: partial immutable Direct output exists: ${DIRECT_ROOT}"
+  exit 98
+else
+  run_logged "${LOG_ROOT}/direct_clean6.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+      --cache_manifest "${VAL_CACHE}" \
+      --train_cache_manifest "${TRAIN_CACHE}" \
+      --checkpoint "${CHECKPOINT}" \
+      --output_dir "${DIRECT_ROOT}" \
+      --pretrained "${PRETRAINED}" \
+      --uids "${CLEAN_UIDS}" \
+      --joint_seeds 42 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --surface_samples 20000 \
+      --bootstrap_samples 5000 \
+      --amp_dtype bf16 \
+      --noise_identity_mode object_uid_v1 \
+      --comparison_branches stock,full
+  C1_RC=$?
+  echo "C1_RC=${C1_RC}"
+  [ "${C1_RC}" -eq 0 ] || exit "${C1_RC}"
+fi
+
+"${PY}" -c \
+  'import json,sys
+selection=json.load(open(sys.argv[1]))
+r=json.load(open(sys.argv[2]))
+expected={x["uid"] for x in selection["selected"]}
+assert r["format"]=="pose_point_depth_mv.direct_slat_mesh_exploratory.v2"
+assert r["checkpoint_step"]==100 and r["joint_seeds"]==[42]
+assert r["object_count"]==6 and len(r["records"])==6
+assert {x["uid"] for x in r["records"]}==expected
+assert r["train_eval_split_audit"]["object_overlap_count"]==0
+assert r["train_eval_split_audit"]["source_glb_overlap_count"]==0
+print("C1 Direct Clean6 audit passed")' \
+  "${SELECTION}" "${DIRECT_REPORT}"
+C1_AUDIT_RC=$?
+[ "${C1_AUDIT_RC}" -eq 0 ] || exit "${C1_AUDIT_RC}"
+
+DIRECT_RUN_CONFIG=${DIRECT_ROOT}/run_config.json
+DIRECT_CACHE=$(
+  "${PY}" -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["cache_manifest"])' \
+    "${DIRECT_RUN_CONFIG}"
+)
+SOURCE_LIFTING=$(
+  "${PY}" -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["source_lifting_manifest"])' \
+    "${DIRECT_CACHE}"
+)
+
+###############################################################################
+# C2. 原版 ReconViaGen，同一批 RGB / mask
+###############################################################################
+
+mkdir -p "${RECON_ROOT}" "${LOG_ROOT}"
+while IFS=$'\t' read -r PAIR_ID SAMPLE_UID SEED; do
+  CASE_OUT=${RECON_ROOT}/${PAIR_ID}
+  CASE_LOG=${LOG_ROOT}/recon_${PAIR_ID}.log
+  if [ -s "${CASE_OUT}/report.json" ]; then
+    echo "reuse original ReconViaGen: ${PAIR_ID}"
+    continue
+  fi
+  if [ -e "${CASE_OUT}" ]; then
+    echo "C2 blocked: partial ReconViaGen output exists: ${CASE_OUT}"
+    exit 98
+  fi
+  run_logged "${CASE_LOG}" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.infer_reconviagen_stock_from_direct_cache \
+      --source_lifting_manifest "${SOURCE_LIFTING}" \
+      --uid "${SAMPLE_UID}" \
+      --output_dir "${CASE_OUT}" \
+      --pretrained "${PRETRAINED}" \
+      --device cuda \
+      --low_vram \
+      --seed "${SEED}" \
+      --ss_steps 30 \
+      --ss_guidance 7.5 \
+      --ss_guidance_rescale 0.7 \
+      --ss_rescale_t 5.0 \
+      --slat_steps 12 \
+      --slat_guidance 7.5 \
+      --slat_guidance_rescale 0.5 \
+      --slat_rescale_t 3.0 \
+      --multiimage_algo multidiffusion
+  C2_RC=$?
+  echo "C2 ${PAIR_ID} RC=${C2_RC}"
+  [ "${C2_RC}" -eq 0 ] || exit "${C2_RC}"
+done < <(
+  "${PY}" -c \
+    'import json,sys
+for x in json.load(open(sys.argv[1]))["records"]:
+    print("{}\t{}\t{}".format(x["pair_id"],x["uid"],int(x["joint_seed"])))' \
+    "${DIRECT_REPORT}"
+)
+
+RECON_COUNT=$(
+  find "${RECON_ROOT}" -mindepth 2 -maxdepth 2 -type f -name report.json | wc -l
+)
+if [ "${RECON_COUNT}" -ne 6 ]; then
+  echo "C2 blocked: expected 6 ReconViaGen reports, got ${RECON_COUNT}"
+  exit 96
+fi
+
+###############################################################################
+# C3. 统一 Mesh 指标
+###############################################################################
+
+if [ -s "${EVAL_ROOT}/report.json" ]; then
+  echo "reuse complete Clean6 evaluation: ${EVAL_ROOT}/report.json"
+elif [ -e "${EVAL_ROOT}" ]; then
+  echo "C3 blocked: partial immutable evaluation exists: ${EVAL_ROOT}"
+  exit 98
+else
+  run_logged "${LOG_ROOT}/clean6_evaluation.log" \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_reconviagen_stock_full_mesh \
+      --direct_report "${DIRECT_REPORT}" \
+      --recon_root "${RECON_ROOT}" \
+      --output_dir "${EVAL_ROOT}" \
+      --surface_samples 100000 \
+      --thresholds 0.01,0.02,0.05 \
+      --bootstrap_samples 10000 \
+      --metric_seed 20260730 \
+      --alignment_modes canonical_pose
+  C3_RC=$?
+  echo "C3_RC=${C3_RC}"
+  [ "${C3_RC}" -eq 0 ] || exit "${C3_RC}"
+fi
+
+"${PY}" -c \
+  'import json,sys
+r=json.load(open(sys.argv[1]))
+assert r["format"]=="pose_point_depth_mv.reconviagen_stock_full_mesh_accuracy.v1"
+assert r["object_count"]==6 and r["record_count"]==6 and r["joint_seeds"]==[42]
+assert r["same_input_audit"]["passed"] is True
+print(json.dumps({
+  "passed":True,
+  "formal":r["formal"],
+  "methods":r["modes"]["canonical_pose"]["method_summary"],
+  "comparisons":r["modes"]["canonical_pose"]["comparison_summary"],
+},indent=2,ensure_ascii=False))' \
+  "${EVAL_ROOT}/report.json"
+C3_AUDIT_RC=$?
+[ "${C3_AUDIT_RC}" -eq 0 ] || exit "${C3_AUDIT_RC}"
+
+###############################################################################
+# C4. GT / ReconViaGen / stock / Full 公共相机与 GT 辅助刚性位姿对齐
+###############################################################################
+
+"${PY}" -u -m pose_point_depth_mv.render_reconviagen_stock_full_six \
+  --input_report "${EVAL_ROOT}/report.json" \
+  --output_dir "${RENDER_ROOT}" \
+  --expected_objects 6 \
+  --preflight_only
+C4_PREFLIGHT_RC=$?
+[ "${C4_PREFLIGHT_RC}" -eq 0 ] || exit "${C4_PREFLIGHT_RC}"
+
+run_logged "${LOG_ROOT}/clean6_render.log" env \
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.render_reconviagen_stock_full_six \
+    --input_report "${EVAL_ROOT}/report.json" \
+    --output_dir "${RENDER_ROOT}" \
+    --expected_objects 6 \
+    --device cuda \
+    --frames 72 \
+    --resolution 320 \
+    --fps 12 \
+    --contact_frames 6 \
+    --display_margin 0.9 \
+    --alignment_mode rigid_pose_gt \
+    --alignment_seed 20260730 \
+    --candidate_samples 1000 \
+    --alignment_samples 4000 \
+    --candidate_iterations 8 \
+    --final_iterations 30
+C4_RC=$?
+echo "C4_RC=${C4_RC}"
+[ "${C4_RC}" -eq 0 ] || exit "${C4_RC}"
+
+echo "Clean6 Direct summary: ${DIRECT_ROOT}/summary.txt"
+echo "Clean6 metric summary: ${EVAL_ROOT}/summary.txt"
+echo "Clean6 overview: ${RENDER_ROOT}/all_six_normal_contact_sheet.png"
+echo "Clean6 HTML: ${RENDER_ROOT}/index.html"
+echo "current terminal remains open"

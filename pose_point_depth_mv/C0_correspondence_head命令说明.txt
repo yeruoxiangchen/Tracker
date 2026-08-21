@@ -1,0 +1,373 @@
+# C0 Explicit View Correspondence Head 命令说明
+# 日期：2026-07-17
+#
+# 一、当前模型结构
+#
+# 输入（来自现有lifting cache，不重建数据）：
+#
+#   每个view、每个16^3 voxel：
+#     sampled VGGT/DINO visual feature [V,4096,3072]
+#     pose/ray/depth geometry          [V,4096,18]
+#     correct branch view weight      [V,4096]
+#
+#   visual encoder ─┐
+#                   ├─ per-view joint interaction
+#   geometry encoder┘       │
+#                           ▼
+#              same-voxel symmetric view pairs
+#                           │
+#                           ▼
+#               per-pair logit -> per-voxel score
+#                           │
+#                           ▼
+#                  fixed-weight sample score
+#
+# 该阶段不读取x_t、stock velocity或GT latent，不加载ReconViaGen/SS Flow，
+# 也不训练Flow LoRA。唯一目标是验证正确image-pose-depth绑定是否可识别。
+#
+# 训练控制：
+#   pose_cyclic1
+#   depth_view_cyclic1
+#   visual_view_cyclic1
+#
+# 未见过的保留控制：
+#   pose_reverse
+#   depth_spatial
+#
+# 所有correct/control共用correct view weight与support，避免通过覆盖范围变化分类。
+# 训练损失包含sample BCE、paired ranking、hard-negative ranking和弱voxel BCE。
+#
+# 二、执行约定
+#
+# 1. 按V7.1 -> V7.2 -> V7.3 -> V7.4 -> V7.5 -> V7.6执行。
+# 2. 每个命令块最终exit 0，不会因为科学FAIL关闭终端。
+# 3. 真实程序状态写入*.exit_code；科学判定写入*.decision_code。
+# 4. output已存在时不覆盖，写98并停止该块。
+# 5. V7.6只有train16和fresh48都PASS才允许进入多seed。
+
+
+# ========================================================================
+# V7.1 静态编译与45项回归测试
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/c0_correspondence_static_20260717
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/correspondence_head.py \
+    pose_point_depth_mv/train_correspondence_head.py \
+    pose_point_depth_mv/eval_correspondence_head.py \
+    pose_point_depth_mv/test_correspondence_head.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+  echo "${COMPILE_CODE}" > "${OUT}/py_compile.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_correspondence_head \
+    pose_point_depth_mv.test_view_identity_lifting \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    pose_point_depth_mv.test_local_target_probe \
+    pose_point_depth_mv.test_point_anchor_v2 \
+    pose_point_depth_mv.test_point_anchor_rollout_v2 \
+    2>&1 | tee "${OUT}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+  echo "${TEST_CODE}" > "${OUT}/unittest.exit_code"
+
+  echo "V7.1 compile/test codes: ${COMPILE_CODE}/${TEST_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V7.2 单卡BF16 s5 smoke + finite audit
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/c0_correspondence_smoke4_s5_seed42_bf16_20260717
+
+  if [ -e "${RUN}" ]; then
+    echo "output already exists; no overwrite: ${RUN}"
+    echo 98 > "${RUN}.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=1 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_correspondence_head \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${RUN}" \
+    --indices 0-3 \
+    --max_steps 5 \
+    --save_every 5 \
+    --log_every 1 \
+    --seed 42 \
+    --lr 2e-4 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --hidden_dim 64 \
+    --pair_hidden_dim 96 \
+    --min_views 2 \
+    --max_train_views 0 \
+    --train_controls \
+      pose_cyclic1,depth_view_cyclic1,visual_view_cyclic1 \
+    --sample_bce_weight 1.0 \
+    --sample_rank_weight 1.0 \
+    --voxel_bce_weight 0.25 \
+    --hard_negative_weight 0.5 \
+    --rank_margin 0.25 \
+    2>&1 | tee "${RUN}.log"
+  TRAIN_CODE=${PIPESTATUS[0]}
+  echo "${TRAIN_CODE}" > "${RUN}.exit_code"
+
+  if [ "${TRAIN_CODE}" -eq 0 ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+      --train_report "${RUN}/train_report.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --expected_updates 5 \
+      --max_nonfinite_attempts 0 \
+      --output "${RUN}/finite_run_audit.json" \
+      2>&1 | tee "${RUN}/finite_run_audit.log"
+    AUDIT_CODE=${PIPESTATUS[0]}
+  else
+    AUDIT_CODE=97
+  fi
+  echo "${AUDIT_CODE}" > "${RUN}.audit_code"
+  echo "V7.2 train/audit codes: ${TRAIN_CODE}/${AUDIT_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V7.3 train16 seed42 s400
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/c0_correspondence_train16_s400_seed42_bf16_20260717
+
+  if [ -e "${RUN}" ]; then
+    echo "output already exists; no overwrite: ${RUN}"
+    echo 98 > "${RUN}.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=1 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_correspondence_head \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${RUN}" \
+    --indices 0-15 \
+    --max_steps 400 \
+    --save_every 50 \
+    --log_every 10 \
+    --seed 42 \
+    --lr 2e-4 \
+    --weight_decay 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --hidden_dim 64 \
+    --pair_hidden_dim 96 \
+    --min_views 2 \
+    --max_train_views 0 \
+    --train_controls \
+      pose_cyclic1,depth_view_cyclic1,visual_view_cyclic1 \
+    --sample_bce_weight 1.0 \
+    --sample_rank_weight 1.0 \
+    --voxel_bce_weight 0.25 \
+    --hard_negative_weight 0.5 \
+    --rank_margin 0.25 \
+    2>&1 | tee "${RUN}.log"
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${RUN}.exit_code"
+  echo "V7.3 train code: ${CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V7.4 s400 finite checkpoint audit
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/c0_correspondence_train16_s400_seed42_bf16_20260717
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 400 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json" \
+    2>&1 | tee "${RUN}/finite_run_audit.log"
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${RUN}.audit_code"
+  echo "V7.4 audit code: ${CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V7.5 train16 + object-disjoint fresh48严格评估
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/c0_correspondence_train16_s400_seed42_bf16_20260717
+
+  for SPLIT in train16 fresh48; do
+    if [ "${SPLIT}" = train16 ]; then
+      INDICES=0-15
+    else
+      INDICES=16-63
+    fi
+    OUT=${RUN}/eval_${SPLIT}_all_controls
+
+    if [ -e "${OUT}" ]; then
+      echo "output already exists; no overwrite: ${OUT}"
+      echo 98 > "${OUT}.exit_code"
+      continue
+    fi
+
+    CUDA_VISIBLE_DEVICES=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.eval_correspondence_head \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --output_dir "${OUT}" \
+      --indices "${INDICES}" \
+      --split_name "${SPLIT}" \
+      --max_samples 0 \
+      --device cuda \
+      --bootstrap_samples 10000 \
+      --min_object_win_rate 0.65 \
+      --min_margin_mean 0.0 \
+      --min_correct_score 0.0 \
+      --max_control_score 0.0 \
+      --max_permutation_diff 1e-5 \
+      2>&1 | tee "${OUT}.log"
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+passed = bool(json.loads(path.read_text(encoding="utf-8"))["passed"])
+raise SystemExit(0 if passed else 2)
+' "${OUT}/report.json"
+    DECISION_CODE=$?
+    echo "${DECISION_CODE}" > "${OUT}.decision_code"
+    echo "V7.5 ${SPLIT} run/decision codes: ${CODE}/${DECISION_CODE}"
+  done
+  exit 0
+)
+
+
+# ========================================================================
+# V7.6 paired gate与高信号结果提取
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/c0_correspondence_train16_s400_seed42_bf16_20260717
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+reports = {}
+for split in ("train16", "fresh48"):
+    path = root / f"eval_{split}_all_controls" / "report.json"
+    if not path.is_file():
+        print(split, "MISSING", path)
+        continue
+    report = json.loads(path.read_text(encoding="utf-8"))
+    reports[split] = report
+    print("\n====", split)
+    print("passed=", report["passed"])
+    print("correct score=", report["correct_score"]["object"])
+    print("view permutation diff=", report["view_permutation_max_abs_diff"])
+    for mode, row in report["controls"].items():
+        margin = row["correct_margin"]
+        print(
+            mode,
+            "role=", row["role"],
+            "mean/median/win=",
+            margin["object"]["mean"],
+            margin["object"]["median"],
+            margin["object_win_rate"],
+            "CI=", margin["object_bootstrap_95_ci"],
+        )
+paired = (
+    set(reports) == {"train16", "fresh48"}
+    and all(report["passed"] for report in reports.values())
+)
+print("\npaired train/fresh decision=", "PASS" if paired else "FAIL")
+raise SystemExit(0 if paired else 2)
+' "${RUN}" 2>&1 | tee "${RUN}/paired_result_summary.txt"
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${RUN}.decision_code"
+  echo "V7.6 paired decision code: ${CODE}"
+  exit 0
+)
+
+
+# 三、裁决
+#
+# 只有V7.6 decision code=0，才进入seed43/44复现。
+#
+# PASS要求train16和fresh48同时满足：
+#   correct score均值 >= 0；
+#   每个训练control和两个未见held-out control的score均值 <= 0；
+#   correct-control mean/median > 0；
+#   object win rate >= 65%；
+#   object bootstrap 95% CI下界 > 0；
+#   common view permutation分数差 <= 1e-5。
+#
+# 若train PASS、fresh FAIL：说明head记忆训练对象或corruption统计，停止C0 V1。
+# 若训练controls PASS、held-out controls FAIL：说明head记住了特定corruption模式，停止C0 V1。
+# 只有三个seed均在fresh48通过，才进入C1局部occupancy/decoder-logit监督；此时仍不启用Flow LoRA。

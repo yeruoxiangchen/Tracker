@@ -1,0 +1,585 @@
+# Direct-SLAT stock-anchored bounded residual：测试、旧 step800 sweep 与 897-object 微调
+# 2026-07-27
+#
+# 目的：
+# 1. 不重新训练，先用旧 step800 检查有界 residual 能否消除已知 rollout collapse；
+# 2. 只有 sentinel -> 原六例 -> 32x3 回归通过，才把同一语义用于新训练；
+# 3. 当前仍使用 3777 rows / 897 objects 的冻结 cache，不切换 mixed-10k；
+# 4. 所有输出使用新目录，不覆盖旧 Full、旧 step800 或 blind 证据。
+#
+# 参数语义：
+#   --slat_delta_scale 1.0 --slat_delta_rms_ratio_cap -1
+#       旧 Full；cap disabled，默认路径保持旧值。
+#   --slat_delta_scale S --slat_delta_rms_ratio_cap C
+#       对每个 sparse batch 独立限制 RMS(raw_full-stock)
+#       <= C * RMS(stock)，然后再乘 S。
+#   support 缺失、support_scale=0 和 negative CFG 分支仍精确走 stock。
+#
+# 建议逐段粘贴执行。每段最后都会打印 RC，外层交互终端不会因为科学门未通过而关闭。
+
+
+###############################################################################
+# V0. 公共变量
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+
+TRAIN_CACHE=/data/zjr/ar_slat_direct_train_all_step000900_seed424344_lhslatv2_20260723
+VAL_CACHE=/data/zjr/ar_slat_direct_val_all_step000900_seed424344_lhslatv2_20260723
+TARGET_DEC_AUDIT=${VAL_CACHE}/target_decoder_audit32_v2/report.json
+
+OLD_RUN=/home/zjr/Tracker/pose_point_depth_mv/outputs/direct_slat_step900support_trainall_s1000_seed42_2gpu_bf16_v3
+OLD_CKPT=${OLD_RUN}/checkpoints/step_000800.pt
+
+WORK=/data/zjr/direct_slat_bounded_residual_20260727
+GPU=${GPU:-4}
+TRAIN_GPUS=${TRAIN_GPUS:-4,5}
+
+# 这两个值只是命令后半部分的占位默认值。必须先看 V2/V3/V4，
+# 再显式 export SAFE_SCALE=... SAFE_CAP=... 选择候选。
+SAFE_SCALE=${SAFE_SCALE:-0.5}
+SAFE_CAP=${SAFE_CAP:-0.25}
+
+SENTINEL_UID=0d18146b4fdd40ef9dfeb08e19fc4335_seq000
+MATRIX_UIDS=0d18146b4fdd40ef9dfeb08e19fc4335_seq000,0cd491abba6140dda5eea7c4c2452979_seq000,29ddf51d78ae455caba970b9cd3eb75c_seq001,092bb80346414104abd5cace71892752_seq000,04d712a0dae0421cae9083484f4332ee_seq001,262afaaf596a4cf683f74b5768bd4db8_seq000
+
+test -s "${TRAIN_CACHE}/manifest.json"
+test -s "${VAL_CACHE}/manifest.json"
+test -s "${TARGET_DEC_AUDIT}"
+test -s "${OLD_CKPT}"
+
+
+###############################################################################
+# V1. 静态检查与 CPU 单元测试
+###############################################################################
+
+(
+  set -uo pipefail
+  RC=0
+  cd /home/zjr/Tracker || RC=96
+  if [ "${RC}" -eq 0 ]; then
+    "${PY}" -m py_compile \
+      pose_point_depth_mv/direct_slat_flow.py \
+      pose_point_depth_mv/train_direct_slat_flow.py \
+      pose_point_depth_mv/eval_direct_slat_flow.py \
+      pose_point_depth_mv/export_direct_slat_mesh_pairs.py \
+      pose_point_depth_mv/test_direct_slat_flow.py || RC=$?
+  fi
+  if [ "${RC}" -eq 0 ]; then
+    "${PY}" -m unittest \
+      pose_point_depth_mv.test_direct_slat_flow \
+      pose_point_depth_mv.test_direct_slat_data \
+      pose_point_depth_mv.test_direct_slat_runtime_repeat \
+      pose_point_depth_mv.test_direct_slat_release || RC=$?
+  fi
+  echo "V1_RC=${RC}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# V2. 默认策略兼容性：旧 step800 explicit legacy 单次调用
+###############################################################################
+
+# 只跑 1 row × 1 noise × 1 t，属于工程兼容 smoke，不是模型结论。
+# 不跨两次 GPU 进程要求 bit-exact；只在同一次 prediction 内确认 raw/effective
+# statistics 完全相同。默认路径的对象级 identity 由 V1 CPU 单测覆盖。
+
+OUT=${WORK}/teacher_legacy_explicit_one_v1
+LOG=${OUT}.log
+if [ -s "${OUT}/report.json" ]; then
+  echo "reuse ${OUT}/report.json"
+elif [ -e "${OUT}" ]; then
+  echo "V2 blocked by partial output: ${OUT}"
+else
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.eval_direct_slat_flow \
+    --cache_manifest "${VAL_CACHE}/manifest.json" \
+    --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --checkpoint "${OLD_CKPT}" \
+    --output_dir "${OUT}" \
+    --pretrained "${PRETRAINED}" \
+    --max_samples 1 \
+    --noise_seeds 42 \
+    --t_values 0.5 \
+    --max_slat_points 40960 \
+    --amp_dtype bf16 \
+    --bootstrap_samples 100 \
+    --decision_profile report_only \
+    --slat_delta_scale 1.0 \
+    --slat_delta_rms_ratio_cap -1 \
+    2>&1 | tee "${LOG}"
+fi
+
+"${PY}" - "${OUT}/report.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+assert report["slat_delta_policy"] == {
+    "scale": 1.0,
+    "rms_ratio_cap": None,
+    "per_sparse_batch": True,
+}
+for row in report["records"]:
+    assert row["raw_flow_delta_rms"] == row["effective_flow_delta_rms"], row
+    assert row["raw_flow_delta_abs_max"] == row["effective_flow_delta_abs_max"], row
+    assert row["delta_clip_scale"] == 1.0, row
+    assert row["delta_clip_activated"] is False, row
+print("V2 within-call legacy raw/effective equality: PASS")
+PY
+
+
+###############################################################################
+# V3. 旧 step800：已知灾难序列的 bounded residual sweep
+###############################################################################
+
+# 第一轮使用单个 sequence + seed42。完整候选为 3 scales × 4 caps。
+# 如需先节省时间，可临时把 SPECS 改为：
+#   s025_c025:0.25:0.25 s050_c025:0.5:0.25 s100_c025:1.0:0.25
+
+SPECS="
+s025_c010:0.25:0.10
+s025_c025:0.25:0.25
+s025_c050:0.25:0.50
+s025_off:0.25:-1
+s050_c010:0.50:0.10
+s050_c025:0.50:0.25
+s050_c050:0.50:0.50
+s050_off:0.50:-1
+s100_c010:1.00:0.10
+s100_c025:1.00:0.25
+s100_c050:1.00:0.50
+legacy:1.00:-1
+"
+
+for SPEC in ${SPECS}; do
+  IFS=: read -r NAME SCALE CAP <<EOF
+${SPEC}
+EOF
+  OUT=${WORK}/sentinel_${NAME}_step800_seed42_v1
+  LOG=${OUT}.log
+  if [ -s "${OUT}/report.json" ]; then
+    echo "reuse ${OUT}/report.json"
+    continue
+  fi
+  if [ -e "${OUT}" ]; then
+    echo "V3 blocked by partial output: ${OUT}"
+    break
+  fi
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+    --cache_manifest "${VAL_CACHE}/manifest.json" \
+    --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --checkpoint "${OLD_CKPT}" \
+    --output_dir "${OUT}" \
+    --pretrained "${PRETRAINED}" \
+    --uids "${SENTINEL_UID}" \
+    --joint_seeds 42 \
+    --steps 25 \
+    --cfg_strength 5.0 \
+    --cfg_interval 0.5,1.0 \
+    --rescale_t 3.0 \
+    --slat_delta_scale "${SCALE}" \
+    --slat_delta_rms_ratio_cap "${CAP}" \
+    --surface_samples 20000 \
+    --bootstrap_samples 500 \
+    --amp_dtype bf16 \
+    --noise_identity_mode object_uid_v1 \
+    2>&1 | tee "${LOG}"
+  test "${PIPESTATUS[0]}" -eq 0 || break
+done
+
+"${PY}" - "${WORK}" <<'PY'
+import glob
+import json
+import os
+import sys
+
+rows = []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "sentinel_*", "report.json"))):
+    report = json.load(open(path))
+    row = report["records"][0]
+    flow = row["full_flow_stats"]
+    rows.append({
+        "name": os.path.basename(os.path.dirname(path)),
+        "chamfer_improvement": row["chamfer_l1_improvement"],
+        "fscore_delta": row["fscore_0p02_delta"],
+        "normal_delta": row["normal_consistency_delta"],
+        "clip_calls": flow["delta_clip_activated_calls"],
+        "positive_calls": flow["positive_calls"],
+        "clip_scale_min": flow["metrics"]["delta_clip_scale"]["min"],
+        "raw_delta_rms_max": flow["metrics"]["raw_flow_delta_rms"]["max"],
+        "effective_delta_rms_max": flow["metrics"]["effective_flow_delta_rms"]["max"],
+    })
+print(json.dumps(rows, indent=2, ensure_ascii=False))
+assert rows, "no sentinel reports found"
+PY
+
+# 选择规则：
+# - 首先必须明显改善 legacy 灾难例，而不是只让 delta 变小；
+# - clip_scale 不能在所有正 CFG steps 都接近 0；
+# - 选择后显式执行，例如：
+#     export SAFE_SCALE=0.5
+#     export SAFE_CAP=0.25
+
+
+###############################################################################
+# V4. 原六例回归；不得只根据 sentinel 选配置
+###############################################################################
+
+MATRIX_OUT=${WORK}/matrix6_s${SAFE_SCALE}_c${SAFE_CAP}_step800_seed42_v1
+if [ ! -s "${MATRIX_OUT}/report.json" ]; then
+  if [ -e "${MATRIX_OUT}" ]; then
+    echo "V4 blocked by partial output: ${MATRIX_OUT}"
+  else
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+      --cache_manifest "${VAL_CACHE}/manifest.json" \
+      --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --checkpoint "${OLD_CKPT}" \
+      --output_dir "${MATRIX_OUT}" \
+      --pretrained "${PRETRAINED}" \
+      --uids "${MATRIX_UIDS}" \
+      --joint_seeds 42 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --slat_delta_scale "${SAFE_SCALE}" \
+      --slat_delta_rms_ratio_cap "${SAFE_CAP}" \
+      --surface_samples 20000 \
+      --bootstrap_samples 1000 \
+      --amp_dtype bf16 \
+      --noise_identity_mode object_uid_v1 \
+      2>&1 | tee "${MATRIX_OUT}.log"
+  fi
+fi
+
+
+###############################################################################
+# V5. 32 objects × seeds 42/43/44 的 seen regression（高成本，显式解锁）
+###############################################################################
+
+# 只有 V3/V4 通过后再执行：
+#   export APPROVE_32X3=1
+
+REG32=${WORK}/val32_s${SAFE_SCALE}_c${SAFE_CAP}_step800_seed424344_v1
+if [ "${APPROVE_32X3:-0}" != 1 ]; then
+  echo "V5 not started; set APPROVE_32X3=1 after V3/V4 review"
+elif [ -s "${REG32}/report.json" ]; then
+  echo "reuse ${REG32}/report.json"
+elif [ -e "${REG32}" ]; then
+  echo "V5 blocked by partial output: ${REG32}"
+else
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+    --cache_manifest "${VAL_CACHE}/manifest.json" \
+    --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --checkpoint "${OLD_CKPT}" \
+    --output_dir "${REG32}" \
+    --pretrained "${PRETRAINED}" \
+    --joint_seeds 42,43,44 \
+    --max_objects 32 \
+    --steps 25 \
+    --cfg_strength 5.0 \
+    --cfg_interval 0.5,1.0 \
+    --rescale_t 3.0 \
+    --slat_delta_scale "${SAFE_SCALE}" \
+    --slat_delta_rms_ratio_cap "${SAFE_CAP}" \
+    --surface_samples 20000 \
+    --bootstrap_samples 5000 \
+    --amp_dtype bf16 \
+    --noise_identity_mode object_uid_v1 \
+    2>&1 | tee "${REG32}.log"
+fi
+
+
+###############################################################################
+# T0. 新训练前：固定 index 的 2-step 重复 5 次
+###############################################################################
+
+# 这一步量化 CUDA 非 bit-exact 对 loss/grad_norm 的影响，不要求五次逐 bit 相同。
+# 每次都从同一 pretrained 权重、seed42、index0、同一 noise/t 规则开始。
+
+for REPEAT in 0 1 2 3 4; do
+  OUT=${WORK}/train2_fixedindex_repeat${REPEAT}_s${SAFE_SCALE}_c${SAFE_CAP}_v1
+  if [ -s "${OUT}/report.json" ] &&
+     [ -s "${OUT}/checkpoints/step_000002.pt" ]; then
+    echo "reuse repeat ${REPEAT}"
+    continue
+  fi
+  if [ -e "${OUT}" ]; then
+    echo "T0 blocked by partial output: ${OUT}"
+    break
+  fi
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.train_direct_slat_flow \
+    --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+    --output_dir "${OUT}" \
+    --pretrained "${PRETRAINED}" \
+    --indices 0 \
+    --max_steps 2 \
+    --save_every 1 \
+    --log_every 1 \
+    --grad_accum 1 \
+    --seed 42 \
+    --lr 1e-5 \
+    --lora_rank 4 \
+    --lora_alpha 8 \
+    --adapter_hidden_dim 64 \
+    --max_slat_points 2048 \
+    --support_scale 1.0 \
+    --slat_delta_scale "${SAFE_SCALE}" \
+    --slat_delta_rms_ratio_cap "${SAFE_CAP}" \
+    --delta_norm_weight 1e-4 \
+    --amp_dtype bf16 \
+    --gradient_checkpointing \
+    2>&1 | tee "${OUT}.log"
+  test "${PIPESTATUS[0]}" -eq 0 || break
+done
+
+"${PY}" - "${WORK}" "${SAFE_SCALE}" "${SAFE_CAP}" <<'PY'
+import glob
+import json
+import os
+import sys
+
+pattern = os.path.join(
+    sys.argv[1],
+    f"train2_fixedindex_repeat*_s{sys.argv[2]}_c{sys.argv[3]}_v1",
+    "report.json",
+)
+rows = []
+for path in sorted(glob.glob(pattern)):
+    report = json.load(open(path))
+    rows.append({
+        "path": path,
+        "history": [
+            {
+                key: step[key]
+                for key in (
+                    "step", "loss", "flow_loss", "stock_loss", "grad_norm",
+                    "raw_flow_delta_rms", "effective_flow_delta_rms",
+                    "delta_clip_scale", "delta_clip_activated",
+                )
+            }
+            for step in report["history"]
+        ],
+    })
+print(json.dumps(rows, indent=2, ensure_ascii=False))
+assert len(rows) == 5, len(rows)
+PY
+
+
+###############################################################################
+# T1. 100-step 单 GPU preflight
+###############################################################################
+
+PREFLIGHT=${WORK}/train897_preflight100_s${SAFE_SCALE}_c${SAFE_CAP}_seed42_v1
+if [ -s "${PREFLIGHT}/report.json" ] &&
+   [ -s "${PREFLIGHT}/checkpoints/step_000100.pt" ]; then
+  echo "reuse completed T1 preflight"
+elif [ -e "${PREFLIGHT}" ]; then
+  echo "T1 blocked by partial output: ${PREFLIGHT}"
+else
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.train_direct_slat_flow \
+    --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+    --output_dir "${PREFLIGHT}" \
+    --pretrained "${PRETRAINED}" \
+    --max_steps 100 \
+    --save_every 20 \
+    --log_every 5 \
+    --grad_accum 8 \
+    --seed 42 \
+    --lr 1e-5 \
+    --weight_decay 0 \
+    --grad_clip 1.0 \
+    --lora_rank 16 \
+    --lora_alpha 32 \
+    --adapter_hidden_dim 128 \
+    --max_slat_points 40960 \
+    --support_scale 1.0 \
+    --slat_delta_scale "${SAFE_SCALE}" \
+    --slat_delta_rms_ratio_cap "${SAFE_CAP}" \
+    --delta_norm_weight 1e-4 \
+    --sampling_mode object_balanced \
+    --t_schedule uniform \
+    --amp_dtype bf16 \
+    --gradient_checkpointing \
+    2>&1 | tee "${PREFLIGHT}.log"
+fi
+
+
+###############################################################################
+# T2. 897-object 正式候选训练（2 GPU；先显式解锁）
+###############################################################################
+
+# 只在 T0 五次有限、T1 100-step 有限且 bounded stats 合理后执行：
+#   export APPROVE_FULL_TRAIN=1
+
+NEW_RUN=/home/zjr/Tracker/pose_point_depth_mv/outputs/direct_slat_bounded_train897_s1000_seed42_2gpu_bf16_20260727_v1
+if [ "${APPROVE_FULL_TRAIN:-0}" != 1 ]; then
+  echo "T2 not started; set APPROVE_FULL_TRAIN=1 after T0/T1 review"
+elif [ -s "${NEW_RUN}/report.json" ] &&
+     [ -s "${NEW_RUN}/checkpoints/step_001000.pt" ]; then
+  echo "reuse completed T2 training"
+elif [ -e "${NEW_RUN}" ]; then
+  echo "T2 blocked by partial output: ${NEW_RUN}"
+else
+  CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${TORCHRUN}" --standalone --nproc_per_node=2 \
+    -m pose_point_depth_mv.train_direct_slat_flow \
+    --cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --target_decoder_audit "${TARGET_DEC_AUDIT}" \
+    --output_dir "${NEW_RUN}" \
+    --pretrained "${PRETRAINED}" \
+    --max_steps 1000 \
+    --save_every 200 \
+    --log_every 5 \
+    --grad_accum 8 \
+    --seed 42 \
+    --lr 1e-5 \
+    --weight_decay 0 \
+    --grad_clip 1.0 \
+    --lora_rank 16 \
+    --lora_alpha 32 \
+    --adapter_hidden_dim 128 \
+    --max_slat_points 40960 \
+    --support_scale 1.0 \
+    --slat_delta_scale "${SAFE_SCALE}" \
+    --slat_delta_rms_ratio_cap "${SAFE_CAP}" \
+    --delta_norm_weight 1e-4 \
+    --sampling_mode object_balanced \
+    --t_schedule uniform \
+    --amp_dtype bf16 \
+    --gradient_checkpointing \
+    2>&1 | tee "${NEW_RUN}.log"
+fi
+
+
+###############################################################################
+# T3. 新训练 checkpoint 的 128-object teacher-forced 选择
+###############################################################################
+
+for STEP in 000200 000400 000600 000800 001000; do
+  CKPT=${NEW_RUN}/checkpoints/step_${STEP}.pt
+  OUT=${NEW_RUN}/eval_val128_step${STEP}_seed424344_t013579_bounded_v1
+  if [ ! -s "${CKPT}" ]; then
+    echo "T3 missing checkpoint: ${CKPT}"
+    break
+  fi
+  if [ -s "${OUT}/report.json" ]; then
+    echo "reuse ${OUT}/report.json"
+    continue
+  fi
+  if [ -e "${OUT}" ]; then
+    echo "T3 blocked by partial output: ${OUT}"
+    break
+  fi
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.eval_direct_slat_flow \
+    --cache_manifest "${VAL_CACHE}/manifest.json" \
+    --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+    --checkpoint "${CKPT}" \
+    --output_dir "${OUT}" \
+    --pretrained "${PRETRAINED}" \
+    --noise_seeds 42,43,44 \
+    --t_values 0.1,0.3,0.5,0.7,0.9 \
+    --max_slat_points 40960 \
+    --amp_dtype bf16 \
+    --bootstrap_samples 5000 \
+    --min_object_win_rate 0.55 \
+    --decision_profile report_only \
+    2>&1 | tee "${OUT}.log"
+  test "${PIPESTATUS[0]}" -eq 0 || break
+done
+
+# 不得自动选择 step1000。先比较：
+# - full_gain_vs_stock mean/median/win/CI；
+# - raw/effective delta RMS 和 clip activation；
+# - 再对候选 checkpoint 重跑 V3/V4/V5 的 Mesh 门。
+
+
+###############################################################################
+# T4. 最小结果查看
+###############################################################################
+
+"${PY}" - "${NEW_RUN}" <<'PY'
+import glob
+import json
+import os
+import sys
+
+rows = []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "eval_val128_*", "report.json"))):
+    report = json.load(open(path))
+    primary = report["summary"]["full_gain_vs_stock"]
+    records = report["records"]
+    rows.append({
+        "step": report["checkpoint_step"],
+        "gain_mean": primary["mean"],
+        "gain_median": primary["median"],
+        "object_win": primary["positive_rate"],
+        "gain_ci": primary["bootstrap_mean_95_ci"],
+        "clip_activation_rate": sum(r["delta_clip_activated"] for r in records)
+        / len(records),
+        "raw_delta_rms_mean": sum(r["raw_flow_delta_rms"] for r in records)
+        / len(records),
+        "effective_delta_rms_mean": sum(
+            r["effective_flow_delta_rms"] for r in records
+        ) / len(records),
+    })
+print(json.dumps(rows, indent=2, ensure_ascii=False))
+PY

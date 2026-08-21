@@ -1,0 +1,89 @@
+F39 official 30K no-VGGT compact-v2 + strict-fix1 CUDA smoke
+======================================================================
+
+状态：源服务器仅完成 CPU/static 验证；下列 CUDA 命令尚未执行。
+三次 smoke 都保持 global effective batch = 8：
+
+  1 GPU × per-rank batch1 × grad_accum8 = 8
+  2 GPU × per-rank batch1 × grad_accum4 = 8
+  8 GPU × per-rank batch1 × grad_accum1 = 8
+
+不要覆盖：
+  /root/Tracker_perf_v1
+  /root/Tracker_perf_v1_fix1
+
+一、先设置四类现场路径
+----------------------------------------------------------------------
+
+export CODE_ROOT=/root/Tracker_30k_compact_strict_fix1_v1
+export COMPACT_ROOT=/root/autodl-tmp/proobjaverse_official_slat_compact_v2_pilot256_8gpu_v1
+
+# 以下三个必须指向F39上已经同步并校验过的冻结证据；不要凭名字新造report。
+export DECODER_AUDIT=/absolute/path/to/official_decoder_audit/report.json
+export NATIVE_SS_REPORT=/absolute/path/to/frozen_native_ss_training_evidence/report.json
+export STOCK_SLAT_FREEZE=/absolute/path/to/stock_slat_freeze_v2.json
+
+test -s "${COMPACT_ROOT}/slat_manifest.json"
+test -s "${COMPACT_ROOT}/lifting_manifest.json"
+test -s "${DECODER_AUDIT}"
+test -s "${NATIVE_SS_REPORT}"
+test -s "${STOCK_SLAT_FREEZE}"
+
+二、1-GPU：2 optimizer updates
+----------------------------------------------------------------------
+
+set +e
+SMOKE_WORLD_SIZE=1 \
+RUN_UNTIL_STEP=2 \
+OUTPUT_DIR=/root/autodl-tmp/official_slat_compact_strict_fix1_smoke_w1_v1 \
+LOG=/root/autodl-tmp/official_slat_compact_strict_fix1_smoke_w1_v1.log \
+  bash "${CODE_ROOT}/pose_point_depth_mv/background_jobs/run_f39_official_slat_compact_strict_smoke.sh"
+W1_RC=$?
+echo "W1_RC=${W1_RC} (0=PASS；终端保持打开)"
+
+三、2-GPU DDP：2 optimizer updates
+----------------------------------------------------------------------
+
+set +e
+SMOKE_WORLD_SIZE=2 \
+RUN_UNTIL_STEP=2 \
+OUTPUT_DIR=/root/autodl-tmp/official_slat_compact_strict_fix1_smoke_w2_v1 \
+LOG=/root/autodl-tmp/official_slat_compact_strict_fix1_smoke_w2_v1.log \
+  bash "${CODE_ROOT}/pose_point_depth_mv/background_jobs/run_f39_official_slat_compact_strict_smoke.sh"
+W2_RC=$?
+echo "W2_RC=${W2_RC} (0=PASS；终端保持打开)"
+
+四、8-GPU DDP：5 optimizer updates
+----------------------------------------------------------------------
+
+set +e
+SMOKE_WORLD_SIZE=8 \
+RUN_UNTIL_STEP=5 \
+OUTPUT_DIR=/root/autodl-tmp/official_slat_compact_strict_fix1_smoke_w8_v1 \
+LOG=/root/autodl-tmp/official_slat_compact_strict_fix1_smoke_w8_v1.log \
+  bash "${CODE_ROOT}/pose_point_depth_mv/background_jobs/run_f39_official_slat_compact_strict_smoke.sh"
+W8_RC=$?
+echo "W8_RC=${W8_RC} (0=PASS；终端保持打开)"
+
+五、每次完成后的最低检查
+----------------------------------------------------------------------
+
+对应 output 的 report.json 至少确认：
+
+  stage_complete = true
+  step = 2（W1/W2）或5（W8）
+  model_summary.runtime_performance.profile
+      = official_30k_compact_strict_fix1_v1
+  model_summary.runtime_performance.ddp_device_ids = null（W2/W8）
+  model_summary.optimization.global_effective_batch = 8
+
+同时从日志确认：
+
+  - conditional forward确实执行；
+  - loss finite；
+  - trainable gradients finite/nonzero；
+  - 没有compact pair identity错误；
+  - 没有完整lifting payload被DDP递归搬CUDA的错误；
+  - 1/2/8卡分别使用独立output，不resume、不复用失败目录。
+
+这些是功能smoke，不是30K正式训练，也不替代256-object pilot统计或全量cache审计。

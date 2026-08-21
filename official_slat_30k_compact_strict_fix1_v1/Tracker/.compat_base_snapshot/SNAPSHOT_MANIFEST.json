@@ -1,0 +1,64 @@
+{
+  "format": "tracker.aug16.30k_compact_compat.code_only_snapshot.v2",
+  "snapshot_name": "Tracker_Aug16_30k_compact_compat_20260816_v2",
+  "created_at_utc": "2026-08-16T16:52:54.729157+00:00",
+  "source_root": "/home/zjr/Tracker",
+  "git": {
+    "branch": "main",
+    "head": "722296bc754509ce92149b89c908d7231bc603d8",
+    "dirty": true,
+    "status_entry_count": 645,
+    "status_short_sha256": "b6126122e4d1c6f5e9c616aedf2aee4d4b692c3e859bd874648b6f48ec64786b"
+  },
+  "payload": {
+    "source_file_count": 1164,
+    "source_bytes": 18401091,
+    "archive_regular_file_count": 1177,
+    "contains_dirty_and_untracked_source": true
+  },
+  "critical_source_sha256": {
+    "pose_point_depth_mv/train_native_slat_genrecon_no_vggt.py": "e6953c184495c123f495b4abb5ae3e3027cacbafca5b9613ff51a0e518098906",
+    "pose_point_depth_mv/proobjaverse_official_slat_protocol.py": "4b4f4ff27cdfd9536dfe281d0e6fa008b908884f3be1f43a2f06ec8d451dff09",
+    "pose_point_depth_mv/proobjaverse_official_slat_compact.py": "e4868ea6917ca3548bcfb97d8b4817ad502569c67b1923300933efa2e5f0a44a",
+    "pose_point_depth_mv/test_proobjaverse_official_slat_protocol_compat.py": "3a1b35da1afd70399545dafdbf2106cf6cdcee25572ac28ed10a3605c9a4aeb4",
+    "pose_point_depth_mv/test_proobjaverse_official_slat_compact_compat.py": "73576f8ee97e3d51562de3245d794ca7e9f46c986f11029c1ec41828b91642a2",
+    "pose_point_depth_mv/test_proobjaverse_official_slat_cache_v1_v2_fixture.py": "e809c322f76c9041835117181e71513a6fc61173e32b0e6a7626a45974df74a0"
+  },
+  "quick_checks": {
+    "new_compatibility_equivalence_cpu_tests": {
+      "ran": 9,
+      "passed": 9,
+      "failed": 0,
+      "seconds": 2.06
+    },
+    "related_cpu_regressions": {
+      "ran": 23,
+      "passed": 23,
+      "failed": 0,
+      "seconds": 0.626
+    },
+    "py_compile": "passed",
+    "offline_import_smoke": "passed",
+    "gpu_used": false,
+    "real_30k_scanned": false,
+    "cache_built": false,
+    "pilot_run": false,
+    "training_run": false
+  },
+  "snapshot_exclusions": [
+    "datasets",
+    "cache payloads",
+    "outputs",
+    "logs",
+    "checkpoints",
+    "model weights",
+    "compiled binaries",
+    "archives",
+    "__pycache__",
+    "temporary experiment products"
+  ],
+  "distribution_archive_sha256": {
+    "value_location": "Tracker_Aug16_30k_compact_compat_20260816_v2.tar.zst.sha256 and Tracker_Aug16_30k_compact_compat_20260816_v2.tar.zst.manifest.json",
+    "embedded_value_omitted_to_avoid_self_hash_cycle": true
+  }
+}

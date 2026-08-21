@@ -1,0 +1,225 @@
+# OmniObject3D真实视频：R2下载后分层抽样审计命令
+# 日期：2026-08-04
+#
+# 原则：
+#   - 不逐类别、逐对象人工审计；
+#   - 固定6个跨形态样本验证共享videos_processed合同；
+#   - 样本通过后，后续扩大下载只做gzip/字段/总数自动硬门；
+#   - 官方归档已经包含images、matting、COLMAP sparse和poses_bounds，当前不重复跑COLMAP；
+#   - standard/sparse/0_txt是原始COLMAP权威输入；0_txt_rescaled*在scan对齐前只作辅助；
+#   - 所有失败只结束子shell并打印RC，绝不退出当前交互终端。
+
+
+###############################################################################
+# Q0. 前置状态和工具检查（只读）
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  P7=/data/zjr/omni_real_video_pilot_20260804_v1/audit/R2_DOWNLOAD_SUMMARY.json
+  R1=/data/zjr/omni_real_video_pilot_20260804_v1/audit/R1_PROTOCOL_PASS.json
+
+  test -x "${PY}" || exit 96
+  test -s "${P7}" || exit 96
+  test -s "${R1}" || exit 96
+  "${PY}" -c \
+    'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True; assert p["archive_complete_count"]==11; print({k:p[k] for k in ("category_count","archive_complete_count","scan_object_count","total_archive_bytes","passed")})' \
+    "${P7}"
+  "${PY}" -c \
+    'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True; assert p["capture_protocol"]=="camera_orbit_static_object"; print(p)' \
+    "${R1}"
+  "${PY}" -m py_compile \
+    pose_point_depth_mv/dataset_tools/audit_omni_real_video_sample.py
+)
+Q0_RC=$?
+echo "Q0_RC=${Q0_RC}"
+if [ "${Q0_RC}" -ne 0 ]; then echo "Q0 failed; current terminal remains open"; fi
+
+
+###############################################################################
+# Q1. 固定6对象分层样本：安全抽取、自动合同审计、RGB-mask预览
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video_pilot_20260804_v1
+  ARCHIVES=/data/zjr/OmniObject3D/raw/omniobject3d___OmniObject3D-New/raw/videos_processed
+  SCANS=/data/zjr/OmniObject3D/raw_scans_extracted_omni215_v1/categories
+  EXTRACT=${ROOT}/sample_extract_stratified6_v1
+  OUT=${ROOT}/sample_audit_stratified6_v1
+  LOG=${ROOT}/logs/Q1_stratified6_sample_audit.log
+
+  if [ -s "${OUT}/sample_audit.json" ]; then
+    "${PY}" -c \
+      'import json,sys; p=json.load(open(sys.argv[1])); assert p["format"]=="pose_point_depth_mv.omni_real_video_sample_audit.v1"; assert p["sample_count"]==6; assert p["automatic_passed"] is True; print(json.dumps(p,indent=2,ensure_ascii=False))' \
+      "${OUT}/sample_audit.json"
+  elif [ -e "${OUT}" ]; then
+    echo "Q1 partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    mkdir -p "$(dirname "${LOG}")"
+    "${PY}" -u \
+      pose_point_depth_mv/dataset_tools/audit_omni_real_video_sample.py \
+      --archive_root "${ARCHIVES}" \
+      --scan_root "${SCANS}" \
+      --extract_root "${EXTRACT}" \
+      --output_dir "${OUT}" \
+      --sample canned_beverage:canned_beverage_001 \
+      --sample fork:fork_001 \
+      --sample guitar:guitar_001 \
+      --sample laptop:laptop_001 \
+      --sample tvstand:tvstand_001 \
+      --sample boxed_beverage:boxed_beverage_001 \
+      --min_frames 32 \
+      --min_registration_ratio 0.70 \
+      --min_point_count 100 \
+      --preview_frames 12
+  fi
+) 2>&1 | tee /data/zjr/omni_real_video_pilot_20260804_v1/logs/Q1_stratified6_sample_audit.log
+
+Q1_RC=${PIPESTATUS[0]}
+echo "Q1_RC=${Q1_RC}"
+if [ "${Q1_RC}" -eq 0 ]; then
+  echo "Q1 automatic sample audit complete; current terminal remains open"
+else
+  echo "Q1 failed; preserve output and inspect the log; current terminal remains open"
+fi
+
+
+###############################################################################
+# Q2. 将6张contact sheet复制到仓库，供人工查看
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  SRC=/data/zjr/omni_real_video_pilot_20260804_v1/sample_audit_stratified6_v1/previews
+  DST=/home/zjr/Tracker/pose_point_depth_mv/outputs/omni_real_video_sample_audit_stratified6_20260804_v1
+
+  test -d "${SRC}" || exit 96
+  mkdir -p "${DST}"
+  cp -a "${SRC}/." "${DST}/"
+  COUNT=$(find "${DST}" -maxdepth 1 -type f -name '*_rgb_mask_contact.jpg' | wc -l)
+  echo "preview_count=${COUNT}"
+  test "${COUNT}" -eq 6 || exit 96
+  find "${DST}" -maxdepth 1 -type f -ls | sort
+)
+Q2_RC=$?
+echo "Q2_RC=${Q2_RC}"
+if [ "${Q2_RC}" -eq 0 ]; then
+  echo "Q2 complete; inspect: /home/zjr/Tracker/pose_point_depth_mv/outputs/omni_real_video_sample_audit_stratified6_20260804_v1"
+else
+  echo "Q2 failed; current terminal remains open"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# Q3. 人工抽样门：查看6张contact sheet后才运行
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video_pilot_20260804_v1
+  REPORT=${ROOT}/sample_audit_stratified6_v1/sample_audit.json
+  OUTPUT=${ROOT}/audit/R3_STRATIFIED_SAMPLE_CONTRACT_PASS.json
+
+  # 人工看完6张预览后改成1。默认0只会阻塞子shell，不会关闭当前终端。
+  SAMPLE_MANUAL_PASS=1
+
+  if [ "${SAMPLE_MANUAL_PASS}" -ne 1 ]; then
+    echo "Q3 blocked: inspect all six contact sheets, then set SAMPLE_MANUAL_PASS=1"
+    exit 95
+  fi
+
+  "${PY}" - "${REPORT}" "${OUTPUT}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+report_path = Path(sys.argv[1]).resolve()
+output = Path(sys.argv[2]).resolve()
+report = json.loads(report_path.read_text(encoding="utf-8"))
+assert report["format"] == "pose_point_depth_mv.omni_real_video_sample_audit.v1"
+assert report["sample_count"] == 6
+assert report["automatic_passed"] is True
+assert all(row["automatic_passed"] for row in report["samples"])
+payload = {
+    "format": "pose_point_depth_mv.omni_real_video_stratified_contract.v1",
+    "decided_at_utc": datetime.now(timezone.utc).isoformat(),
+    "sample_report": str(report_path),
+    "sample_count": 6,
+    "capture_protocol": "camera_orbit_static_object",
+    "authoritative_rgb": "standard/images",
+    "authoritative_mask": "standard/matting",
+    "authoritative_colmap": "standard/sparse/0_txt",
+    "authoritative_pose_bounds": "standard/poses_bounds.npy",
+    "rescaled_sparse_policy": "auxiliary_only_until_scan_frame_alignment_audit",
+    "future_download_audit_policy": (
+        "no per-category manual audit; require archive integrity, aggregate field contract, "
+        "actual video-object count, and source/category-balanced heldout sampling"
+    ),
+    "manual_visual_checks": {
+        "camera_orbits_static_object": True,
+        "rgb_mask_alignment_acceptable": True,
+        "object_visible_across_orbit": True,
+        "no_systematic_hand_or_support_failure": True,
+    },
+    "passed": True,
+}
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+print(json.dumps(payload, indent=2, ensure_ascii=False))
+PY
+)
+Q3_RC=$?
+echo "Q3_RC=${Q3_RC}"
+if [ "${Q3_RC}" -eq 0 ]; then
+  echo "Q3 contract frozen; future scale-up does not require per-category manual audit"
+else
+  echo "Q3 blocked/failed; current terminal remains open"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# Q4. 只读摘要；Q3通过后再生成200--300真实对象扩量下载计划
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video_pilot_20260804_v1
+  "${PY}" -c \
+    'import json,sys; p=json.load(open(sys.argv[1])); print(json.dumps({"sample_count":p["sample_count"],"automatic_pass_count":p["automatic_pass_count"],"automatic_passed":p["automatic_passed"],"samples":[{"object_id":r["object_id"],"frames":r["image_count"],"registered":r["registered_image_count"],"registration_ratio":r["registration_ratio"],"points":r["sparse_point_count"],"mask_median":r["sampled_mask_area_median"],"passed":r["automatic_passed"]} for r in p["samples"]]},indent=2,ensure_ascii=False))' \
+    "${ROOT}/sample_audit_stratified6_v1/sample_audit.json"
+  "${PY}" -c \
+    'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True; print(json.dumps(p,indent=2,ensure_ascii=False))' \
+    "${ROOT}/audit/R3_STRATIFIED_SAMPLE_CONTRACT_PASS.json"
+)
+Q4_RC=$?
+echo "Q4_RC=${Q4_RC}; current terminal remains open"

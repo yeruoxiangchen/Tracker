@@ -1,0 +1,247 @@
+================================================================================
+C2 Self-referenced Object-gated Local SS Residual 完整命令
+================================================================================
+
+设计：
+  1. 冻结 stock sparse_structure_flow_model；
+  2. 训练 LocalPoseLiftingVelocityAdapter；
+  3. train16 只使用 train correct gate 的均值作为固定训练 scale；
+  4. fresh48 比较 correct / matched constant / permuted / wrong / shuffle gates；
+  5. gate=0 必须 bit-exact stock；
+  6. 第一个 C2 只跑 residual seed42，固定 C1.6 seed42 detector/calibration。
+
+================================================================================
+A. 解压、编译、单测
+================================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+unzip -jo \
+  /home/zjr/Tracker/c2_object_gated_pose_lifting_tools.zip \
+  -d /home/zjr/Tracker/ar_ss_flow/
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  ar_ss_flow/object_gate_c2.py \
+  ar_ss_flow/train_object_gated_pose_lifting_c2.py \
+  ar_ss_flow/eval_object_gated_pose_lifting_c2.py \
+  ar_ss_flow/test_object_gate_c2.py
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  ar_ss_flow.test_object_gate_c2 -v
+
+预期：
+  Ran 5 tests
+  OK
+
+================================================================================
+B. 公共路径
+================================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+export GPU=${GPU:-0}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+
+C1ROOT=ar_ss_flow/outputs/corr_pairwise_v3_s200_seed42
+CALIBRATION=${C1ROOT}/deployment_object_selfref_sigmoid_calibration_v7/calibration.json
+TRAIN_GATE_REPORT=${C1ROOT}/deployment_object_selfref_train16_v1/report.json
+TRAIN_GATE_SAMPLES=${C1ROOT}/deployment_object_selfref_train16_v1/selfref_samples.npz
+FRESH_GATE_REPORT=${C1ROOT}/deployment_object_selfref_fresh48_v1/report.json
+FRESH_GATE_SAMPLES=${C1ROOT}/deployment_object_selfref_fresh48_v1/selfref_samples.npz
+
+for FILE in \
+  "${CACHE}" \
+  "${CALIBRATION}" \
+  "${TRAIN_GATE_REPORT}" \
+  "${TRAIN_GATE_SAMPLES}" \
+  "${FRESH_GATE_REPORT}" \
+  "${FRESH_GATE_SAMPLES}"
+do
+  test -s "${FILE}" || { echo "Missing ${FILE}"; exit 97; }
+done
+
+================================================================================
+C. C2-0：5-step zero-init / gradient smoke
+================================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+OUT=ar_ss_flow/outputs/c2_object_gate_pose_lifting_smoke_s5_seed42
+rm -rf "${OUT}"
+rm -f "${OUT}.log" "${OUT}.exit_code"
+
+(
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m ar_ss_flow.train_object_gated_pose_lifting_c2 \
+    --cache_manifest "${CACHE}" \
+    --gate_report "${TRAIN_GATE_REPORT}" \
+    --gate_samples "${TRAIN_GATE_SAMPLES}" \
+    --gate_calibration "${CALIBRATION}" \
+    --output_dir "${OUT}" \
+    --indices 0-3 \
+    --device cuda \
+    --seed 42 \
+    --max_steps 5 \
+    --save_every 5 \
+    --log_every 1 \
+    --lr 1e-4 \
+    --adapter_hidden_dim 96 \
+    --residual_scale 1.0 \
+    --train_gate_policy matched_constant \
+    --amp_dtype bf16 \
+    --flow_weight 1.0 \
+    --gain_weight 0.10 \
+    --gain_margin 0.002 \
+    --delta_norm_weight 0.01
+) 2>&1 | tee "${OUT}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${OUT}.exit_code"
+echo "C2 smoke status=${STATUS}"
+
+检查：
+  completed checkpoint step = 5
+  loss / gradients finite
+  step1 output projection先启动是正常的
+
+================================================================================
+D. C2-1：seed42 train16 fixed-constant residual training
+================================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+OUT=ar_ss_flow/outputs/c2_object_gate_pose_lifting_train16_s50_seed42
+rm -rf "${OUT}"
+rm -f "${OUT}.log" "${OUT}.exit_code"
+
+(
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m ar_ss_flow.train_object_gated_pose_lifting_c2 \
+    --cache_manifest "${CACHE}" \
+    --gate_report "${TRAIN_GATE_REPORT}" \
+    --gate_samples "${TRAIN_GATE_SAMPLES}" \
+    --gate_calibration "${CALIBRATION}" \
+    --output_dir "${OUT}" \
+    --indices 0-15 \
+    --device cuda \
+    --seed 42 \
+    --max_steps 50 \
+    --save_every 10 \
+    --log_every 5 \
+    --lr 1e-4 \
+    --weight_decay 0 \
+    --grad_clip 1.0 \
+    --adapter_hidden_dim 96 \
+    --residual_scale 1.0 \
+    --train_gate_policy matched_constant \
+    --amp_dtype bf16 \
+    --flow_weight 1.0 \
+    --gain_weight 0.10 \
+    --gain_margin 0.002 \
+    --delta_norm_weight 0.01
+) 2>&1 | tee "${OUT}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${OUT}.exit_code"
+echo "C2 train16 status=${STATUS}"
+
+================================================================================
+E. C2-2：fresh48 fixed-noise causal gate audit
+================================================================================
+
+cd /home/zjr/Tracker || exit 1
+
+TRAIN=ar_ss_flow/outputs/c2_object_gate_pose_lifting_train16_s50_seed42
+CHECKPOINT=${TRAIN}/checkpoints/last.pt
+OUT=ar_ss_flow/outputs/c2_object_gate_pose_lifting_fresh48_s50_seed42_eval_v1
+
+rm -rf "${OUT}"
+rm -f "${OUT}.log" "${OUT}.exit_code"
+
+test -s "${CHECKPOINT}" || { echo "Missing ${CHECKPOINT}"; exit 97; }
+
+(
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m ar_ss_flow.eval_object_gated_pose_lifting_c2 \
+    --cache_manifest "${CACHE}" \
+    --checkpoint "${CHECKPOINT}" \
+    --gate_report "${FRESH_GATE_REPORT}" \
+    --gate_samples "${FRESH_GATE_SAMPLES}" \
+    --gate_calibration "${CALIBRATION}" \
+    --output_dir "${OUT}" \
+    --indices 16-63 \
+    --device cuda \
+    --seeds 42,43,44 \
+    --t_values 0.1,0.3,0.5,0.7,0.9 \
+    --adapter_hidden_dim 96 \
+    --residual_scale 1.0 \
+    --amp_dtype bf16 \
+    --permutation_seed 20260714 \
+    --min_positive_t 4 \
+    --min_object_win_vs_constant 0.55 \
+    --min_object_win_vs_permuted 0.55 \
+    --min_object_win_vs_negative 0.60 \
+    --min_gain_vs_constant 0.0 \
+    --min_gain_vs_permuted 0.0 \
+    --min_gain_vs_negative 0.0 \
+    --fail_on_error
+) 2>&1 | tee "${OUT}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${OUT}.exit_code"
+echo "C2 fresh causal audit status=${STATUS}"
+
+if [ -s "${OUT}/report.json" ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python - "${OUT}/report.json" <<'PY'
+import json, sys
+p=sys.argv[1]
+d=json.load(open(p))
+print("stage:", d["stage"])
+print("passed:", d["passed"])
+print("objects:", d["eligible_object_count"], "records:", d["record_count"])
+print("off_max_abs:", d["residual_off_max_abs_diff"])
+print("fresh_constant:", d["fresh_matched_constant_gate"])
+for branch,row in d["branch_summary"].items():
+    print(
+        branch,
+        "gain=", row["object_balanced_gain"]["mean"],
+        "median=", row["object_balanced_gain"]["median"],
+        "positive=", row["object_positive_rate"],
+        "delta_rms=", row["mean_delta_rms"],
+    )
+for control,row in d["comparisons"].items():
+    print(
+        "correct_vs", control,
+        "gain=", row["object_difference"]["mean"],
+        "win=", row["object_win_rate"],
+    )
+print("checks:", d["checks"])
+PY
+fi
+
+退出码：
+  0：C2 seed42机制门通过，可再做 residual train seed43/44。
+  2：程序正常但科学门失败；先分析 matched constant / permuted / negative controls。
+  其他：文件、CUDA或程序错误。
+
+================================================================================
+F. 结果解释纪律
+================================================================================
+
+正式通过必须同时满足：
+  residual_off == stock bit-exact
+  correct gate fresh mean/median gain > 0
+  至少4/5个t为正
+  correct gate > fresh matched constant
+  correct gate > permuted correct gate
+  correct gate > cyclic1/cyclic2/reverse/shuffle gates
+
+注意：
+  matched constant 使用 fresh correct gate 的均值，只匹配平均残差强度，不使用Flow标签。
+  permuted gate 保留完整gate分布，只打乱对象绑定。
+  因此 correct > constant/permuted 才能证明对象特异gate有因果价值。

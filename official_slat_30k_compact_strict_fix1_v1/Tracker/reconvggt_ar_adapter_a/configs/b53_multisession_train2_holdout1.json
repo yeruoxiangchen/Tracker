@@ -1,0 +1,29 @@
+[
+  {
+    "name": "ar_20260617_075401_819",
+    "split": "train",
+    "image_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_pose_streaming_selected_test_20260513_023847_853/prepare/dataset/ar_session_20260617_075401_819/images",
+    "mask_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_pose_streaming_selected_test_20260513_023847_853/prepare/dataset/ar_session_20260617_075401_819/masks",
+    "pose_file": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_pose_streaming_selected_test_20260513_023847_853/prepare/dataset/ar_session_20260617_075401_819/poses.txt",
+    "colmap_sparse_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_pose_streaming_selected_test_20260513_023847_853/prepare/dataset/ar_session_20260617_075401_819/sparse_ar_streaming/0",
+    "prior_manifest": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_pose_streaming_selected_test_20260513_023847_853/manifest/manifest.json"
+  },
+  {
+    "name": "ar_20260624_010530_849",
+    "split": "train",
+    "image_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_010530_849_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_010530_849/images",
+    "mask_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_010530_849_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_010530_849/masks",
+    "pose_file": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_010530_849_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_010530_849/poses.txt",
+    "colmap_sparse_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_010530_849_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_010530_849/sparse_ar_streaming/0",
+    "prior_manifest": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_010530_849_pose_streaming_countcheck_v1/manifest/manifest.json"
+  },
+  {
+    "name": "ar_20260624_011149_207",
+    "split": "validation",
+    "image_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011149_207_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_011149_207/images",
+    "mask_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011149_207_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_011149_207/masks",
+    "pose_file": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011149_207_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_011149_207/poses.txt",
+    "colmap_sparse_dir": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011149_207_pose_streaming_countcheck_v1/prepare/dataset/ar_session_20260624_011149_207/sparse_ar_streaming/0",
+    "prior_manifest": "/home/zjr/Tracker/trellis_point_prior_mv/outputs/ar_session_smoke/ar_session_20260624_011149_207_pose_streaming_countcheck_v1/manifest/manifest.json"
+  }
+]

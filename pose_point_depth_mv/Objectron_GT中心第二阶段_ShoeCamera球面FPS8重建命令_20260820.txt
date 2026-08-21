@@ -1,0 +1,146 @@
+# Objectron GT 中心模拟第二阶段采集：Shoe + Camera
+# ==================================================
+#
+# 目的：
+#   已知 Objectron 官方物体中心后，从每个完整视频片段的全部有效候选帧中，
+#   以“相机中心相对物体中心的单位方向”执行训练一致的单 seed 球面 FPS，选 8 帧。
+#
+# 每个片段输出三份 Mesh：
+#   1) 当前 SS30K+SLat30K，pose+mask runtime-O（GT 只用于选帧）；
+#   2) 当前 SS30K+SLat30K，Objectron 完整真值 pose O（oracle 上界）；
+#   3) strict ReconViaGen，使用完全相同的 8 张 RGB。
+# 当前模型的两个 O 分支都会把 Mesh 轮廓投回原始 8 帧。
+#
+# 注意：这是一项 oracle 选帧定性诊断。GT rotation/scale 不进入第 1 个分支，
+# 但 GT translation 进入了选帧，因此不能直接当作可部署结果或正式测试结论。
+
+
+# T0. 语法预检
+# ------------
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+${PY} -m py_compile \
+  pose_point_depth_mv/objectron_with_vggt_frame_selection_matrix.py
+
+bash -n \
+  pose_point_depth_mv/background_jobs/run_objectron_gt_center_guided8_shoe_camera_4gpu.sh
+
+bash -n \
+  pose_point_depth_mv/background_jobs/show_objectron_gt_center_guided8_progress.sh
+
+
+# T1. 四卡后台启动
+# ---------------
+# 默认用物理 GPU 0,1,2,3；需要换卡时只改 GT_CENTER_GPUS。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs2/Objectron_ShoeCamera_GT中心引导_训练一致球面FPS8_SS30K_SLat30K_vs_ReconViaGen_20260820_v1
+UNIT=tracker-objectron-gt-center-guided8-v1
+mkdir -p "${ROOT}/logs"
+
+if [ -s "${ROOT}/report.json" ]; then
+  echo "reuse complete result: ${ROOT}/report.json"
+elif systemctl --user is-active --quiet "${UNIT}.service"; then
+  echo "already active: ${UNIT}.service"
+else
+  systemctl --user reset-failed "${UNIT}.service" 2>/dev/null || true
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property=StandardOutput=append:${ROOT}/logs/master.log \
+    --property=StandardError=append:${ROOT}/logs/master.log \
+    /usr/bin/env \
+      PROJECT_ROOT=/home/zjr/Tracker \
+      PYTHON=/home/zjr/anaconda3/envs/reconviagen/bin/python \
+      GT_CENTER_GPUS=0,1,2,3 \
+      OUTPUT_ROOT="${ROOT}" \
+      /bin/bash \
+        pose_point_depth_mv/background_jobs/run_objectron_gt_center_guided8_shoe_camera_4gpu.sh
+fi
+
+echo "master log: ${ROOT}/logs/master.log"
+echo "final report: ${ROOT}/report.json"
+echo "current terminal remains open"
+
+
+# T2. 监视（另开终端）
+# -------------------
+
+cd /home/zjr/Tracker
+
+watch -n 20 -- bash \
+  pose_point_depth_mv/background_jobs/show_objectron_gt_center_guided8_progress.sh
+
+# 查看模型详细进度：
+# ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs2/Objectron_ShoeCamera_GT中心引导_训练一致球面FPS8_SS30K_SLat30K_vs_ReconViaGen_20260820_v1
+# tail -F "${ROOT}/logs/master.log" "${ROOT}"/logs/phase*.log
+
+
+# T3. 只看 GT 中心 FPS 选中的 8 帧和覆盖数据
+# --------------------------------------------
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs2/Objectron_ShoeCamera_GT中心引导_训练一致球面FPS8_SS30K_SLat30K_vs_ReconViaGen_20260820_v1
+
+${PY} -c '
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for name in ("shoe_batch14_30_obj0", "camera_batch7_24_obj0"):
+    p = json.load(open(root / name / "experiment_plan.json", encoding="utf-8"))
+    s = p["strategies"][0]["selection"]
+    print(json.dumps({
+        "clip": p["clip_sequence"],
+        "candidate_frames": p["frame_count"],
+        "center_source": s["object_center_source"],
+        "selected_frames": s["selected_frame_names"],
+        "candidate_azimuth_coverage_degrees":
+            s["candidate_azimuth_coverage_degrees"],
+        "azimuth_coverage_degrees": s["azimuth_coverage_degrees"],
+        "minimum_pairwise_angle_degrees":
+            s["minimum_pairwise_angular_separation_degrees"],
+        "gt_rotation_used_for_selection":
+            s["object_rotation_consumed_for_selection"],
+        "gt_scale_used_for_selection":
+            s["object_scale_consumed_for_selection"],
+    }, indent=2, ensure_ascii=False))
+' "${ROOT}"
+
+
+# T4. 完成检查和人工查看位置
+# ------------------------
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs2/Objectron_ShoeCamera_GT中心引导_训练一致球面FPS8_SS30K_SLat30K_vs_ReconViaGen_20260820_v1
+
+${PY} -c '
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+r = json.load(open(root / "report.json", encoding="utf-8"))
+assert r["passed"] is True and r["clip_count"] == 2
+for clip in r["clips"]:
+    strategy = clip["strategy"]
+    assert strategy["status"] == "COMPLETE"
+    print(json.dumps({
+        "clip": clip["clip_sequence"],
+        "selected_frames": clip["selected_frame_names"],
+        "meshes": strategy["meshes"],
+        "pose_mask_contours": strategy["contours_pose_mask"],
+        "true_pose_contours": strategy["contours_true_pose"],
+    }, indent=2, ensure_ascii=False))
+' "${ROOT}"
+
+echo "总报告: ${ROOT}/report.json"
+echo "说明: ${ROOT}/README.md"
+echo "Shoe: ${ROOT}/shoe_batch14_30_obj0/01_gt_center_training_spherical_fps8"
+echo "Camera: ${ROOT}/camera_batch7_24_obj0/01_gt_center_training_spherical_fps8"
+echo "current terminal remains open"

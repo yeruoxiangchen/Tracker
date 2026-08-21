@@ -1,0 +1,1625 @@
+AR SS Flow Pose Lifting 命令说明
+日期：2026-07-14
+
+当前模型结构
+============
+
+部署可用输入：
+
+  multi-view image + mask + K/T + sparse AR/COLMAP points
+
+P1 离线缓存分成两条视觉路径：
+
+  路径 A（stock）：
+    原 ReconViaGen alpha crop/recenter
+      -> frozen VGGT + DINO/Image encoder
+      -> frozen sparse_structure_vggt_cond
+      -> stock_condition [1,4096,1024]
+
+  路径 B（geometry lifting）：
+    原始 512x512 full-frame masked image，不裁剪
+      -> resize 518x518，同时把 K 缩放到 518 坐标系
+      -> frozen VGGT patch + frozen DINO patch
+      -> visual_patch_features [V,1369,3072]
+      -> frozen VGGT depth/depth confidence
+
+  sparse points + correct K/T：
+    投影 sparse point，比较 z_camera 与 VGGT depth
+      -> robust scale-only fit
+      -> robust affine fit
+      -> 选择正 scale 且 residual 更合理的模型
+
+  深度标定失败：
+    显式 depth_consistency_enabled=false
+    只使用 mask + visibility/visual-hull 权重
+    禁止默认 depth scale
+
+P2/P3 运行时 lifting：
+
+  同一份 visual_patch_features/depth/mask
+    + correct pose
+    + small pose perturbation
+    + shuffled pose（相机在 view 间 roll，visual view 顺序不变）
+    + depth corruption（同一 depth 做固定二维 shift/水平翻转，并施加确定性 per-view scale）
+      -> 分别重建 16^3 dense visual volume
+
+  correct projection geometry 可用 FP32 缓存加速；corruption 必须重算 K/T sampling grid。
+  correct volume 不是唯一缓存表示。
+
+P3 SS Flow adapter：
+
+  frozen stock SS Flow：
+    (x_t, t, stock_condition) -> stock_velocity [B,8,16,16,16]
+
+  trainable local adapter（无 global attention）：
+    h_i = projection([x_t_i, stock_velocity_i, t])
+    v_i = projection(lifted_visual_i)
+    m_i = projection(support/depth/prior/XYZ metadata_i)
+
+    interaction_i = concat(
+      h_i,
+      v_i,
+      h_i * v_i,
+      abs(h_i - v_i),
+      m_i
+    )
+
+    interaction_i -> pointwise 1x1x1 MLP -> zero-init velocity delta_i
+    output_i = stock_velocity_i + weighted_support_i * delta_i
+
+  空间范围：同一个 16^3 voxel；没有 4096x4096 cross-attention。
+  physical_present=false 或 null volume 时 hard bypass，velocity bit-exact stock。
+  第一版不训练 VGGT、DINO、bridge、stock SS Flow、decoder、SLAT，也不开 Flow LoRA。
+
+配对训练：
+
+  correct/corruption 共用同一 target、noise、x_t、t、stock condition 和 visual patches。
+
+  L = correct flow matching
+    + corrupted pose/depth -> stock velocity
+    + correct relative gain hinge
+    + correct-vs-corruption rank hinge
+    + delta norm
+
+阶段门：
+
+  P0/P1 cache audit PASS
+    -> P2 full overfit64 input separability PASS
+    -> P3 one-sample s5 finite/checkpoint PASS
+    -> P4 overfit16 三个训练 seed PASS
+    -> fresh P5 overfit64
+    -> object-disjoint validation
+
+任一阶段 FAIL 都停下分析，不直接增加训练步数或启用 Flow LoRA。
+
+
+0. 静态检查与 CPU 单测
+======================
+
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  ar_ss_flow/pose_lifting.py \
+  ar_ss_flow/build_pose_lifting_cache.py \
+  ar_ss_flow/local_pose_lifting_flow.py \
+  ar_ss_flow/audit_pose_lifting_cache.py \
+  ar_ss_flow/audit_lifting_separability.py \
+  ar_ss_flow/train_local_pose_lifting_ss_flow.py \
+  ar_ss_flow/eval_local_pose_lifting_ss_flow.py \
+  ar_ss_flow/summarize_pose_lifting_multiseed.py \
+  ar_ss_flow/test_pose_lifting.py
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  ar_ss_flow.test_pose_lifting -v
+
+
+1. P1：构建 overfit64 可复用 lifting cache
+==========================================
+
+说明：
+  约 46.5 MiB/sample，64 samples 约 3 GiB。
+  ReconViaGen pipeline 会删除 depth_head；脚本会显式重新加载
+  Stable-X/vggt-object-v0-1 的完整 VGGT，并只保留 aggregator/depth head。
+  log 写在 cache 目录外，避免输出目录非空导致 builder 拒绝启动。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+DATA_ROOT=/data/reconvggt_pointpose_v9_ssfixed_odsplit_20260712
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+LOG=${CACHE}.build.log
+
+if [ -e "${CACHE}" ]; then
+  echo "output already exists: ${CACHE}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/build_pose_lifting_cache.py \
+  --source_cache_manifest "${DATA_ROOT}/cache/train/overfit64.json" \
+  --output_dir "${CACHE}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --vggt_pretrained Stable-X/vggt-object-v0-1 \
+  --indices all \
+  --max_samples 0 \
+  --device cuda \
+  --image_resolution 518 \
+  --vggt_feature_index -1 \
+  --min_depth_matches 8 \
+  --affine_improvement_ratio 0.90 \
+  --save_correct_geometry \
+  --log_every 1 \
+  2>&1 | tee "${LOG}"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${CACHE}.P1.exit_code"
+echo "P1 build exit code: ${CODE}"
+exit "${CODE}"
+) || true
+
+
+2. P0/P1：缓存、深度标定与 correct geometry 审计
+================================================
+
+说明：
+  depth calibration coverage 是数据指标，不应通过默认 scale 补齐。
+  correct cached geometry 与运行时 FP32 重算必须接近数值等价。
+  先看 report.json；passed=false 时不要进入训练。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=${CACHE}/independent_audit_v2
+
+CUDA_VISIBLE_DEVICES=1 \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/audit_pose_lifting_cache.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --indices all \
+  --max_samples 0 \
+  --device cuda \
+  --min_depth_enabled_ratio 0.80 \
+  --max_cached_geometry_diff 1.0e-5 \
+  --max_roundtrip_error 1.0e-4 \
+  --fail_on_error \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.P0.exit_code"
+echo "P0/P1 audit exit code: ${CODE}"
+exit "${CODE}"
+) || true
+
+说明（2026-07-20 D3 v2修复）：
+
+  cache builder在CPU上生成correct_geometry。v2固定在CPU上重建fresh geometry，
+  直接检查image_grid、patch_grid、camera_depth的shape/dtype/finite/max-abs，
+  并要求valid bit-exact。随后将cached CPU geometry和fresh CPU geometry分别送入
+  指定的runtime device重放volume/metadata。因此1e-5现在是同源几何重放硬门，
+  不再用来覆盖CPU/CUDA投影坐标差异。projection round-trip仍保留1e-4独立硬门。
+
+  旧v1在CUDA上重建fresh geometry，将约2.38e-7的CPU/CUDA grid差异经
+  grid_sample和1e-6 support硬阈值放大，产生了数值审计假失败。旧报告仅作历史证据，
+  不应通过放宽到4e-3来准入。
+
+  必须加--fail_on_error。外层`|| true`只保护交互终端，真实状态读取
+  `${OUT}.P0.exit_code`和report.json中的passed，不能只看shell最终返回值。
+
+
+3. 历史 P2：correct / pose perturb / shuffled pose / depth corruption（仅诊断）
+============================================================================
+
+状态（2026-07-15）：该审计已稳定复现 `passed=false`，但失败的是未控制active-view
+集合和total-support mass的raw cross-view方向门，不是non-identity、null或paired-input门。
+本节不再作为第12节C3的硬前置，也不得据此启动下面旧P3/P4训练。
+
+当前执行入口：
+
+  P0/P1 cache audit通过
+    -> 跳到第12节C3 static/s5/actual-corruption协议
+
+旧第4至第9节只保留为历史复现命令，不再继续运行。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=${CACHE}/p2_separability_all64
+
+CUDA_VISIBLE_DEVICES=1 \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/audit_lifting_separability.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --indices all \
+  --max_samples 0 \
+  --device cuda \
+  --min_visual_normalized_mse 1.0e-4 \
+  --min_sample_pass_ratio 0.80 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.P2.exit_code"
+echo "P2 audit exit code: ${CODE}"
+exit "${CODE}"
+) || true
+
+P2 的 report.json 必须满足：
+
+  passed=true
+  paired_same_visual_features=true
+  null_is_exact_zero=true
+  三类 corruption 的 sample_pass_ratio >= 0.80
+
+depth_corrupt 通常比 pose_shuffle 弱，必须看 full 64 分布，不能用单样本决定阈值。
+
+已观测结果：
+
+  paired_same_visual_features = true
+  null_is_exact_zero = true
+  all_corruptions_separable = true
+  correct_geometry_has_directional_advantage = false
+
+原因：pose_shuffle方向通过率57.8125%，略低于60%；depth_corrupt为17.1875%，
+因为它会减少有效view/权重，使raw weighted variance表面上更低。该指标没有固定两路的
+active-view集合，不能作为correct pose是否更合理的可靠硬门。C3改用actual corruption、
+same-voxel pair features、constant/spatial controls和最终Flow/rollout结果直接判定。
+
+
+4. P3：单样本 BF16 s5 smoke
+============================
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_s5_seed42_bf16
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/train_local_pose_lifting_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0 \
+  --max_steps 5 \
+  --save_every 5 \
+  --log_every 1 \
+  --num_workers 0 \
+  --seed 42 \
+  --lr 1.0e-4 \
+  --grad_accum 1 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --nonfinite_policy error \
+  --max_nonfinite_attempts 0 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --t_schedule uniform \
+  --corruption_modes pose_perturb,pose_shuffle,depth_corrupt \
+  --flow_weight 1.0 \
+  --corrupt_stock_weight 0.10 \
+  --correct_gain_weight 0.10 \
+  --correct_gain_margin 0.005 \
+  --correct_corrupt_rank_weight 0.05 \
+  --correct_corrupt_margin 0.002 \
+  --delta_norm_weight 0.01 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "P3 train exit code: ${CODE}"
+) || true
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+  --train_report /home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_s5_seed42_bf16/train_report.json \
+  --checkpoint /home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_s5_seed42_bf16/checkpoints/last.pt \
+  --expected_updates 5 \
+  --max_nonfinite_attempts 0 \
+  --output /home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_s5_seed42_bf16/finite_run_audit.json
+
+P3 必须确认：
+
+  finite_run_audit.passed=true
+  physical_off_max_abs_diff=0
+  null_volume_max_abs_diff=0
+  step1 允许只有 output gradient 非零
+  step2 以后 visual/state/fusion gradient 应非零
+
+
+5. P4：overfit16 三个训练 seed，2 GPU，s50
+===========================================
+
+说明：
+  cache 有 64 个对象，但 --indices 0-15 只训练 16 个对象。
+  每个 seed 必须 from scratch；不要 resume 另一个 seed。
+  子 shell 即使失败也不会杀掉当前终端；失败后检查对应 .log。
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+(
+set -uo pipefail
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_seed${TRAIN_SEED}_2gpu_bf16
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=1,2 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+NCCL_IB_DISABLE=1 \
+OMP_NUM_THREADS=4 \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  ar_ss_flow/train_local_pose_lifting_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-15 \
+  --max_steps 50 \
+  --save_every 10 \
+  --log_every 5 \
+  --num_workers 0 \
+  --seed "${TRAIN_SEED}" \
+  --lr 1.0e-4 \
+  --grad_accum 8 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --nonfinite_policy error \
+  --max_nonfinite_attempts 0 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --t_schedule uniform \
+  --corruption_modes pose_perturb,pose_shuffle,depth_corrupt \
+  --flow_weight 1.0 \
+  --corrupt_stock_weight 0.10 \
+  --correct_gain_weight 0.10 \
+  --correct_gain_margin 0.005 \
+  --correct_corrupt_rank_weight 0.05 \
+  --correct_corrupt_margin 0.002 \
+  --delta_norm_weight 0.01 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "P4 seed=${TRAIN_SEED} train exit code: ${CODE}"
+exit "${CODE}"
+) || true
+done
+
+
+6. P4：三个训练 run 的 finite checkpoint 审计
+==============================================
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+  RUN=/home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_seed${TRAIN_SEED}_2gpu_bf16
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 50 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json"
+done
+
+
+7. P4：固定噪声、三 eval seed、五 t 的 paired teacher-forced eval
+================================================================
+
+cd /home/zjr/Tracker
+
+for TRAIN_SEED in 42 43 44; do
+(
+set -uo pipefail
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+RUN=/home/zjr/Tracker/ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_seed${TRAIN_SEED}_2gpu_bf16
+OUT=${RUN}/teacher_forced_noise424344_t013579
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  exit 98
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/eval_local_pose_lifting_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --checkpoint "${RUN}/checkpoints/last.pt" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-15 \
+  --max_samples 0 \
+  --device cuda \
+  --seeds 42,43,44 \
+  --t_values 0.1,0.3,0.5,0.7,0.9 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --amp_dtype bf16 \
+  --min_object_win_rate 0.65 \
+  --min_positive_t 4 \
+  --max_corrupt_abs_gain 0.005 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "P4 seed=${TRAIN_SEED} eval exit code: ${CODE}"
+exit "${CODE}"
+) || true
+done
+
+
+8. P4：跨三个训练 seed 汇总
+===========================
+
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/summarize_pose_lifting_multiseed.py \
+  --report_dirs \
+    ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_seed42_2gpu_bf16/teacher_forced_noise424344_t013579 \
+    ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_seed43_2gpu_bf16/teacher_forced_noise424344_t013579 \
+    ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_seed44_2gpu_bf16/teacher_forced_noise424344_t013579 \
+  --expected_train_seeds 42,43,44 \
+  --output_dir ar_ss_flow/outputs/pose_lifting_local16_overfit16_s50_multiseed_summary
+
+只有 summary/report.json 的 passed=true 才进入 fresh overfit64。
+
+
+9. P5：fresh overfit64 入口配置（只在 P4 三 seed PASS 后运行）
+================================================================
+
+第一轮 P5 只跑一个 seed，且必须 from scratch：
+
+  --indices all
+  --max_steps 200
+  --save_every 25
+  --log_every 10
+  --grad_accum 16
+  --seed 42
+
+其余模型和 loss 参数与 P4 完全相同。P5 通过后才构建 val lifting cache：
+
+  source cache manifest:
+    /data/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/cache/val/manifest.json
+
+  output:
+    /data/ar_ss_flow_pose_lifting_val_v1_20260714
+
+validation cache 必须重新执行 P0/P1 audit 和 P2 separability；不得复用 train 的深度标定。
+
+
+已完成的本地实现 smoke（2026-07-14）
+=====================================
+
+临时目录：
+
+  /tmp/ar_ss_flow_pose_lifting_cache_smoke_20260714
+  /tmp/ar_ss_flow_local_train_s2_20260714
+
+结果：
+
+  1 sample cache build PASS
+  visual feature shape = [4,1369,3072]
+  stock condition shape = [1,4096,1024]
+  sparse depth matches = 148
+  selected depth model = affine
+  correct cached geometry vs FP32 recompute max diff = 0
+  voxel->pixel/depth->world round-trip max error = 3.78149e-7
+  supported voxel ratio = 0.55517578125
+
+  P2 normalized visual MSE：
+    pose_perturb = 0.17979237
+    pose_shuffle = 0.33918458
+    depth_corrupt = 0.00323648
+
+  BF16 s2：
+    applied updates = 2
+    nonfinite attempts = 0
+    checkpoint/optimizer/scaler finite audit = PASS
+    physical-off/null = bit-exact stock
+    step2 visual/state/fusion gradients = nonzero
+
+  2-GPU DDP s1：
+    applied updates = 1
+    nonfinite attempts = 0
+    rank-0 checkpoint finite audit = PASS
+
+这些只证明工程链路成立，不是收益结论。正式结论必须看 full P2 和 P4 三训练 seed。
+
+
+10. P1完成后的修正版协议（2026-07-14，覆盖旧P2/P3/P4命令）
+================================================================
+
+本节及其后命令覆盖上面的旧训练/评估命令。旧s2 checkpoint使用未归一化时间通道，禁止resume或评估。
+
+关键修正：
+
+  1. adapter时间输入固定为 t / 1000，模型版本升级为
+     ar_ss_flow.local_pose_lifting_velocity.v2。
+  2. pose_shuffle和depth_corrupt是hard invalid corruption：训练回到stock。
+  3. pose_perturb是AR鲁棒性输入：训练到target、接近correct、优于stock。
+  4. P2同时报告non-identity、跨view方向和GT局部支持方向。
+  5. P4使用mean(abs(corrupt gain))，并加入correct-vs-stock对象胜率、逐t方向、
+     pose perturb鲁棒门和neutral max-abs硬门。
+  6. multiseed summary硬检查cache hash、样本、step、noise、t、corruption、
+     hidden dim、physical scale、loss权重和模型版本完全一致。
+
+
+10.1 原生ReconViaGen stock condition硬审计（已PASS）
+---------------------------------------------------
+
+本次实际结果：2/4/8 view代表样本全部满足：
+
+  torch.equal(native_fp16, cached_fp16) = true
+  max_abs_diff = 0
+  RMS difference = 0
+  cosine = 1
+
+因此不需要重建P1，也不需要repair stock_condition。
+
+重现命令：
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/p1_stock_condition_native_audit_recheck
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/audit_cached_stock_condition.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0,1,5 \
+  --device cuda \
+  --max_abs_tolerance 0 \
+  --rms_tolerance 0 \
+  --min_cosine 1 \
+  --require_fp16_equal \
+  --fail_on_error \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+
+
+10.2 full-64方向性P2（正式训练硬前置）
+---------------------------------------
+
+GT local support只作辅助诊断；当前硬门为non-identity加跨view方向。先看full-64分布，
+不得依据单样本把GT辅助指标改成硬门。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/p2_directional_full64_v2_20260714
+
+CUDA_VISIBLE_DEVICES=1 \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/audit_lifting_separability.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --indices all \
+  --max_samples 0 \
+  --device cuda \
+  --min_visual_normalized_mse 1e-4 \
+  --min_sample_pass_ratio 0.80 \
+  --min_direction_pass_ratio 0.60 \
+  --fail_on_error \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+
+
+10.3 单卡BF16 s5（新版时间与loss smoke）
+-----------------------------------------
+
+新版s2已实际PASS：2/2 update、0 nonfinite、optimizer/scaler finite。继续跑s5：
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/local_pose_v2_time_norm_roles_s5_bf16
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/train_local_pose_lifting_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-4 \
+  --max_steps 5 \
+  --save_every 5 \
+  --log_every 1 \
+  --num_workers 0 \
+  --seed 42 \
+  --lr 1e-4 \
+  --grad_accum 1 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --nonfinite_policy error \
+  --max_nonfinite_attempts 0 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --t_schedule uniform \
+  --corruption_modes pose_perturb,pose_shuffle,depth_corrupt \
+  --flow_weight 1.0 \
+  --corrupt_stock_weight 0.10 \
+  --correct_gain_weight 0.10 \
+  --correct_gain_margin 0.005 \
+  --correct_corrupt_rank_weight 0.05 \
+  --correct_corrupt_margin 0.002 \
+  --delta_norm_weight 0.01 \
+  --perturb_flow_weight 0.25 \
+  --perturb_consistency_weight 0.05 \
+  --perturb_gain_weight 0.05 \
+  --perturb_gain_margin 0.0 \
+  2>&1 | tee "${OUT}.log"
+
+TRAIN_CODE=${PIPESTATUS[0]}
+echo "${TRAIN_CODE}" > "${OUT}.train.exit_code"
+
+if [ "${TRAIN_CODE}" -eq 0 ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${OUT}/train_report.json" \
+    --checkpoint "${OUT}/checkpoints/last.pt" \
+    --expected_updates 5 \
+    --max_nonfinite_attempts 0 \
+    --output "${OUT}/finite_run_audit.json"
+  AUDIT_CODE=$?
+else
+  AUDIT_CODE=99
+fi
+
+echo "${AUDIT_CODE}" > "${OUT}.audit.exit_code"
+exit "$(( TRAIN_CODE != 0 ? TRAIN_CODE : AUDIT_CODE ))"
+) || true
+
+
+10.4 两卡DDP s1
+----------------
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/local_pose_v2_time_norm_roles_ddp2_s1_bf16
+
+CUDA_VISIBLE_DEVICES=1,2 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+NCCL_IB_DISABLE=1 \
+OMP_NUM_THREADS=4 \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  ar_ss_flow/train_local_pose_lifting_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-1 \
+  --max_steps 1 \
+  --save_every 1 \
+  --log_every 1 \
+  --num_workers 0 \
+  --seed 42 \
+  --lr 1e-4 \
+  --grad_accum 1 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --nonfinite_policy error \
+  --max_nonfinite_attempts 0 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 1.0 \
+  --corruption_modes pose_perturb,pose_shuffle,depth_corrupt \
+  --perturb_flow_weight 0.25 \
+  --perturb_consistency_weight 0.05 \
+  --perturb_gain_weight 0.05 \
+  2>&1 | tee "${OUT}.log"
+
+TRAIN_CODE=${PIPESTATUS[0]}
+echo "${TRAIN_CODE}" > "${OUT}.train.exit_code"
+
+if [ "${TRAIN_CODE}" -eq 0 ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${OUT}/train_report.json" \
+    --checkpoint "${OUT}/checkpoints/last.pt" \
+    --expected_updates 1 \
+    --max_nonfinite_attempts 0 \
+    --output "${OUT}/finite_run_audit.json"
+  AUDIT_CODE=$?
+else
+  AUDIT_CODE=99
+fi
+
+echo "${AUDIT_CODE}" > "${OUT}.audit.exit_code"
+exit "$(( TRAIN_CODE != 0 ? TRAIN_CODE : AUDIT_CODE ))"
+) || true
+
+
+10.5 修正版P4参数（替换旧P4命令的阈值段）
+------------------------------------------------
+
+训练命令必须加入：
+
+  --perturb_flow_weight 0.25
+  --perturb_consistency_weight 0.05
+  --perturb_gain_weight 0.05
+  --perturb_gain_margin 0.0
+
+评估命令必须加入/替换为：
+
+  --min_object_win_rate 0.65
+  --min_correct_stock_object_win_rate 0.65
+  --min_positive_t 4
+  --min_hard_positive_t 4
+  --max_corrupt_abs_gain 0.005
+  --min_perturb_object_win_rate 0.55
+  --min_perturb_positive_t 4
+  --max_perturb_correct_gap 0.005
+  --max_neutral_velocity_abs 0
+  --fail_on_error
+
+每次eval后必须写：
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.eval.exit_code"
+
+summary同样使用--fail_on_error，并写：
+
+  CODE=$?
+  echo "${CODE}" > "${SUMMARY}.summary.exit_code"
+
+只有full P2、s5 finite audit、DDP s1 finite audit均PASS，才重新启动三个from-scratch s50。
+旧v1 checkpoint不得resume到v2。
+
+
+11. P0.5：Object-frame Synthetic Sim(3) Stress Test
+====================================================
+
+当前16³仍是TRELLIS canonical cube，不是AR world grid。P0.5在同一视觉内容下随机改变
+整个scene的Sim(3)，比较：
+
+  no_recovery:
+    只变换相机，不提供object_to_world；应明显偏离baseline。
+
+  oracle:
+    变换相机并提供真实object_to_world；必须数值恢复baseline。
+
+  point_pca:
+    只从变换后的稀疏world points估计中心、尺度和PCA朝向；用于判断点云单独
+    canonicalization是否足够。
+
+P0.5不会训练模型。它是P2.1和s50之前的新硬前置；现阶段禁止启动s50。
+
+
+11.1 静态检查
+---------------
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/p05_static_20260714
+mkdir -p "${OUT}"
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  ar_ss_flow/object_frame.py \
+  ar_ss_flow/audit_object_frame_sim3.py \
+  ar_ss_flow/summarize_object_frame_sim3.py \
+  ar_ss_flow/pose_lifting.py \
+  ar_ss_flow/local_pose_lifting_flow.py
+COMPILE_CODE=$?
+
+if [ "${COMPILE_CODE}" -eq 0 ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    ar_ss_flow.test_pose_lifting
+  TEST_CODE=$?
+else
+  TEST_CODE=99
+fi
+
+echo "${COMPILE_CODE}" > "${OUT}/compile.exit_code"
+echo "${TEST_CODE}" > "${OUT}/test.exit_code"
+exit "$(( COMPILE_CODE != 0 ? COMPILE_CODE : TEST_CODE ))"
+) || true
+
+
+11.2 三个transform seed的8-object pilot
+---------------------------------------
+
+先跑8个object，不直接投入full-64。每个seed使用独立GPU，命令结束后终端不会因某个
+seed返回2而退出；真实状态保存在各自exit_code中。
+
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+
+for ITEM in 42:1 43:2 44:3; do
+  SEED=${ITEM%%:*}
+  GPU=${ITEM##*:}
+  OUT=${ROOT}/p05_object_frame_sim3_pilot8_seed${SEED}
+
+  (
+    set -o pipefail
+
+    if [ -e "${OUT}" ]; then
+      echo "output already exists: ${OUT}"
+      echo 98 > "${OUT}.exit_code"
+      exit 0
+    fi
+
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      ar_ss_flow/audit_object_frame_sim3.py \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --output_dir "${OUT}" \
+      --indices 0-7 \
+      --max_samples 0 \
+      --device cuda \
+      --seed "${SEED}" \
+      --expected_canonical_extent 0.9 \
+      --oracle_max_normalized_mse 1e-6 \
+      --min_no_recovery_mse 1e-3 \
+      --min_no_recovery_detection_ratio 0.80 \
+      --min_estimator_improvement_ratio 0.60 \
+      --max_estimator_center_error_over_scale 0.20 \
+      --max_estimator_scale_log_error 0.25 \
+      --fail_on_error \
+      2>&1 | tee "${OUT}.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+    exit 0
+  ) &
+done
+
+wait
+
+for SEED in 42 43 44; do
+  OUT=${ROOT}/p05_object_frame_sim3_pilot8_seed${SEED}
+  echo "seed=${SEED} exit=$(cat "${OUT}.exit_code" 2>/dev/null || echo MISSING)"
+done
+
+
+11.3 pilot多seed汇总
+--------------------
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+OUT=${ROOT}/p05_object_frame_sim3_pilot8_multiseed
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/summarize_object_frame_sim3.py \
+  --report_dirs \
+    "${ROOT}/p05_object_frame_sim3_pilot8_seed42" \
+    "${ROOT}/p05_object_frame_sim3_pilot8_seed43" \
+    "${ROOT}/p05_object_frame_sim3_pilot8_seed44" \
+  --expected_seeds 42,43,44 \
+  --output_dir "${OUT}" \
+  --fail_on_error
+
+CODE=$?
+echo "${CODE}" > "${OUT}.exit_code"
+exit "${CODE}"
+) || true
+
+
+11.4 判定与后续训练门
+---------------------
+
+必须分别看summary中的两个结论：
+
+  mechanism_passes_every_seed = false:
+    object_to_world实现或depth/camera尺度处理仍有错误；停止并修代码。
+
+  mechanism_passes_every_seed = true
+  estimated_frame_passes_every_seed = false:
+    已证明object frame必要，但point-only PCA不足；下一步加入gravity、reference camera
+    和visual-hull约束。禁止s50。
+
+  两者都为true:
+    才运行full-64 P0.5，然后在estimated object frame上重做P2.1。
+
+训练命令暂不新增。原第6节/第10节的s50命令保持封存，只有以下全部成立才解封：
+
+  P0.5 full-64三seed PASS
+  estimated object frame被写入cache metadata
+  P2.1在estimated frame PASS
+
+不得在当前oracle-aligned synthetic cache上继续训练并把结果解释为AR部署收益。
+
+
+12. C3：State-conditioned Same-voxel Pair-feature SS Adapter（2026-07-15）
+============================================================================
+
+12.0 当前模型结构、实验边界与判定层级
+--------------------------------------
+
+本节是跨视图 correspondence 路线的最后一轮结构性验证。它修复 C2 的两个关键问题：
+
+  1. 不再把 C1 confidence 只压成归一化 view weight 或 object scalar gate；
+  2. correct、pose corruption、cross-object corruption 都重建自己的真实 pair evidence，
+     不再对同一个 correct volume 只替换标量 gate。
+
+结构：
+
+  frozen C1 pairwise correspondence model
+    + 同一 16^3 voxel 内的 view-pair features：
+        projected pair embeddings
+        abs difference / product
+        pair confidence logit/probability
+        depth residual difference
+        support / ray cosine / camera-depth difference
+    -> [B, pair_count, pair_feature_dim, 16,16,16]
+
+  frozen stock SS Flow：
+    (x_t, t, stock_condition) -> stock_velocity
+
+  trainable C3 local adapter（约 0.51M 参数）：
+    query = projection(x_t, stock_velocity, t/1000)
+    key/value = 当前 voxel 的 view-pair features
+    + lifted visual volume
+    + support/depth/prior/XYZ metadata
+    -> pointwise fusion
+    -> zero-init velocity residual
+
+  output = stock_velocity
+         + physical_scale * support_gate * time_gate * residual
+
+明确约束：
+
+  无 4096x4096 global attention；
+  只在同一个 16^3 voxel 内查询 view pairs；
+  physical_present=false -> bit-exact stock；
+  null evidence -> bit-exact stock；
+  t<=0.5 -> bit-exact stock；
+  VGGT/DINO/bridge/stock SS Flow/decoder/SLAT/C1 全部冻结；
+  第一版不开 Flow LoRA。
+
+配对训练：
+
+  correct 与 wrong 共用 target、noise、x_t、t、stock condition；
+  wrong 是实际重建的 cyclic/reverse/cross-object evidence；
+  correct -> target velocity；
+  wrong -> stock velocity；
+  同时约束 correct 优于 stock、correct 优于 wrong、delta norm。
+
+重要边界：
+
+  当前 cache 仍是已知 canonical frame 的合成机制数据。
+  C3 PASS 只能证明“该局部跨视图机制值得继续”；不能替代 P0.5 的真实 AR
+  object-frame/Sim(3) 恢复问题，也不能直接声称真实 AR 部署收益。
+
+判定分两层：
+
+  benchmark_relaxed：
+    只判断 teacher-forced correct 是否稳定优于 frozen ReconViaGen stock；
+    用于决定是否值得跑昂贵 rollout；不能证明 pose-specific causality。
+
+  mechanism_strict：
+    还要求 correct 优于 constant-pair、spatial-permuted-pair 和所有 actual corruption；
+    只有这一层通过，才能把收益归因于正确 pose/view correspondence。
+
+
+12.1 静态检查与 CPU 单测
+------------------------
+
+以下命令无论检查是否通过，最外层都返回 0；真实状态写入 exit-code 文件，终端不会被退出。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+OUT=/home/zjr/Tracker/ar_ss_flow/outputs/c3_static_20260715
+mkdir -p "${OUT}"
+CODE=0
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  ar_ss_flow/correspondence_lifting.py \
+  ar_ss_flow/pair_feature_ss_flow.py \
+  ar_ss_flow/train_pair_feature_ss_flow.py \
+  ar_ss_flow/eval_pair_feature_ss_flow.py \
+  ar_ss_flow/audit_pair_feature_training_run.py \
+  ar_ss_flow/summarize_pair_feature_multiseed.py \
+  || CODE=$?
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  ar_ss_flow.test_correspondence_lifting \
+  ar_ss_flow.test_pair_feature_ss_flow \
+  || CODE=$?
+
+echo "${CODE}" > "${OUT}/exit_code"
+echo "C3 static/unit-test exit=${CODE}"
+exit 0
+)
+
+
+12.2 单卡 BF16 s5 工程 smoke
+--------------------------
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+CORR_SUMMARY=${ROOT}/corr_pairwise_v3_s200_multiseed_summary/report.json
+CORR_CKPT=${ROOT}/corr_pairwise_v3_s200_seed42/checkpoints/last.pt
+OUT=${ROOT}/c3_pair_feature_s5_seed42_bf16
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  echo 98 > "${OUT}.train.exit_code"
+  exit 0
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/train_pair_feature_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --correspondence_checkpoint "${CORR_CKPT}" \
+  --correspondence_summary_report "${CORR_SUMMARY}" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-7 \
+  --device cuda \
+  --seed 42 \
+  --max_steps 5 \
+  --save_every 5 \
+  --log_every 1 \
+  --lr 5e-5 \
+  --grad_clip 1.0 \
+  --amp_dtype bf16 \
+  --adapter_hidden_dim 96 \
+  --physical_scale 0.5 \
+  --residual_t_min 0.5 \
+  --residual_t_ramp 0.1 \
+  --train_t_min 0.5 \
+  --train_t_max 0.99 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --flow_weight 1.0 \
+  --wrong_stock_weight 0.25 \
+  --correct_gain_weight 0.10 \
+  --correct_gain_margin 0.002 \
+  --correct_wrong_rank_weight 0.10 \
+  --correct_wrong_margin 0.002 \
+  --delta_norm_weight 0.01 \
+  2>&1 | tee "${OUT}.log"
+
+TRAIN_CODE=${PIPESTATUS[0]}
+echo "${TRAIN_CODE}" > "${OUT}.train.exit_code"
+
+AUDIT_CODE=99
+if [ "${TRAIN_CODE}" -eq 0 ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    ar_ss_flow/audit_pair_feature_training_run.py \
+    --train_report "${OUT}/train_report.json" \
+    --checkpoint "${OUT}/checkpoints/last.pt" \
+    --expected_steps 5 \
+    --output "${OUT}/finite_run_audit.json" \
+    --fail_on_error
+  AUDIT_CODE=$?
+fi
+echo "${AUDIT_CODE}" > "${OUT}.audit.exit_code"
+echo "C3 s5 train/audit=${TRAIN_CODE}/${AUDIT_CODE}"
+exit 0
+)
+
+
+12.3 s5 teacher-forced 与实际 corruption smoke
+-----------------------------------------------
+
+注意：正式决策 t 使用五个 active 点；t=0.4 单独用于 inactive exact-stock 审计。
+旧的 0.1,0.3,0.5,0.7,0.9 与 t_min=0.5 冲突，最多只有两个 active 正向点，已停用。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+RUN=${ROOT}/c3_pair_feature_s5_seed42_bf16
+OUT=${RUN}/eval_smoke_actual_corruption
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  echo 98 > "${OUT}.exit_code"
+  exit 0
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/eval_pair_feature_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --correspondence_checkpoint "${ROOT}/corr_pairwise_v3_s200_seed42/checkpoints/last.pt" \
+  --flow_checkpoint "${RUN}/checkpoints/last.pt" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 0-7 \
+  --max_samples 2 \
+  --device cuda \
+  --seeds 42 \
+  --t_values 0.55,0.65,0.75,0.85,0.95 \
+  --inactive_t_probe 0.4 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --decision_profile report_only \
+  --rollout_steps 0 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+echo "C3 s5 teacher-forced smoke exit=${CODE}"
+exit 0
+)
+
+
+12.4 overfit16 三个独立训练 seed，单卡并行 s50
+------------------------------------------------
+
+三个 run 分别使用相同 seed 的已通过 C1 checkpoint。不要从 s5 resume。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+CORR_SUMMARY=${ROOT}/corr_pairwise_v3_s200_multiseed_summary/report.json
+
+for ITEM in 42:1 43:2 44:3; do
+  SEED=${ITEM%%:*}
+  GPU=${ITEM##*:}
+  CORR_CKPT=${ROOT}/corr_pairwise_v3_s200_seed${SEED}/checkpoints/last.pt
+  OUT=${ROOT}/c3_pair_feature_overfit16_s50_seed${SEED}_bf16
+
+  (
+    set -uo pipefail
+    if [ -e "${OUT}" ]; then
+      echo "output already exists: ${OUT}"
+      echo 98 > "${OUT}.train.exit_code"
+      exit 0
+    fi
+
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      ar_ss_flow/train_pair_feature_ss_flow.py \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --correspondence_checkpoint "${CORR_CKPT}" \
+      --correspondence_summary_report "${CORR_SUMMARY}" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices 0-15 \
+      --device cuda \
+      --seed "${SEED}" \
+      --max_steps 50 \
+      --save_every 10 \
+      --log_every 5 \
+      --lr 5e-5 \
+      --grad_clip 1.0 \
+      --amp_dtype bf16 \
+      --adapter_hidden_dim 96 \
+      --physical_scale 0.5 \
+      --residual_t_min 0.5 \
+      --residual_t_ramp 0.1 \
+      --train_t_min 0.5 \
+      --train_t_max 0.99 \
+      --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+      --flow_weight 1.0 \
+      --wrong_stock_weight 0.25 \
+      --correct_gain_weight 0.10 \
+      --correct_gain_margin 0.002 \
+      --correct_wrong_rank_weight 0.10 \
+      --correct_wrong_margin 0.002 \
+      --delta_norm_weight 0.01 \
+      2>&1 | tee "${OUT}.log"
+
+    TRAIN_CODE=${PIPESTATUS[0]}
+    echo "${TRAIN_CODE}" > "${OUT}.train.exit_code"
+    AUDIT_CODE=99
+    if [ "${TRAIN_CODE}" -eq 0 ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        ar_ss_flow/audit_pair_feature_training_run.py \
+        --train_report "${OUT}/train_report.json" \
+        --checkpoint "${OUT}/checkpoints/last.pt" \
+        --expected_steps 50 \
+        --output "${OUT}/finite_run_audit.json" \
+        --fail_on_error
+      AUDIT_CODE=$?
+    fi
+    echo "${AUDIT_CODE}" > "${OUT}.audit.exit_code"
+    echo "seed=${SEED} train/audit=${TRAIN_CODE}/${AUDIT_CODE}"
+    exit 0
+  ) &
+done
+
+wait
+for SEED in 42 43 44; do
+  OUT=${ROOT}/c3_pair_feature_overfit16_s50_seed${SEED}_bf16
+  echo "seed=${SEED} train=$(cat "${OUT}.train.exit_code" 2>/dev/null || echo MISSING) audit=$(cat "${OUT}.audit.exit_code" 2>/dev/null || echo MISSING)"
+done
+exit 0
+)
+
+
+12.5 fresh48 object-disjoint teacher-forced，三训练 seed 并行
+-----------------------------------------------------------
+
+每个 run 内部使用三个固定 noise seed 和五个 active t。`report_only` 保证 FAIL 只写报告，
+不会关闭终端；判定读取 report.json 中的两个独立字段。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+
+for ITEM in 42:1 43:2 44:3; do
+  TRAIN_SEED=${ITEM%%:*}
+  GPU=${ITEM##*:}
+  RUN=${ROOT}/c3_pair_feature_overfit16_s50_seed${TRAIN_SEED}_bf16
+  OUT=${RUN}/eval_fresh48_actual_corruption_noise424344
+
+  (
+    set -uo pipefail
+    if [ -e "${OUT}" ]; then
+      echo "output already exists: ${OUT}"
+      echo 98 > "${OUT}.exit_code"
+      exit 0
+    fi
+
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      ar_ss_flow/eval_pair_feature_ss_flow.py \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --correspondence_checkpoint "${ROOT}/corr_pairwise_v3_s200_seed${TRAIN_SEED}/checkpoints/last.pt" \
+      --flow_checkpoint "${RUN}/checkpoints/last.pt" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices 16-63 \
+      --max_samples 0 \
+      --device cuda \
+      --seeds 42,43,44 \
+      --t_values 0.55,0.65,0.75,0.85,0.95 \
+      --inactive_t_probe 0.4 \
+      --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+      --benchmark_min_object_win 0.55 \
+      --benchmark_min_positive_t 3 \
+      --mechanism_min_object_win 0.65 \
+      --mechanism_min_control_win 0.55 \
+      --mechanism_min_positive_t 4 \
+      --max_corrupt_abs_gain 0.005 \
+      --decision_profile report_only \
+      --rollout_steps 0 \
+      2>&1 | tee "${OUT}.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+    echo "train_seed=${TRAIN_SEED} eval exit=${CODE}"
+    exit 0
+  ) &
+done
+
+wait
+exit 0
+)
+
+
+12.6 三训练 seed 协议校验与双门汇总
+------------------------------------
+
+汇总器会硬检查：sample UID、cache manifest hash、noise seeds、active t、corruption、
+checkpoint step、adapter schema、scale 和所有训练 loss 配置一致。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+OUT=${ROOT}/c3_pair_feature_overfit16_s50_multiseed_summary
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  echo 98 > "${OUT}.exit_code"
+  exit 0
+fi
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/summarize_pair_feature_multiseed.py \
+  --report_dirs \
+    "${ROOT}/c3_pair_feature_overfit16_s50_seed42_bf16/eval_fresh48_actual_corruption_noise424344" \
+    "${ROOT}/c3_pair_feature_overfit16_s50_seed43_bf16/eval_fresh48_actual_corruption_noise424344" \
+    "${ROOT}/c3_pair_feature_overfit16_s50_seed44_bf16/eval_fresh48_actual_corruption_noise424344" \
+  --expected_train_seeds 42,43,44 \
+  --output_dir "${OUT}" \
+  --decision_profile report_only \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+echo "C3 multiseed protocol summary exit=${CODE}"
+exit 0
+)
+
+读取：
+
+  protocol_passed
+  benchmark_relaxed_passed_all_seeds
+  mechanism_strict_passed_all_seeds
+
+`passed=true` 在 report_only 下只表示协议一致，不能代替后两个科学判定。
+
+
+12.7 条件式 30-step decoded rollout
+------------------------------------
+
+只有三个 seed 全部通过 benchmark_relaxed 才执行。自动选择 teacher-forced gain mean 最大的
+训练 seed；即使未满足条件也只打印 SKIP，不退出终端。
+
+(
+set -uo pipefail
+cd /home/zjr/Tracker
+
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+ROOT=/home/zjr/Tracker/ar_ss_flow/outputs
+SUMMARY=${ROOT}/c3_pair_feature_overfit16_s50_multiseed_summary/report.json
+
+READY=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c \
+  "import json; print(int(json.load(open('${SUMMARY}'))['benchmark_relaxed_passed_all_seeds']))" \
+  2>/dev/null || echo 0)
+
+if [ "${READY}" != "1" ]; then
+  echo "SKIP rollout: benchmark_relaxed did not pass all train seeds"
+  exit 0
+fi
+
+BEST_SEED=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c \
+  "import json; d=json.load(open('${SUMMARY}')); print(max(d['seed_reports'], key=lambda x:x['correct_gain_mean'])['train_seed'])")
+RUN=${ROOT}/c3_pair_feature_overfit16_s50_seed${BEST_SEED}_bf16
+OUT=${RUN}/rollout_fresh8_steps30_noise424344
+
+if [ -e "${OUT}" ]; then
+  echo "output already exists: ${OUT}"
+  echo 98 > "${OUT}.exit_code"
+  exit 0
+fi
+
+CUDA_VISIBLE_DEVICES=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+  ar_ss_flow/eval_pair_feature_ss_flow.py \
+  --cache_manifest "${CACHE}/manifest.json" \
+  --correspondence_checkpoint "${ROOT}/corr_pairwise_v3_s200_seed${BEST_SEED}/checkpoints/last.pt" \
+  --flow_checkpoint "${RUN}/checkpoints/last.pt" \
+  --output_dir "${OUT}" \
+  --pretrained Stable-X/trellis-vggt-v0-2 \
+  --indices 16-63 \
+  --max_samples 8 \
+  --device cuda \
+  --seeds 42,43,44 \
+  --t_values 0.55,0.65,0.75,0.85,0.95 \
+  --inactive_t_probe 0.4 \
+  --negative_modes pose_cyclic1,pose_cyclic2,pose_reverse,cross_sample \
+  --decision_profile report_only \
+  --rollout_steps 30 \
+  --rollout_max_samples 8 \
+  --rollout_seeds 42,43,44 \
+  --cfg_strength 7.5 \
+  --guidance_rescale 0.5 \
+  --rescale_t 3.0 \
+  --rollout_min_object_win 0.55 \
+  --rollout_max_precision_drop 0.0001 \
+  --rollout_max_largest_component_drop 0.01 \
+  2>&1 | tee "${OUT}.log"
+
+CODE=${PIPESTATUS[0]}
+echo "${CODE}" > "${OUT}.exit_code"
+echo "C3 rollout best_seed=${BEST_SEED} exit=${CODE}"
+exit 0
+)
+
+最终读取 report.json：
+
+  rollout_benchmark.passed
+  rollout_benchmark.teacher_forced_and_rollout_passed
+  rollout.object_balanced_delta_vs_stock.correct
+
+
+12.8 标准能否放宽，以及允许的结论
+------------------------------------
+
+可以放宽“是否值得继续”的准入门，但不能放宽“pose机制成立”的归因门。
+
+A. 工程门，不可放宽：
+
+  finite checkpoint；
+  optimizer/scaler finite；
+  stock Flow 和 C1 冻结；
+  off/null/inactive-t bit-exact stock；
+  三 seed 协议完全一致；
+  train/eval object 不重叠。
+
+B. ReconViaGen 内部基线收益门，可作为探索性放宽标准：
+
+  三个训练 seed 的 teacher-forced correct gain mean/median > 0；
+  object-balanced correct > stock win rate >= 55%；
+  五个 active t 至少 3 个为正；
+  随后 decoded rollout 的 IoU mean/median > 0、object win >= 55%；
+  precision 平均下降不超过 1e-4；
+  largest-component ratio 平均下降不超过 0.01。
+
+通过 B、但未通过 C 时，只允许写：
+
+  “C3 在注册的 object-disjoint、same-noise 协议上优于 frozen ReconViaGen baseline。”
+
+不能写：
+
+  “模型学会了正确 pose correspondence”或“收益由 Point/Pose 对齐导致”。
+
+C. Pose/correspondence 机制门，不应放宽：
+
+  object-balanced correct > stock win rate >= 65%；
+  correct > constant-pair 与 spatial-permuted-pair；
+  correct > actual cyclic/reverse/cross-object evidence；
+  五个 active t 至少 4 个方向为正；
+  wrong branches 近 stock；
+  三个训练 seed 均通过。
+
+D. 与 TRELLIS / Pixal3D 的外部模型比较：
+
+  不能比较 SS Flow MSE，因为不同模型的 latent、target 和 flow parameterization 不同。
+  必须统一：
+
+    object-disjoint test objects
+    输入 image/view 数和分辨率
+    pose/mask/point 可见信息预算
+    sampling seed 数和 sampling compute
+    canonical normalization
+
+  比较最终输出：
+
+    occupancy IoU / precision / recall
+    Chamfer / F-score（有 mesh/point GT 时）
+    multi-view silhouette/depth reprojection
+    component count / largest-component ratio
+    每对象 win rate及 bootstrap confidence interval
+
+  对 ReconViaGen 的比较最直接：本脚本已在同一 stock condition、同一 noise 下配对。
+  对原 TRELLIS 或 Pixal3D，必须另行生成同一 test manifest 的最终 decoded geometry，
+  再按上述公共指标比较；不得用本脚本的 teacher-forced Flow gain 声称跨模型领先。
+
+停止条件：
+
+  三 seed benchmark_relaxed 失败：停止 C3，不跑 rollout；
+  benchmark_relaxed 通过但 rollout 失败：停止增加训练步数，收益未到最终生成；
+  rollout 优于 stock 但 mechanism_strict 失败：可保留 baseline-improvement 结果，
+    但将模块解释为 learned local regularizer，不宣称 pose-specific；
+  mechanism_strict 与 rollout 都通过：才进入 fresh overfit64/validation 和真实 AR frame 数据。

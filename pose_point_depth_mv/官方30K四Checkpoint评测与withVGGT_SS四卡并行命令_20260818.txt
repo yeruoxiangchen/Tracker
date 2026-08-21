@@ -1,0 +1,593 @@
+重要修订：30K strict 比较必须使用 exact target NPZ（targetlocked_v2）
+======================================================================
+
+旧任务 `slat30k3eval` 在10K的最后CPU聚合门退出。10K的Train64、Dev64 GT和
+Dev48 predicted worker均已完成；checkpoint推理没有崩溃。失败原因是当前worker
+重新从official SLat解码target mesh，而strict ReconViaGen报告绑定的是2026-08-16
+已经冻结的精确target NPZ。稀疏decoder跨运行产生微小拓扑差异：48个对象中41个
+不同；示例只差6个顶点/12个面，但不能在严格配对中当作同一target。
+
+不得放宽结构比较或加浮点容差。新版做法：
+
+  - R/A/B/C全部使用strict R报告记录的同一个target NPZ和SHA256；
+  - 新聚合同时检查target structure与target NPZ SHA256；
+  - 旧v1输出永久保留，不覆盖；
+  - 新输出写入独立`4gpu_targetlocked_v2`；
+  - 10K已完成的Train64/Dev64 GT目录用硬链接复用；
+  - 10K已完成的Native-SS coords逐文件SHA验证后复用；
+  - 只重新计算受target改变影响的Dev48 A/B/C SLat mesh与surface指标；
+  - 30K/60K继续按同一target-lock合同运行；70K不运行。
+
+一、启动/恢复targetlocked_v2（命令启动后立即返回）
+----------------------------------------------------------------------
+
+  cd /home/zjr/Tracker
+  set +e
+
+  ROOT=/data/zjr/proobjaverse_official_slat_train29861_20260817_v1
+  OUT=${ROOT}/eval_legacy_protocol2128_step10k30k60k_seed424344_4gpu_targetlocked_v2
+  MASTER=${ROOT}/logs/eval_legacy_protocol2128_step10k30k60k_4gpu_targetlocked_v2.launcher.log
+  TMUX_LOG=${ROOT}/logs/eval_legacy_protocol2128_step10k30k60k_4gpu_targetlocked_v2.tmux.log
+
+  if tmux has-session -t slat30k_targetv2 2>/dev/null; then
+    echo "slat30k_targetv2 already running"
+  elif test -s "${OUT}/trajectory_summary.json"; then
+    echo "targetlocked_v2 already complete: ${OUT}/trajectory_summary.json"
+  else
+    tmux new-session -d -s slat30k_targetv2 \
+      "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=4,5,6,7 EVAL_GPU_HOLD_MIB=64 exec bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu4567_steps10k30k60k_targetlocked_v2.sh >> ${TMUX_LOG} 2>&1'"
+  fi
+
+  sleep 3
+  tmux has-session -t slat30k_targetv2 2>/dev/null \
+    && echo "slat30k_targetv2 RUNNING" \
+    || echo "session未运行；检查 ${TMUX_LOG} 和 ${MASTER}"
+
+这条命令可用于中断后的恢复；已有完整shard/report会复用，partial predicted worker
+走原生resume。不要删除或移动旧`...4gpu_v1`，因为v2会从其10K worker复用经过
+验证的checkpoint-independent Native-SS coords。
+
+二、监视
+----------------------------------------------------------------------
+
+  tail -F \
+    /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/eval_legacy_protocol2128_step10k30k60k_4gpu_targetlocked_v2.tmux.log \
+    /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/eval_legacy_protocol2128_step10k30k60k_4gpu_targetlocked_v2.launcher.log
+
+  watch -n 20 'date -u; tmux has-session -t slat30k_targetv2 2>/dev/null && echo RUNNING || echo EXITED; find /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/eval_legacy_protocol2128_step10k30k60k_seed424344_4gpu_targetlocked_v2 -name report.json -type f 2>/dev/null | wc -l'
+
+三、停止（需要时）
+----------------------------------------------------------------------
+
+  tmux kill-session -t slat30k_targetv2 2>/dev/null || true
+  sleep 8
+  pgrep -af '[r]un_proobjaverse_slat29861_legacy_eval|[e]valuate_proobjaverse_official_slat_gt_support_cross_protocol|[e]valuate_proobjaverse_official_native_ss_stock_slat' \
+    || echo "30K targetlocked evaluation stopped"
+
+以下旧`slat30k3eval`恢复入口已被targetlocked_v2取代，只保留为历史记录。
+
+最新：三Checkpoint 30K + with-VGGT Dev48-only 停止/恢复（2026-08-18）
+======================================================================
+
+当前正式范围已经修改为：
+
+  30K no-VGGT SLat：10K、30K、60K；不再评测70K。
+  with-VGGT：P11 VSS Dev48 + 10K/15K SLat Dev48 predicted-support。
+  with-VGGT 不跑Train64，也不跑GT-support作为SLat输入。
+  official GT mesh仍作为Chamfer/F-score/Normal的量化参考；这不是GT-support输入。
+
+with-VGGT 15K会严格复用10K已经冻结的：
+
+  stock/native SS coords
+  official target mesh cache
+
+复用通过完整worker report、checkpoint、object UID、seed和逐文件SHA256 fail-closed
+校验，并使用同文件系统硬链接。15K的SLat三分支、Mesh解码和表面指标仍重新计算，
+不复用checkpoint相关结果。
+
+一、停止30K任务（当前可立即执行）
+----------------------------------------------------------------------
+
+当前旧`slat30k4eval`正在写原`4gpu_v1`输出；新`slat30k4567eval`只是在等待
+GPU4。两者都先停止，避免重复任务：
+
+  cd /home/zjr/Tracker
+  set +e
+
+  for SESSION in slat30k4567eval slat30k4eval; do
+    if tmux has-session -t "${SESSION}" 2>/dev/null; then
+      tmux kill-session -t "${SESSION}"
+    fi
+  done
+
+  sleep 8
+
+  pgrep -af '[r]un_proobjaverse_slat29861_legacy_eval|[e]valuate_proobjaverse_official_slat_gt_support_cross_protocol|[e]valuate_proobjaverse_official_native_ss_stock_slat' \
+    || echo "30K evaluation processes stopped"
+
+若pgrep仍列出30K评测进程，不要启动第二份；只按输出的精确PID检查/终止。
+已有完整report不会删除；中断的GT shard/aggregate在恢复时会重命名为
+`.interrupted_UTC`保留证据后重跑。predicted-support shard原生resume。
+
+二、恢复30K，只跑10K/30K/60K
+----------------------------------------------------------------------
+
+这条命令复用已经运行数小时的原`...4gpu_v1`输出，不从头重跑10K：
+
+  cd /home/zjr/Tracker
+  set +e
+
+  ROOT=/data/zjr/proobjaverse_official_slat_train29861_20260817_v1
+  LOG=${ROOT}/logs/eval_legacy_protocol2128_step10k30k60k70k_4gpu_v1.launcher.log
+
+  tmux new-session -d -s slat30k3eval \
+    "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=4,5,6,7 EVAL_GPU_HOLD_MIB=64 exec bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu4567_steps10k30k60k_resume.sh >> ${LOG} 2>&1'"
+
+  sleep 3
+  tmux has-session -t slat30k3eval \
+    && echo "slat30k3eval RUNNING" \
+    || echo "slat30k3eval EXITED; inspect ${LOG}"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/eval_legacy_protocol2128_step10k30k60k70k_4gpu_v1.launcher.log
+
+三、with-VGGT何时可以无损停止
+----------------------------------------------------------------------
+
+当前P11不是逐对象落盘，必须等下面的aggregate存在后再停止：
+
+  test -s /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/dev48_VSS_step2000_seed424344_2gpu03_hold_v2/aggregate_v1/report.json \
+    && echo "P11 SAFE PAUSE POINT REACHED" \
+    || echo "P11仍在运行；现在停止会重跑整个未完成shard"
+
+达到安全点后停止：
+
+  cd /home/zjr/Tracker
+  set +e
+
+  test -s /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/dev48_VSS_step2000_seed424344_2gpu03_hold_v2/aggregate_v1/report.json \
+    || { echo "P11 aggregate尚未完成，不停止"; exit 90; }
+
+  tmux kill-session -t vggtss03evalv2 2>/dev/null || true
+  sleep 8
+
+  pgrep -af '[r]un_source_posttrain_2gpu03|[o]fficial_ss_with_vggt_perf_v1.evaluate|[e]valuate_ss_slat' \
+    || echo "with-VGGT evaluation stopped at a resumable boundary"
+
+四、恢复with-VGGT Dev48-only合理化版本
+----------------------------------------------------------------------
+
+P11 aggregate会通过identity校验后直接复用；P13 cache builder和P15 endpoint均支持
+已有结果恢复。新代码不会启动Train64：
+
+  cd /home/zjr/Tracker
+  set +e
+
+  SS=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  LOG=${SS}/logs/P10_P17_posttrain_eval_2gpu03_hold_v2.master.log
+
+  test -s "${SS}/dev48_VSS_step2000_seed424344_2gpu03_hold_v2/aggregate_v1/report.json" \
+    || { echo "P11 aggregate缺失，不能无损恢复"; exit 91; }
+
+  tmux new-session -d -s vggtss03evalv2 \
+    "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=0,3 EVAL_GPU_HOLD_MIB=64 exec bash official_ss_with_vggt_perf_v1/run_source_posttrain_2gpu03.sh >> ${LOG} 2>&1'"
+
+  sleep 3
+  tmux has-session -t vggtss03evalv2 \
+    && echo "vggtss03evalv2 DEV48-ONLY RUNNING" \
+    || echo "vggtss03evalv2 EXITED; inspect ${LOG}"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_2gpu03_hold_v2.master.log
+
+
+以下内容是旧四Checkpoint/Train64方案的历史说明，不再作为当前启动入口。
+
+官方 30K no-VGGT 四 checkpoint 评测 + with-VGGT SS 四卡续跑
+======================================================================
+
+最新：改用物理 GPU 0、3，并在全部 worker/wave 之间持续占位（2026-08-18）
+======================================================================
+
+当前 P10 已经完成并冻结：
+
+  cfg_strength = 5.0
+  condition_scale_policy = learned_projection_only
+  passed = true
+
+当前停顿只是旧四卡脚本在 P11 前等待 GPU 0/1/2/3 同时空闲。不要重跑 P10，
+也不要复用旧四卡 P11 输出目录。新版会验证并复用现有 calibration，然后用：
+
+  GPU 0: Dev[16:40)
+  GPU 3: Dev[40:64)
+
+完成 P11。P13 和 P15 同样按两卡动态分片，模型、seed、CFG、object set、noise、
+指标和聚合数学均不改变。
+
+新版还会为 GPU0、GPU3 各启动一个 64 MiB CUDA holder。holder 从整条队列开始
+一直活到所有评测结束，因此某个 worker 提前完成、CPU aggregate、切换 wave 或从
+with-VGGT 测试切换到 30K SLat 测试时，两张卡都不会在 nvidia-smi 中变成空卡。
+holder 只是低显存可见占位，不是驱动级独占锁；它不参与模型 forward，也不改变结果。
+
+一、先停止当前只是在等待四卡的旧 tmux
+----------------------------------------------------------------------
+
+  cd /home/zjr/Tracker
+  set -euo pipefail
+
+  if tmux has-session -t vggtss4 2>/dev/null; then
+    tmux kill-session -t vggtss4
+  fi
+
+  sleep 3
+
+  if pgrep -af '[r]un_source_after_p6_4gpu_gb8.sh|[r]un_source_posttrain_p10_p17_eval_pipeline.sh'; then
+    echo "ERROR: 旧P10--P17进程仍在；先按上面输出的精确PID处理，不要启动第二份。" >&2
+    exit 90
+  fi
+
+  echo "OLD FOUR-GPU WAIT PIPELINE STOPPED"
+
+这只终止旧的等待/评测流水线，不删除 P10 calibration、SS checkpoint、cache 或日志。
+旧状态文件可能记录一次被人工终止的 FAIL，这是运行证据，不影响新版独立身份。
+
+二、纠正：两条 tmux、六张物理卡并行运行
+----------------------------------------------------------------------
+
+正式拓扑是：
+
+  with-VGGT P11--P17：GPU 0、3
+  30K SLat 10K/30K/60K/70K：GPU 4、5、6、7
+
+旧`vggtss03queue`把二者错误串行在GPU0/3，必须先停止。它已启动的P11 v1 partial
+永久保留，不删除；新运行使用`2gpu03_hold_v2`，不会覆盖现场。
+
+  set +e
+  (
+    set -euo pipefail
+    cd /home/zjr/Tracker
+
+    if tmux has-session -t vggtss03queue 2>/dev/null; then
+      tmux kill-session -t vggtss03queue
+    fi
+    sleep 5
+
+    if pgrep -af '[r]un_source_gpu03_posttrain_then_slat30k_eval.sh|[o]fficial_ss_with_vggt_perf_v1.evaluate.*2gpu03_hold_v1|[h]old_eval_gpu.py.*gpu03_posttrain_then_slat30k'; then
+      echo "ERROR: 旧串行队列仍有残留进程；按上方精确PID处理后再启动。" >&2
+      exit 90
+    fi
+
+    SS=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+    SLAT=/data/zjr/proobjaverse_official_slat_train29861_20260817_v1
+    SS_LOG=${SS}/logs/P10_P17_posttrain_eval_2gpu03_hold_v2.master.log
+    SLAT_LOG=${SLAT}/logs/eval_legacy_protocol2128_step10k30k60k70k_4gpu4567_hold_v1.launcher.log
+
+    test -s "${SS}/dev64_VSS_step2000_4gpu_gb8_calibrate0_16_seed424344_v1/calibration.json"
+    test ! -e "${SS}/dev48_VSS_step2000_seed424344_2gpu03_hold_v2"
+    test ! -e "${SS_LOG}"
+    test ! -e "${SLAT}/eval_legacy_protocol2128_step10k30k60k70k_seed424344_4gpu4567_hold_v1"
+    test ! -e "${SLAT_LOG}"
+    ! tmux has-session -t vggtss03evalv2 2>/dev/null
+    ! tmux has-session -t slat30k4567eval 2>/dev/null
+
+    tmux new-session -d -s vggtss03evalv2 \
+      "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=0,3 EVAL_GPU_HOLD_MIB=64 exec bash official_ss_with_vggt_perf_v1/run_source_posttrain_2gpu03.sh >> ${SS_LOG} 2>&1'"
+
+    tmux new-session -d -s slat30k4567eval \
+      "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=4,5,6,7 EVAL_GPU_HOLD_MIB=64 exec bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu4567.sh >> ${SLAT_LOG} 2>&1'"
+
+    sleep 3
+    tmux has-session -t vggtss03evalv2
+    tmux has-session -t slat30k4567eval
+    echo "PARALLEL SIX-GPU EVALUATION RUNNING; launch command returns now."
+  )
+  LAUNCH_RC=$?
+  echo "LAUNCH_RC=${LAUNCH_RC} (0=两条后台任务均已启动；当前终端保持打开)"
+  echo "current terminal remains open"
+
+不要在启动段末尾自动接`tail -F`；`tail -F`会持续占用当前终端。需要监视时再单独
+执行下一节的命令。不要在交互shell全局设置`set -e`，严格检查只放在上面的子shell中。
+
+三、分别监视两条并行任务
+----------------------------------------------------------------------
+
+with-VGGT（GPU0/3）：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_2gpu03_hold_v2.master.log
+
+with-VGGT阶段：
+
+  watch -n 20 'date -u; cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_2gpu03_hold_v2.status 2>/dev/null || true'
+
+30K SLat（GPU4/5/6/7）：
+
+  tail -F /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/eval_legacy_protocol2128_step10k30k60k70k_4gpu4567_hold_v1.launcher.log
+
+六卡与holder：
+
+  watch -n 5 'date -u; nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits; echo; pgrep -af "hold_eval_gpu.py.*physical-gpu (0|3|4|5|6|7)" || true'
+
+当前 with-VGGT worker：
+
+  watch -n 20 'D=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/dev48_VSS_step2000_seed424344_2gpu03_hold_v2/logs; date -u; find "$D" -maxdepth 1 -type f -name "*.log" -print -exec tail -n 2 {} \; 2>/dev/null || true'
+
+30K worker：
+
+  watch -n 20 'D=/data/zjr/proobjaverse_official_slat_train29861_20260817_v1/eval_legacy_protocol2128_step10k30k60k70k_seed424344_4gpu4567_hold_v1/logs; date -u; find "$D" -maxdepth 1 -type f -name "*.log" -print -exec tail -n 2 {} \; 2>/dev/null || true'
+
+终态：
+
+  cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_2gpu03_hold_v2.exit_code
+  cat /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/eval_legacy_protocol2128_step10k30k60k70k_seed424344_4gpu4567_hold_v1/trajectory_summary.json
+
+四、单项入口
+----------------------------------------------------------------------
+
+只从现有 P10 继续当前 with-VGGT P11--P17：
+
+  EVAL_GPUS=0,3 EVAL_GPU_HOLD_MIB=64 \
+    bash official_ss_with_vggt_perf_v1/run_source_posttrain_2gpu03.sh
+
+只运行 30K SLat 四 checkpoint：
+
+  EVAL_GPUS=4,5,6,7 EVAL_GPU_HOLD_MIB=64 \
+    bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu4567.sh
+
+两项各自持有自己的GPU直到各自整体结束，不需要串行交接。
+
+
+以下“四卡并行”内容保留为旧运行方案/历史说明；当前 GPU 占用现场不要再执行。
+
+最简启动（两条任务各占四卡，可并行）
+----------------------------------------------------------------------
+
+前提：P6_REPAIR_RC=0；F39 checkpoint 已传入本文约定的 CKPT_ROOT。SHA 证据可为
+统一的 `SHA256SUMS.txt`（当前正式回传形式），也兼容逐文件 `.pt.sha256`。
+
+终端A：GPU 4/5/6/7 评测 10K、30K、60K、70K
+
+  set +e
+  cd /home/zjr/Tracker
+
+  ROOT=/data/zjr/proobjaverse_official_slat_train29861_20260817_v1
+  LOG_DIR="${ROOT}/logs"
+  LAUNCH_LOG="${LOG_DIR}/eval_legacy_protocol2128_step10k30k60k70k_4gpu_v1.launcher.log"
+  RUNNER=pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu.sh
+
+  mkdir -p "${LOG_DIR}"
+
+  tmux new-session -d -s slat30k4eval \
+    "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=4,5,6,7 exec bash ${RUNNER} >> ${LAUNCH_LOG} 2>&1'"
+
+  sleep 3
+  tmux has-session -t slat30k4eval \
+    && echo "slat30k4eval RUNNING" \
+    || echo "slat30k4eval EXITED; inspect ${LAUNCH_LOG}"
+
+  tail -n 50 "${LAUNCH_LOG}"
+
+终端B：GPU 0/1/2/3 从已修复的 P6 cache 继续 P7 -> SS 训练 -> P10--P17
+
+  cd /home/zjr/Tracker
+
+  tmux new-session -d -s vggtss4 \
+    "bash -lc 'cd /home/zjr/Tracker && PIPELINE_GPUS=0,1,2,3 exec bash official_ss_with_vggt_perf_v1/run_source_after_p6_4gpu_gb8.sh >> /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P7_P17_4gpu_gb8_v1.master.log 2>&1'"
+
+这两条命令不会互相抢卡：
+
+- with-VGGT SS：GPU 0--3；
+- 30K checkpoint 评测：GPU 4--7。
+
+
+一、30K checkpoint 文件合同
+======================================================================
+
+默认目录：
+
+  /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/
+    F39_fresh_step150000_seed42_8gpu_strict_fix1_warmup3000_v1/checkpoints/
+
+当前正式回传目录必须包含：
+
+  step_010000.pt
+  step_030000.pt
+  step_060000.pt
+  step_070000.pt
+  SHA256SUMS.txt
+
+脚本也兼容旧式逐文件 `step_xxxxxx.pt.sha256`；若两种形式同时存在，优先采用
+逐文件 sidecar。两种形式都必须给出严格的64位小写十六进制 SHA256。
+
+评测脚本按 10K -> 30K -> 60K -> 70K 顺序工作：
+
+1. 当前 step 的 `.pt` 或 SHA 证据未到时只轮询等待；
+2. 文件与 SHA 证据到齐后先重新计算 checkpoint SHA256；
+3. SHA 匹配后才启动该 step 的 GPU worker；
+4. 因此 10K 可以边测，后面的 checkpoint 继续并行下载；
+5. 不会读取仍在传输中的半文件。
+
+如果实际下载到了另一目录，只修改变量，不改脚本：
+
+  CKPT_ROOT=/你的/checkpoints目录 EVAL_GPUS=4,5,6,7 \
+    bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu.sh
+
+
+二、30K 四 checkpoint 实际测什么
+======================================================================
+
+每个 checkpoint 有三次四卡 GPU wave，随后一次 CPU 聚合：
+
+1. `train64_gt`
+
+   - official GT support；
+   - no-VGGT Stock SLat vs 30K trained no-VGGT SLat；
+   - 4 个 shard，每卡 16 个对象；
+   - 回答旧 Train64 上的拟合兼容表现。
+
+2. `legacy_dev64_gt_training_overlap`
+
+   - official GT support；
+   - no-VGGT Stock SLat vs 30K trained no-VGGT SLat；
+   - 4 个 shard，每卡 16 个对象。
+
+3. `legacy_dev48_predicted_training_overlap`
+
+   - official no-VGGT Native-SS step2000 EMA/CFG5 产生 predicted support；
+   - A = posed-DINO interface -> Stock SS -> no-VGGT Stock SLat；
+   - B = posed-DINO -> official Native-SS step2000 -> no-VGGT Stock SLat；
+   - C = posed-DINO -> official Native-SS step2000 -> 当前 30K SLat checkpoint；
+   - 4 个 shard，每卡 12 个对象；
+   - 保留 A/B/C、B-A、C-B、C-A。
+
+4. `legacy_dev48_vs_strict_reconviagen_training_overlap`
+
+   - 不重跑 strict ReconViaGen GPU inference；
+   - 直接复用已经完成的 5 份 strict R worker report；
+   - R = VGGT -> original Stock SS -> original Stock SLat -> Stock decoder；
+   - CPU 配对计算 C-R，并同时保留 A-R、B-R、B-A、C-B；
+   - 这是“算上 SS 的完整端点比较”。
+
+所有 SLat baseline 都是当前冻结的 no-VGGT Stock SLat floor；不会误用
+with-VGGT V0。
+
+
+三、非常重要的科学边界
+======================================================================
+
+旧 2K protocol 的 Train64 和旧 Dev64 已逐 UID 检查：它们全部属于 30K
+checkpoint 的 29,861 个训练 UID。
+
+因此本文立即复用的结果只能写成：
+
+  legacy compatibility / checkpoint-training-overlap diagnosis
+
+不能写成：
+
+  30K held-out Dev generalization
+
+脚本不会静默放宽 protocol 检查。每个 worker 都必须同时通过：
+
+- checkpoint protocol 与旧 cache protocol 明确为 different；
+- checkpoint 内冻结的 training object UID 列表存在且合法；
+- 当前 shard 的每个 UID 都在 checkpoint training UID 中；
+- `expected_checkpoint_training_membership=all_training`；
+- 报告内写入 overlap count/rate 和 scope guard。
+
+若要得到正式 30K 泛化结论，后续必须使用冻结 30K protocol 自己的真正 Dev64
+重新构建评测输入，不能把本文旧 Dev64 政名。
+
+
+四、30K 评测监视
+======================================================================
+
+看主日志：
+
+  tail -F /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/logs/eval_legacy_protocol2128_step10k30k60k70k_4gpu_v1.launcher.log
+
+看当前所有 worker 日志末尾：
+
+  watch -n 20 'date -u; D=/data/zjr/proobjaverse_official_slat_train29861_20260817_v1/eval_legacy_protocol2128_step10k30k60k70k_seed424344_4gpu_v1/logs; if [ ! -d "$D" ]; then echo "worker日志尚未创建（检查launcher日志）"; else find "$D" -maxdepth 1 -type f -name "*.log" -print -exec tail -n 2 {} \;; fi'
+
+看 GPU 4--7：
+
+  watch -n 5 'nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits | sed -n "5,8p"'
+
+看 tmux 是否仍在：
+
+  tmux has-session -t slat30k4eval && echo RUNNING || echo FINISHED
+
+最终总表：
+
+  /data/zjr/proobjaverse_official_slat_train29861_20260817_v1/
+    eval_legacy_protocol2128_step10k30k60k70k_seed424344_4gpu_v1/
+      trajectory_summary.json
+
+完整时应有：4 checkpoint × 4 aggregate = 16 个聚合报告。
+
+
+五、P6_REPAIR 之后的 with-VGGT SS 四卡合同
+======================================================================
+
+新路线不会调用旧 8 卡输出身份：
+
+  VSS_with_vggt_train2000_step2000_seed42_4gpu_gb8_v1
+
+训练合同：
+
+- world_size = 4；
+- per-rank batch = 1；
+- grad_accum = 2；
+- global effective batch = 8；
+- fresh Stock-equivalent VSS0 initialization；
+- max step = 2000；
+- 保存 step500/1000/1500/2000；
+- 架构、loss、LR、EMA、view sampling、bf16、gradient checkpointing 不变。
+
+流水线顺序：
+
+  P7 cache identity validation
+  -> P8 four-GPU/global-batch-8 fresh SS training
+  -> P10 Dev[0:16] CFG calibration
+  -> P11 disjoint Dev[16:64] VSS direct evaluation（4×12）
+  -> P13 with-VGGT SLat Dev sidecar validation/build
+  -> P15 with-VGGT SS2K + SLat10K/15K Train64/Dev48 endpoint evaluation
+  -> P17 summary
+
+P10 选出的 CFG 会冻结给 P11 和后续端点评测；P11 不重新挑 CFG。
+
+
+六、with-VGGT SS 四卡监视
+======================================================================
+
+主日志：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P7_P17_4gpu_gb8_v1.master.log
+
+阶段状态：
+
+  watch -n 20 'date -u; cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P7_P17_4gpu_gb8_v1.status 2>/dev/null || true; cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_4gpu_gb8_v1.status 2>/dev/null || true'
+
+训练日志：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/VSS_with_vggt_train2000_step2000_seed42_4gpu_gb8_v1.log
+
+GPU 0--3：
+
+  watch -n 5 'nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits | sed -n "1,4p"'
+
+最终 summary：
+
+  /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/
+    P10_P17_posttrain_eval_4gpu_gb8_v1_summary.json
+
+
+七、启动前只做一次快速检查
+======================================================================
+
+  cd /home/zjr/Tracker
+  set -euo pipefail
+
+  bash -n \
+    pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu.sh \
+    official_ss_with_vggt_perf_v1/run_train_4gpu_gb8.sh \
+    official_ss_with_vggt_perf_v1/run_eval_dev48_4gpu.sh \
+    official_ss_with_vggt_perf_v1/run_source_after_p6_4gpu_gb8.sh \
+    official_ss_with_vggt_perf_v1/run_source_posttrain_p10_p17_eval_pipeline.sh
+
+  test ! -e /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/VSS_with_vggt_train2000_step2000_seed42_4gpu_gb8_v1
+
+  echo "FOUR-GPU PARALLEL LAUNCH PREFLIGHT PASS"
+
+
+八、不要做的事情
+======================================================================
+
+- 不要把 30K 旧 Dev64 结果写成 held-out/generalization；
+- 不要删除 protocol mismatch 或 UID membership guard；
+- 不要把 4 卡 SS fresh 输出写入旧 8 卡目录；
+- 不要把 grad_accum 改回 1，否则 global batch 会从 8 变成 4；
+- 不要让两个任务使用同一组 GPU；
+- 不要删除 partial predicted-support worker，它们支持同身份 resume；
+- GT-support partial shard不可 resume，遇到中断应保留证据并换新的 OUTPUT_ROOT 版本。

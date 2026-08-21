@@ -1,0 +1,719 @@
+# Mixed10k：Omni OBJ 坐标修复后的回归、pilot 与正式重启命令
+# 2026-07-29
+#
+# 已知失败现场（只读保留，不续跑）：
+#   /tmp/mixed10k_both16_cyclescuda_v3
+#   /data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v3
+#
+# 新版本关键变化：
+# - Blender 3 OBJ importer 显式冻结 axis_forward=-Z / axis_up=Y；
+# - OBJ 与 GLB 都在 importer 已转换的 render frame 中归一化，不再二次旋转 OBJ；
+# - trimesh/Pixal3D 与 Blender AABB 在任何 Cycles 帧渲染之前比较；
+# - 不渲染图像的 source-frame audit 成为正式 smoke 前硬门；
+# - 所有修复后输出使用 v4 新目录，不复用 v3 marker。
+#
+# GPU 预算：
+#   Direct-SLAT train/eval + Mixed10k render worker <= 4 GPUs。
+#   若 Direct-SLAT S6 占2卡，数据渲染最多再开2卡。
+
+
+###############################################################################
+# D0. 停止旧 v3 Omni pilot；不删除任何输出
+###############################################################################
+
+cd /home/zjr/Tracker
+
+systemctl --user stop \
+  tracker-mixed10k-omnipilot256-w0-of2-v3.service \
+  tracker-mixed10k-omnipilot256-w1-of2-v3.service \
+  2>/dev/null || true
+
+systemctl --user is-active \
+  tracker-mixed10k-omnipilot256-w0-of2-v3.service \
+  tracker-mixed10k-omnipilot256-w1-of2-v3.service \
+  2>/dev/null || true
+
+echo "保留失败现场:"
+echo "  /tmp/mixed10k_both16_cyclescuda_v3"
+echo "  /data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v3"
+echo "current terminal remains open"
+
+
+###############################################################################
+# D1. CPU 静态检查与单元回归
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+D1_RC=0
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/dataset_tools/blender_pbr_render_multiview.py \
+  pose_point_depth_mv/dataset_tools/build_objaverse_multiview_sparse_data.py \
+  pose_point_depth_mv/dataset_tools/audit_mixed_mesh_blender_frames.py \
+  pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+  || D1_RC=$?
+
+if [ "${D1_RC}" -eq 0 ]; then
+  "${PY}" -m unittest \
+    pose_point_depth_mv.test_mixed_multiview_render_guards \
+    pose_point_depth_mv.dataset_tools.test_prepare_mixed_mesh10k_sources \
+    || D1_RC=$?
+fi
+
+echo "D1_RC=${D1_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# D2. 不渲染图像的真实 Blender source-frame 硬门（CPU）
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE_FREEZE=/data/zjr/dataset10k_20260726/source_freeze_obj11546_omni215_v2
+BLENDER=/tmp/blender-3.0.1-linux-x64/blender
+FRAME_AUDIT_DIR=/data/zjr/dataset10k_20260726/audits/blender_frame_known4_v4
+FRAME_AUDIT=${FRAME_AUDIT_DIR}/report.json
+KNOWN_UIDS=objaverse_00b828afd5cf489eb816ec53f569c11a,omni_anise_013,omni_anise_025,omni_antique_017
+D2_RC=97
+
+if [ -s "${FRAME_AUDIT}" ]; then
+  echo "reuse immutable source-frame audit: ${FRAME_AUDIT}"
+  "${PY}" -c \
+    'import hashlib,json,sys
+r=json.load(open(sys.argv[1]))
+current=hashlib.sha256(open(sys.argv[2],"rb").read()).hexdigest()
+assert r["passed"] is True and r["selected_count"]==4
+assert r["blender_script_sha256"]==current
+assert all(x["bounds"]["normalized_scene_bounds_max_abs"]<=0.001 for x in r["records"])
+print(json.dumps({
+  "passed":True,
+  "records":[{
+    "uid":x["uid"],
+    "suffix":x["bounds"]["source_suffix"],
+    "max_abs":x["bounds"]["normalized_scene_bounds_max_abs"]
+  } for x in r["records"]]
+},indent=2))' \
+    "${FRAME_AUDIT}" \
+    pose_point_depth_mv/dataset_tools/blender_pbr_render_multiview.py
+  D2_RC=$?
+elif [ -e "${FRAME_AUDIT_DIR}" ]; then
+  echo "D2 blocked: partial immutable audit exists: ${FRAME_AUDIT_DIR}"
+  D2_RC=98
+else
+  "${PY}" -u -m \
+    pose_point_depth_mv.dataset_tools.audit_mixed_mesh_blender_frames \
+      --source_plan "${SOURCE_FREEZE}/build_plan.json" \
+      --sources objaverse,omni \
+      --uids "${KNOWN_UIDS}" \
+      --blender_path "${BLENDER}" \
+      --canonical_margin 0.9 \
+      --bounds_tolerance 0.001 \
+      --output "${FRAME_AUDIT}"
+  D2_RC=$?
+fi
+
+echo "D2_RC=${D2_RC}"
+echo "report=${FRAME_AUDIT}"
+echo "current terminal remains open"
+
+# 2026-07-29 开发机实测：
+#   Objaverse GLB max_abs = 1.0475516e-5
+#   三个 Omni OBJ max_abs = 2.9802322e-8
+#   四个对象均 < 0.001。
+
+
+###############################################################################
+# D3. 修复后两来源 4-object/源实际图像 smoke（单卡、前台）
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE_FREEZE=/data/zjr/dataset10k_20260726/source_freeze_obj11546_omni215_v2
+FRAME_AUDIT=/data/zjr/dataset10k_20260726/audits/blender_frame_known4_v4/report.json
+BLENDER=/tmp/blender-3.0.1-linux-x64/blender
+SMOKE_GPU=${SMOKE_GPU:-3}
+MODEL_GPU_COUNT=${MODEL_GPU_COUNT:-0}
+MAX_PROJECT_GPUS=4
+SMOKE4_ROOT=/tmp/mixed10k_both4_cyclescuda_v4
+SMOKE4_PREVIEW=/tmp/mixed10k_both4_cyclescuda_v4_preview
+SMOKE4_LOG=/tmp/mixed10k_both4_cyclescuda_v4_logs
+D3_RC=97
+
+if [ ! -s "${FRAME_AUDIT}" ]; then
+  echo "D3 blocked: run D2 first"
+  D3_RC=96
+elif [ $((MODEL_GPU_COUNT + 1)) -gt "${MAX_PROJECT_GPUS}" ]; then
+  echo "D3 blocked: GPU budget model=${MODEL_GPU_COUNT} render=1 max=${MAX_PROJECT_GPUS}"
+  D3_RC=95
+else
+  CUDA_VISIBLE_DEVICES="${SMOKE_GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  PYOPENGL_PLATFORM=egl \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u \
+    pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+      --source_plan "${SOURCE_FREEZE}/build_plan.json" \
+      --render_root "${SMOKE4_ROOT}" \
+      --preview_root "${SMOKE4_PREVIEW}" \
+      --log_root "${SMOKE4_LOG}" \
+      --worker_index 0 \
+      --num_workers 16 \
+      --sources objaverse,omni \
+      --python "${PY}" \
+      --blender_path "${BLENDER}" \
+      --blender_engine CYCLES \
+      --blender_samples 16 \
+      --blender_bounds_tolerance 0.001 \
+      --blender_cycles_device CUDA \
+      --seed 20260729 \
+      --sequences_per_object 2 \
+      --candidate_views 24 \
+      --selected_views 8 \
+      --vis_count_per_shard 4 \
+      --max_objects_per_shard 4
+  D3_RC=$?
+fi
+
+echo "D3_RC=${D3_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# D4. 两来源 4-object smoke 硬门
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SMOKE4_ROOT=/tmp/mixed10k_both4_cyclescuda_v4
+
+"${PY}" -c \
+  'import json,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+summary={}
+for source in ("objaverse","omni"):
+    shard=root/source/"shard_000"
+    marker=shard/"_WORKER_COMPLETE.json"
+    manifest=shard/"manifest.json"
+    assert marker.is_file(), f"missing marker: {marker}"
+    r=json.load(open(manifest))
+    assert len(r["samples"])+len(r["failures"])==8
+    assert len(r["samples"])>0, f"{source}: no accepted samples"
+    assert all(
+        float(row["renderer_audit"]["normalized_scene_bounds_max_abs"])<=0.001
+        for row in r["samples"]
+    )
+    assert not any(
+        row.get("failure_class")=="renderer_failed"
+        for row in r["failures"]
+    )
+    summary[source]={
+        "accepted":len(r["samples"]),
+        "failed":len(r["failures"]),
+        "failure_counts":r["failure_counts"],
+        "bounds_max":max(
+            float(row["renderer_audit"]["normalized_scene_bounds_max_abs"])
+            for row in r["samples"]
+        ),
+    }
+print(json.dumps({"passed":True,"sources":summary},indent=2,ensure_ascii=False))' \
+  "${SMOKE4_ROOT}"
+D4_RC=$?
+
+echo "D4_RC=${D4_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# D5. 两来源 16-object/源回归（单卡、后台、新 v4 目录）
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE_FREEZE=/data/zjr/dataset10k_20260726/source_freeze_obj11546_omni215_v2
+BLENDER=/tmp/blender-3.0.1-linux-x64/blender
+SMOKE_GPU=${SMOKE_GPU:-3}
+MODEL_GPU_COUNT=${MODEL_GPU_COUNT:-0}
+MAX_PROJECT_GPUS=4
+SMOKE16_ROOT=/data/zjr/dataset10k_20260726/smoke_both16_cyclescuda_v4
+SMOKE16_PREVIEW=/home/zjr/Tracker/pixal3d_multiview/outputs/data_previews/both16_cyclescuda_v4
+SMOKE16_LOG=/data/zjr/dataset10k_20260726/logs/smoke_both16_cyclescuda_v4
+UNIT=tracker-mixed10k-both16-w0-v4
+
+if [ "${APPROVE_MIXED10K_BOTH16_V4:-0}" != 1 ]; then
+  echo "D5 not started; after D4 pass run:"
+  echo "  export APPROVE_MIXED10K_BOTH16_V4=1"
+elif [ $((MODEL_GPU_COUNT + 1)) -gt "${MAX_PROJECT_GPUS}" ]; then
+  echo "D5 blocked: GPU budget model=${MODEL_GPU_COUNT} render=1 max=${MAX_PROJECT_GPUS}"
+elif systemctl --user is-active --quiet "${UNIT}"; then
+  echo "already active: ${UNIT}"
+else
+  systemctl --user reset-failed "${UNIT}" >/dev/null 2>&1 || true
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${SMOKE_GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      PYOPENGL_PLATFORM=egl \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u \
+      pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+        --source_plan "${SOURCE_FREEZE}/build_plan.json" \
+        --render_root "${SMOKE16_ROOT}" \
+        --preview_root "${SMOKE16_PREVIEW}" \
+        --log_root "${SMOKE16_LOG}" \
+        --worker_index 0 \
+        --num_workers 16 \
+        --sources objaverse,omni \
+        --python "${PY}" \
+        --blender_path "${BLENDER}" \
+        --blender_engine CYCLES \
+        --blender_samples 16 \
+        --blender_bounds_tolerance 0.001 \
+        --blender_cycles_device CUDA \
+        --seed 20260729 \
+        --sequences_per_object 2 \
+        --candidate_views 24 \
+        --selected_views 8 \
+        --vis_count_per_shard 4 \
+        --max_objects_per_shard 16
+  echo "unit=${UNIT} rc=$?"
+fi
+
+echo "current terminal remains open"
+
+
+###############################################################################
+# D6. 监视两来源 smoke
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+watch -n 20 \
+  "${PY} -u pose_point_depth_mv/dataset_tools/monitor_mixed_render_smoke.py \
+    --render_root /data/zjr/dataset10k_20260726/smoke_both16_cyclescuda_v4 \
+    --log_root /data/zjr/dataset10k_20260726/logs/smoke_both16_cyclescuda_v4 \
+    --unit tracker-mixed10k-both16-w0-v4.service \
+    --sources objaverse,omni \
+    --expected_tasks_per_source 32 \
+    --gpu_index 3"
+
+
+###############################################################################
+# D7. 两来源 16-object smoke 硬门
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SMOKE16_ROOT=/data/zjr/dataset10k_20260726/smoke_both16_cyclescuda_v4
+
+"${PY}" -c \
+  'import json,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+summary={}
+for source in ("objaverse","omni"):
+    shard=root/source/"shard_000"
+    assert (shard/"_WORKER_COMPLETE.json").is_file()
+    r=json.load(open(shard/"manifest.json"))
+    assert len(r["samples"])+len(r["failures"])==32
+    assert len(r["samples"])>0
+    assert not any(x.get("failure_class")=="renderer_failed" for x in r["failures"])
+    assert all(
+        float(x["renderer_audit"]["normalized_scene_bounds_max_abs"])<=0.001
+        for x in r["samples"]
+    )
+    summary[source]={
+      "accepted":len(r["samples"]),
+      "failed":len(r["failures"]),
+      "failure_counts":r["failure_counts"],
+    }
+print(json.dumps({"passed":True,"sources":summary},indent=2,ensure_ascii=False))' \
+  "${SMOKE16_ROOT}"
+D7_RC=$?
+
+echo "D7_RC=${D7_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# D8. Omni 256-object pilot v4（D7通过后，最多2卡与Direct-SLAT S6并行）
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE_FREEZE=/data/zjr/dataset10k_20260726/source_freeze_obj11546_omni215_v2
+BLENDER=/tmp/blender-3.0.1-linux-x64/blender
+OMNI_PILOT_ROOT=/data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4
+OMNI_PILOT_PREVIEW=/home/zjr/Tracker/pixal3d_multiview/outputs/data_previews/omni256_cyclescuda_v4
+OMNI_PILOT_LOG=/data/zjr/dataset10k_20260726/logs/pilot_omni256_cyclescuda_v4
+PILOT_GPU_LIST_CSV=${PILOT_GPU_LIST_CSV:-1,3}
+IFS=',' read -r -a PILOT_GPUS <<<"${PILOT_GPU_LIST_CSV}"
+PILOT_WORKERS=${#PILOT_GPUS[@]}
+MODEL_GPU_COUNT=${MODEL_GPU_COUNT:-0}
+MAX_PROJECT_GPUS=4
+
+if [ "${APPROVE_MIXED10K_OMNI256_V4:-0}" != 1 ]; then
+  echo "D8 not started; after D7 pass run:"
+  echo "  export APPROVE_MIXED10K_OMNI256_V4=1"
+elif [ "${PILOT_WORKERS}" -le 0 ] || [ "${PILOT_WORKERS}" -gt 2 ]; then
+  echo "D8 blocked: use one or two render GPUs"
+elif [ $((MODEL_GPU_COUNT + PILOT_WORKERS)) -gt "${MAX_PROJECT_GPUS}" ]; then
+  echo "D8 blocked: GPU budget model=${MODEL_GPU_COUNT} render=${PILOT_WORKERS}"
+else
+  for WORKER_INDEX in "${!PILOT_GPUS[@]}"; do
+    GPU_INDEX=${PILOT_GPUS[${WORKER_INDEX}]}
+    UNIT=tracker-mixed10k-omnipilot256-w${WORKER_INDEX}-of${PILOT_WORKERS}-v4
+    if systemctl --user is-active --quiet "${UNIT}"; then
+      echo "already active: ${UNIT}"
+      continue
+    fi
+    systemctl --user reset-failed "${UNIT}" >/dev/null 2>&1 || true
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      /usr/bin/env \
+        CUDA_VISIBLE_DEVICES="${GPU_INDEX}" \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        PYOPENGL_PLATFORM=egl \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u \
+        pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+          --source_plan "${SOURCE_FREEZE}/build_plan.json" \
+          --render_root "${OMNI_PILOT_ROOT}" \
+          --preview_root "${OMNI_PILOT_PREVIEW}" \
+          --log_root "${OMNI_PILOT_LOG}" \
+          --worker_index "${WORKER_INDEX}" \
+          --num_workers "${PILOT_WORKERS}" \
+          --sources omni \
+          --python "${PY}" \
+          --blender_path "${BLENDER}" \
+          --blender_engine CYCLES \
+          --blender_samples 16 \
+          --blender_bounds_tolerance 0.001 \
+          --blender_cycles_device CUDA \
+          --seed 20260729 \
+          --sequences_per_object 2 \
+          --candidate_views 24 \
+          --selected_views 8 \
+          --vis_count_per_shard 2 \
+          --max_objects_per_shard 32
+    echo "${UNIT}: rc=$? GPU=${GPU_INDEX}"
+  done
+fi
+
+echo "current terminal remains open"
+
+
+###############################################################################
+# D9. 监视并汇总 Omni pilot
+###############################################################################
+
+watch -n 20 '
+date -u
+systemctl --user list-units "tracker-mixed10k-omnipilot256-*-v4*" \
+  --all --no-pager || true
+echo
+printf "Omni markers: "
+find /data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4/omni \
+  -mindepth 2 -maxdepth 2 -type f -name _WORKER_COMPLETE.json \
+  2>/dev/null | wc -l
+echo
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+'
+
+# 全部服务停止且 marker=8 后执行：
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE_FREEZE=/data/zjr/dataset10k_20260726/source_freeze_obj11546_omni215_v2
+OMNI_PILOT_ROOT=/data/zjr/dataset10k_20260726/pilot_omni256_cyclescuda_v4
+OMNI_PILOT_REPORT=${OMNI_PILOT_ROOT}/pilot_report.json
+OMNI_MARKERS=$(find "${OMNI_PILOT_ROOT}/omni" -mindepth 2 -maxdepth 2 \
+  -type f -name _WORKER_COMPLETE.json 2>/dev/null | wc -l)
+D9_RC=97
+
+if [ "${OMNI_MARKERS}" -ne 8 ]; then
+  echo "D9 blocked: Omni pilot incomplete: ${OMNI_MARKERS}/8"
+  D9_RC=96
+elif [ -s "${OMNI_PILOT_REPORT}" ]; then
+  echo "reuse immutable pilot report: ${OMNI_PILOT_REPORT}"
+  D9_RC=0
+elif [ -e "${OMNI_PILOT_REPORT}" ]; then
+  echo "D9 blocked: partial pilot report exists"
+  D9_RC=98
+else
+  "${PY}" -u \
+    pose_point_depth_mv/dataset_tools/analyze_mixed_render_pilot.py \
+      --render_root "${OMNI_PILOT_ROOT}" \
+      --source omni \
+      --expected_shards 8 \
+      --sequences_per_object 2 \
+      --max_low_texture_ratio 0.22 \
+      --target_objects 4000 \
+      --reserve_fraction 0.15 \
+      --output "${OMNI_PILOT_REPORT}"
+  D9_RC=$?
+fi
+
+if [ "${D9_RC}" -eq 0 ]; then
+  "${PY}" -c \
+    'import json,sys
+p=json.load(open(sys.argv[1])); s=json.load(open(sys.argv[2]))
+available=int(s["omni"]["object_count"])
+suggested=int(p["suggested_candidate_objects"])
+print(json.dumps({
+  "passed":p["passed"],
+  "attempted_objects":p["attempted_objects"],
+  "accepted_sequences":p["accepted_sequences"],
+  "estimated_admitted_object_yield":p["estimated_admitted_object_yield"],
+  "suggested_candidate_objects":suggested,
+  "available_omni_objects":available,
+  "candidate_budget_sufficient":suggested<=available,
+  "infrastructure_failure_count":p["infrastructure_failure_count"],
+  "failure_counts":p["failure_counts"]
+},indent=2,ensure_ascii=False))
+assert p["passed"] is True
+assert p["infrastructure_failure_count"]==0
+assert suggested<=available' \
+    "${OMNI_PILOT_REPORT}" \
+    "${SOURCE_FREEZE}/source_report.json"
+  D9_RC=$?
+fi
+
+echo "D9_RC=${D9_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# D10. 正式24分片渲染（只有D7/D9通过后，最多2卡启动）
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+WORK=/data/zjr/dataset10k_20260726
+SOURCE_FREEZE=${WORK}/source_freeze_obj11546_omni215_v2
+FRAME_AUDIT=${WORK}/audits/blender_frame_known4_v4/report.json
+SMOKE16_ROOT=${WORK}/smoke_both16_cyclescuda_v4
+OMNI_PILOT_REPORT=${WORK}/pilot_omni256_cyclescuda_v4/pilot_report.json
+RENDER_ROOT=${WORK}/strict_render_mixed10k_cyclescuda_v4
+PREVIEW_ROOT=/home/zjr/Tracker/pixal3d_multiview/outputs/data_previews/mixed10k_cyclescuda_v4
+RENDER_LOG=${WORK}/logs/strict_render_mixed10k_cyclescuda_v4
+BLENDER=/tmp/blender-3.0.1-linux-x64/blender
+GPU_LIST_CSV=${GPU_LIST_CSV:-1,3}
+IFS=',' read -r -a GPU_LIST <<<"${GPU_LIST_CSV}"
+NUM_WORKERS=${#GPU_LIST[@]}
+MODEL_GPU_COUNT=${MODEL_GPU_COUNT:-0}
+MAX_PROJECT_GPUS=4
+OBJ_SMOKE_MARKERS=$(find "${SMOKE16_ROOT}/objaverse" -type f \
+  -name _WORKER_COMPLETE.json 2>/dev/null | wc -l)
+OMNI_SMOKE_MARKERS=$(find "${SMOKE16_ROOT}/omni" -type f \
+  -name _WORKER_COMPLETE.json 2>/dev/null | wc -l)
+
+if [ "${APPROVE_MIXED10K_FORMAL_V4:-0}" != 1 ]; then
+  echo "D10 not started; after D9 pass run:"
+  echo "  export APPROVE_MIXED10K_FORMAL_V4=1"
+elif [ ! -s "${FRAME_AUDIT}" ] || \
+     [ "${OBJ_SMOKE_MARKERS}" -ne 1 ] || \
+     [ "${OMNI_SMOKE_MARKERS}" -ne 1 ] || \
+     [ ! -s "${OMNI_PILOT_REPORT}" ]; then
+  echo "D10 blocked: source-frame/smoke/pilot prerequisites are incomplete"
+elif [ "${NUM_WORKERS}" -le 0 ] || [ "${NUM_WORKERS}" -gt 2 ]; then
+  echo "D10 blocked: use one or two formal render GPUs"
+elif [ $((MODEL_GPU_COUNT + NUM_WORKERS)) -gt "${MAX_PROJECT_GPUS}" ]; then
+  echo "D10 blocked: GPU budget model=${MODEL_GPU_COUNT} render=${NUM_WORKERS}"
+else
+  PREFLIGHT_RC=0
+  "${PY}" -c \
+    'import json,sys
+frame=json.load(open(sys.argv[1]))
+pilot=json.load(open(sys.argv[2]))
+source=json.load(open(sys.argv[3]))
+assert frame["passed"] is True
+assert pilot["passed"] is True
+assert pilot["infrastructure_failure_count"]==0
+assert int(pilot["suggested_candidate_objects"])<=int(source["omni"]["object_count"])' \
+    "${FRAME_AUDIT}" \
+    "${OMNI_PILOT_REPORT}" \
+    "${SOURCE_FREEZE}/source_report.json" \
+    || PREFLIGHT_RC=$?
+
+  if [ "${PREFLIGHT_RC}" -ne 0 ]; then
+    echo "D10 blocked: formal preflight failed"
+  else
+    for WORKER_INDEX in "${!GPU_LIST[@]}"; do
+      GPU_INDEX=${GPU_LIST[${WORKER_INDEX}]}
+      UNIT=tracker-mixed10k-render-w${WORKER_INDEX}-of${NUM_WORKERS}-v4
+      if systemctl --user is-active --quiet "${UNIT}"; then
+        echo "already active: ${UNIT}"
+        continue
+      fi
+      systemctl --user reset-failed "${UNIT}" >/dev/null 2>&1 || true
+      systemd-run --user \
+        --unit="${UNIT}" \
+        --collect \
+        --property=WorkingDirectory=/home/zjr/Tracker \
+        /usr/bin/env \
+          CUDA_VISIBLE_DEVICES="${GPU_INDEX}" \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          PYOPENGL_PLATFORM=egl \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+          MPLCONFIGDIR=/tmp/matplotlib \
+          NUMBA_CACHE_DIR=/tmp/numba_cache \
+          TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u \
+          pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+            --source_plan "${SOURCE_FREEZE}/build_plan.json" \
+            --render_root "${RENDER_ROOT}" \
+            --preview_root "${PREVIEW_ROOT}" \
+            --log_root "${RENDER_LOG}" \
+            --worker_index "${WORKER_INDEX}" \
+            --num_workers "${NUM_WORKERS}" \
+            --sources objaverse,omni \
+            --python "${PY}" \
+            --blender_path "${BLENDER}" \
+            --blender_engine CYCLES \
+            --blender_samples 16 \
+            --blender_bounds_tolerance 0.001 \
+            --blender_cycles_device CUDA \
+            --seed 20260729 \
+            --sequences_per_object 2 \
+            --candidate_views 24 \
+            --selected_views 8 \
+            --vis_count_per_shard 8
+      echo "${UNIT}: rc=$? GPU=${GPU_INDEX}"
+    done
+  fi
+fi
+
+echo "current terminal remains open"
+
+
+###############################################################################
+# D11. 正式构建监视
+###############################################################################
+
+watch -n 20 '
+date -u
+systemctl --user list-units "tracker-mixed10k-render-*-v4*" \
+  --all --no-pager || true
+echo
+printf "Objaverse markers: "
+find /data/zjr/dataset10k_20260726/strict_render_mixed10k_cyclescuda_v4/objaverse \
+  -mindepth 2 -maxdepth 2 -type f -name _WORKER_COMPLETE.json \
+  2>/dev/null | wc -l
+printf "Omni markers: "
+find /data/zjr/dataset10k_20260726/strict_render_mixed10k_cyclescuda_v4/omni \
+  -mindepth 2 -maxdepth 2 -type f -name _WORKER_COMPLETE.json \
+  2>/dev/null | wc -l
+echo
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+echo
+df -h /data
+'
+
+
+###############################################################################
+# D12. 全部24分片完成后冻结 object-disjoint 10k
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+WORK=/data/zjr/dataset10k_20260726
+SOURCE_FREEZE=${WORK}/source_freeze_obj11546_omni215_v2
+RENDER_ROOT=${WORK}/strict_render_mixed10k_cyclescuda_v4
+FINAL_ROOT=/data/zjr/pixal3d_multiview/mixed_objaverse6000_omni4000_10k_cyclescuda_v4
+FINAL_LOG=${WORK}/logs/finalize_mixed10k_cyclescuda_v4.log
+OBJ_DONE=$(find "${RENDER_ROOT}/objaverse" -mindepth 2 -maxdepth 2 \
+  -type f -name _WORKER_COMPLETE.json 2>/dev/null | wc -l)
+OMNI_DONE=$(find "${RENDER_ROOT}/omni" -mindepth 2 -maxdepth 2 \
+  -type f -name _WORKER_COMPLETE.json 2>/dev/null | wc -l)
+D12_RC=97
+
+if [ "${OBJ_DONE}" -ne 16 ] || [ "${OMNI_DONE}" -ne 8 ]; then
+  echo "D12 blocked: markers objaverse=${OBJ_DONE}/16 omni=${OMNI_DONE}/8"
+  D12_RC=96
+elif [ -s "${FINAL_ROOT}/report.json" ]; then
+  echo "reuse immutable final dataset: ${FINAL_ROOT}"
+  D12_RC=0
+elif [ -e "${FINAL_ROOT}" ]; then
+  echo "D12 blocked: immutable final path exists without report: ${FINAL_ROOT}"
+  D12_RC=98
+else
+  "${PY}" -u \
+    pose_point_depth_mv/dataset_tools/finalize_mixed_multiview_10k.py \
+      --source_plan "${SOURCE_FREEZE}/build_plan.json" \
+      --objaverse_render_root "${RENDER_ROOT}/objaverse" \
+      --omni_render_root "${RENDER_ROOT}/omni" \
+      --output_dir "${FINAL_ROOT}" \
+      --objaverse_objects 6000 \
+      --omni_objects 4000 \
+      --train_objects 9000 \
+      --val_objects 500 \
+      --test_objects 500 \
+      --sequences_per_object 2 \
+      --max_sequences_per_object 1 \
+      --max_low_texture_ratio 0.22 \
+      --required_renderer blender \
+      --seed 20260729 \
+    2>&1 | tee "${FINAL_LOG}"
+  D12_RC=${PIPESTATUS[0]}
+fi
+
+echo "D12_RC=${D12_RC}"
+echo "final=${FINAL_ROOT}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# 模型训练边界
+###############################################################################
+
+# Direct-SLAT V4 的 step100 S5：
+#   工程执行/low-t gate通过，但最终Mesh收益约为中性，不能批准10k模型长训。
+#
+# 可以继续当前897-object的受控S6(step100->400)，完整命令仍在：
+#   pose_point_depth_mv/Direct_SLAT_v4_rollout_endpoint训练测试命令_20260728.txt
+#
+# S6后必须运行该文档S7。只有897-object最终Mesh出现稳定正向趋势，才进入：
+#   1k短训 -> 3k scaling -> 10k长训。

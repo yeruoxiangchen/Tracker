@@ -1,0 +1,402 @@
+Omni Holdout64：ReconViaGen original vs official Native-SS 2k + SLat15k/25k
+归一化 / proper-Sim(3) 纯 Shape 比较命令（2026-08-16）
+==========================================================================
+
+目标固定为三路：
+
+  A. ReconViaGen original：官方 TrellisVGGTTo3DPipeline，确实执行 VGGT；
+  B. official Native-SS：ProObjaverse 2000 objects、step2000、EMA、CFG5
+     + official Native-SLat step15000、EMA；
+  C. 与 B 完全相同的 Point+Mask -> runtime-O、DINO-only、Native-SS，
+     只把 Native-SLat checkpoint 换为 step25000、EMA。
+
+输入和协议：
+
+  - Omni Holdout64 固定 64 objects、seed42；
+  - B/C 都消费 M11C Point+Mask -> runtime-O 和 M11G DINO-only 输入；
+  - A 复用已经完成且绑定同一 M11C runtime manifest 的 M11K 原版 ReconViaGen；
+  - 不比较世界位姿、T_O2W 或绝对尺度；
+  - normalized_fixed_contract：Recon 固定 decoder 轴修正，所有 Mesh 分别按
+    自身 AABB 中心平移到原点并除以自身最长边；
+  - proper_sim3_shape_only（主结果）：三种预测分别对同一 GT 允许 SO(3) 旋转、
+    平移和统一尺度对齐；禁止 reflection 和 anisotropic scale；
+  - 这是已消费 Holdout64 上的 post-hoc development 比较，formal=false，不能声称
+    世界位姿、尺度、AR placement 或首次盲测结果。
+
+下列每个编号块均可整体逐段复制。推理块只启动后台任务，不会占住当前终端。
+
+
+O0. 只读预检：确认 Omni、checkpoint、bridge 和共同 runtime-O 身份
+================================================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OMNI=/data/zjr/omni_real_video500_download_20260804_v2
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+TRAJ=${SOURCE}/eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1
+ARCHIVE=/data/zjr/slat_train2000_trajectory_archives/slat_train2000_trajectory_step10000_25000_strict_fix1_v1
+SS_REPORT=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/dev64_step2000_eval16_64_seed424344_6gpu_v1/aggregate_v1/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+LABEL=${OMNI}/M11E_holdout64_mesh_o_labels_v1/runtime_o_label_manifest.json
+RUNTIME=${OMNI}/M11C_holdout64_runtime_o_v1/runtime_input_manifest.json
+MODEL_INPUT=${OMNI}/M11G_holdout64_dino_only_model_inputs_v1/model_input_manifest.json
+RECON=${OMNI}/M11K_holdout64_reconviagen_original_seed42_v1/inference_manifest.json
+CKPT15=${ARCHIVE}/checkpoints/step_015000.pt
+CKPT25=${ARCHIVE}/checkpoints/step_025000.pt
+BRIDGE15=${TRAJ}/step_015000/dev48_predicted/aggregate_v1/report.json
+BRIDGE25=${TRAJ}/step_025000/dev48_predicted/aggregate_v1/report.json
+
+for PATH_TO_CHECK in \
+  "${SS_REPORT}" "${STOCK_FREEZE}" "${LABEL}" "${RUNTIME}" \
+  "${MODEL_INPUT}" "${RECON}" "${CKPT15}" "${CKPT25}" \
+  "${BRIDGE15}" "${BRIDGE25}"
+do
+  test -s "${PATH_TO_CHECK}"
+done
+
+MPLCONFIGDIR=/tmp/matplotlib \
+${PY} -c '
+import json,sys
+from pathlib import Path
+from pose_point_depth_mv.infer_real_proobjaverse_official_ss_slat import validate_cross_deployment_bridge
+from pose_point_depth_mv.proobjaverse_official_ss import load_official_native_ss_deployment
+label,runtime,model_input,recon,ss,stock,ck15,ck25,br15,br25=map(Path,sys.argv[1:])
+L=json.load(open(label)); R=json.load(open(runtime)); M=json.load(open(model_input)); G=json.load(open(recon))
+assert L["passed"] and R["passed"] and M["passed"] and G["passed"]
+assert L["selected_object_count"] == R["selected_object_count"] == M["selected_object_count"] == 64
+assert R["format"] == "pose_point_depth_mv.omni_real_runtime_input_manifest.v2"
+assert R["build_config"]["input_frontend_format"] == "pose_point_depth_mv.real_input_frontend.v2"
+minimum=R["build_config"]["frame_config"]["min_object_points"]
+supports=[x["runtime_frame_stats"]["support"]["mask_supported_point_count"] for x in R["objects"]]
+assert minimum > 0 and min(supports) >= minimum
+assert M["vggt_model_loaded"] is False and M["vggt_model_executed"] is False
+assert G["object_count"] == G["record_count"] == 64 and G["seeds"] == [42]
+assert G["method"] == "reconviagen_original"
+runtime_sha=L["runtime_input_manifest_sha256"]
+assert M["runtime_input_manifest_sha256"] == runtime_sha
+assert G["runtime_input_manifest_sha256"] == runtime_sha
+_,binding=load_official_native_ss_deployment(ss)
+assert binding["checkpoint_step"] == 2000 and binding["weights"] == "ema"
+assert binding["cfg_strength"] == 5.0 and binding["steps"] == 25
+assert binding["cfg_interval"] == [0.5,1.0]
+assert binding["guidance_rescale"] == 0.0 and binding["rescale_t"] == 3.0
+bridges=[]
+for step,checkpoint,bridge in ((15000,ck15,br15),(25000,ck25,br25)):
+    result=validate_cross_deployment_bridge(
+        bridge,native_ss_report=ss,native_ss_binding=binding,
+        trained_slat_checkpoint=checkpoint,trained_slat_step=step,
+        trained_slat_weights="ema",stock_slat_freeze=stock)
+    assert result["passed"] is True and result["object_count"] == 48
+    bridges.append({"step":step,"workers":result["worker_count"],
+                    "bridge_runtime_passed":result["aggregate_runtime_passed"]})
+print(json.dumps({
+  "passed":True,"omni_objects":64,"seed":42,
+  "frontend":"Point+Mask -> runtime-O -> posed DINO-only",
+  "minimum_mask_supported_points":min(supports),
+  "native_ss":{"step":2000,"weights":"ema","cfg":5.0},
+  "slat_steps":[15000,25000],"bridges":bridges,
+  "reconviagen":"original VGGT pipeline; existing M11K artifact",
+  "formal":False,"shape_only":True
+},indent=2,ensure_ascii=False))
+' "${LABEL}" "${RUNTIME}" "${MODEL_INPUT}" "${RECON}" \
+  "${SS_REPORT}" "${STOCK_FREEZE}" "${CKPT15}" "${CKPT25}" \
+  "${BRIDGE15}" "${BRIDGE25}"
+
+echo "O0 passed"
+echo "current terminal remains open"
+
+
+O1. 两卡并行启动 official SS2k + SLat15k/25k 的 Omni64 推理
+================================================================
+
+默认使用物理 GPU 0 和 1；务必先按 nvidia-smi 修改 GPU15/GPU25。
+两路会各自严格执行相同的 official Native-SS step2000，再分别执行 SLat15k/25k。
+这样计算稍有重复，但 artifact 完全隔离，任何一路中断都不会污染另一路。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU15=${GPU15:-3}
+GPU25=${GPU25:-4}
+test "${GPU15}" != "${GPU25}"
+
+OMNI=/data/zjr/omni_real_video500_download_20260804_v2
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+TRAJ=${SOURCE}/eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1
+ARCHIVE=/data/zjr/slat_train2000_trajectory_archives/slat_train2000_trajectory_step10000_25000_strict_fix1_v1
+SS_REPORT=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/dev64_step2000_eval16_64_seed424344_6gpu_v1/aggregate_v1/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+MODEL_INPUT=${OMNI}/M11G_holdout64_dino_only_model_inputs_v1/model_input_manifest.json
+
+ROOT=/data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1
+OUT15=${ROOT}/01_official_ss2k_slat15k_seed42
+OUT25=${ROOT}/02_official_ss2k_slat25k_seed42
+LOG15=${ROOT}/logs/O1_slat15k.log
+LOG25=${ROOT}/logs/O1_slat25k.log
+mkdir -p "${ROOT}/logs"
+
+if [ -s "${OUT15}/inference_manifest.json" ]; then
+  echo "reuse complete SLat15k inference: ${OUT15}/inference_manifest.json"
+else
+  systemd-run --user \
+    --unit=tracker-omni64-official-slat15k-v1 \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property=StandardOutput=append:${LOG15} \
+    --property=StandardError=append:${LOG15} \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES=${GPU15} \
+      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      ${PY} -u -m pose_point_depth_mv.infer_real_proobjaverse_official_ss_slat \
+        --model_input_manifest "${MODEL_INPUT}" \
+        --native_ss_report "${SS_REPORT}" \
+        --native_slat_checkpoint "${ARCHIVE}/checkpoints/step_015000.pt" \
+        --expected_slat_step 15000 \
+        --cross_deployment_bridge_report \
+          "${TRAJ}/step_015000/dev48_predicted/aggregate_v1/report.json" \
+        --stock_slat_freeze "${STOCK_FREEZE}" \
+        --output_dir "${OUT15}" \
+        --seeds 42 --weights ema --device cuda --amp_dtype bf16
+fi
+
+if [ -s "${OUT25}/inference_manifest.json" ]; then
+  echo "reuse complete SLat25k inference: ${OUT25}/inference_manifest.json"
+else
+  systemd-run --user \
+    --unit=tracker-omni64-official-slat25k-v1 \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property=StandardOutput=append:${LOG25} \
+    --property=StandardError=append:${LOG25} \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES=${GPU25} \
+      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      ${PY} -u -m pose_point_depth_mv.infer_real_proobjaverse_official_ss_slat \
+        --model_input_manifest "${MODEL_INPUT}" \
+        --native_ss_report "${SS_REPORT}" \
+        --native_slat_checkpoint "${ARCHIVE}/checkpoints/step_025000.pt" \
+        --expected_slat_step 25000 \
+        --cross_deployment_bridge_report \
+          "${TRAJ}/step_025000/dev48_predicted/aggregate_v1/report.json" \
+        --stock_slat_freeze "${STOCK_FREEZE}" \
+        --output_dir "${OUT25}" \
+        --seeds 42 --weights ema --device cuda --amp_dtype bf16
+fi
+
+echo "SLat15k log: ${LOG15}"
+echo "SLat25k log: ${LOG25}"
+echo "current terminal remains open"
+
+
+O2. 监视 O1（只监视，不启动新任务）
+====================================
+
+cd /home/zjr/Tracker
+
+watch -n 20 --exec bash \
+  /home/zjr/Tracker/pose_point_depth_mv/monitor_omni_recon_slat_shape.sh inference
+
+
+O3. O1完成后检查两路 exact 64-object manifest
+===============================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1
+M15=${ROOT}/01_official_ss2k_slat15k_seed42/inference_manifest.json
+M25=${ROOT}/02_official_ss2k_slat25k_seed42/inference_manifest.json
+
+${PY} -c '
+import json,sys
+out={}
+for step,path in ((15000,sys.argv[1]),(25000,sys.argv[2])):
+    r=json.load(open(path)); d=r["native_slat_deployment"]
+    assert r["passed"] is True and r["object_count"] == 64 and r["record_count"] == 64
+    assert r["seeds"] == [42] and r["output_frame"] == "runtime-O"
+    assert r["vggt_model_executed"] is False
+    assert d["checkpoint_step"] == step and d["weights"] == "ema"
+    out[str(step)]={"objects":r["object_count"],"checkpoint_sha256":d["checkpoint_sha256"]}
+print(json.dumps({"passed":True,"inference":out},indent=2,ensure_ascii=False))
+' "${M15}" "${M25}"
+
+echo "current terminal remains open"
+
+
+O4. 后台启动三路归一化 + proper-Sim(3) 纯 Shape 评测（主命令）
+================================================================
+
+这一步不占 GPU，CPU 运行时间明显长于只做 AABB 归一化。它按对象写 record，若终端或服务
+中断，原命令加 --resume 后可继续；本命令已经默认带 --resume。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OMNI=/data/zjr/omni_real_video500_download_20260804_v2
+ROOT=/data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1
+LABEL=${OMNI}/M11E_holdout64_mesh_o_labels_v1/runtime_o_label_manifest.json
+RECON=${OMNI}/M11K_holdout64_reconviagen_original_seed42_v1/inference_manifest.json
+M15=${ROOT}/01_official_ss2k_slat15k_seed42/inference_manifest.json
+M25=${ROOT}/02_official_ss2k_slat25k_seed42/inference_manifest.json
+EVAL=${ROOT}/03_normalized_and_proper_sim3_shape_v1
+LOG=${ROOT}/logs/O4_shape_eval.log
+
+test -s "${M15}"
+test -s "${M25}"
+
+if [ -s "${EVAL}/report.json" ]; then
+  echo "reuse complete shape report: ${EVAL}/report.json"
+else
+  systemd-run --user \
+    --unit=tracker-omni64-recon-slat15k25k-shape-v1 \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property=StandardOutput=append:${LOG} \
+    --property=StandardError=append:${LOG} \
+    /usr/bin/env \
+      MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+      ${PY} -u -m pose_point_depth_mv.evaluate_omni_reconviagen_slat15k25k_shape \
+        --label_manifest "${LABEL}" \
+        --reconviagen_manifest "${RECON}" \
+        --slat15000_manifest "${M15}" \
+        --slat25000_manifest "${M25}" \
+        --output_dir "${EVAL}" \
+        --expected_objects 64 --seed 42 \
+        --candidate_samples 2000 --alignment_samples 10000 \
+        --candidate_iterations 12 --final_iterations 50 \
+        --surface_samples 20000 --bootstrap_samples 10000 \
+        --metric_seed 20260816 --resume
+fi
+
+echo "shape log: ${LOG}"
+echo "shape report: ${EVAL}/report.json"
+echo "shape summary: ${EVAL}/summary.txt"
+echo "current terminal remains open"
+
+
+O5. 监视 O4
+============
+
+cd /home/zjr/Tracker
+
+watch -n 20 --exec bash \
+  /home/zjr/Tracker/pose_point_depth_mv/monitor_omni_recon_slat_shape.sh evaluation
+
+
+O6. O4完成后打印主结果
+======================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+REPORT=/data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1/03_normalized_and_proper_sim3_shape_v1/report.json
+
+${PY} -c '
+import json,sys
+r=json.load(open(sys.argv[1]))
+assert r["passed"] is True and r["object_count"] == 64 and r["record_count"] == 192
+shape=r["summary"]["tracks"]["proper_sim3_shape_only"]
+metrics=("chamfer_l1","fscore_0p02","normal_consistency")
+methods={name:{metric:{key:row[metric][key] for key in ("mean","median")}
+                      for metric in metrics}
+         for name,row in shape["methods"].items()}
+comparisons={name:{
+    "candidate":row["candidate"],"baseline":row["baseline"],
+    "metrics":{metric:{key:row["metrics"][metric][key]
+                       for key in ("mean","median","positive_rate","bootstrap_mean_95_ci")}
+               for metric in metrics}}
+    for name,row in shape["comparisons"].items()}
+print(json.dumps({
+  "passed":r["passed"],"formal":r["formal"],"post_hoc":r["post_hoc"],
+  "objects":r["object_count"],"methods":methods,
+  "paired_comparisons":comparisons,
+  "interpretation_scope":r["interpretation_scope"]
+},indent=2,ensure_ascii=False))
+' "${REPORT}"
+
+echo "简表: ${REPORT%/report.json}/summary.txt"
+echo "判读顺序：先看 15k-vs-Recon 和 25k-vs-Recon，再看 25k-vs-15k。"
+echo "Chamfer paired improvement > 0、F-score/Normal delta > 0 才表示候选更好。"
+echo "current terminal remains open"
+
+
+O7（可选）. 只做快速 AABB 归一化，不运行 proper-Sim(3)
+==========================================================
+
+只有需要先快速排查输入/manifest/mesh 完整性时才运行。它写入独立目录，不会覆盖 O4。
+正式回答“完全不看世界位姿、只看 shape”时仍以 O4/O6 的 proper_sim3_shape_only 为主。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+OMNI=/data/zjr/omni_real_video500_download_20260804_v2
+ROOT=/data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1
+
+MPLCONFIGDIR=/tmp/matplotlib \
+${PY} -u -m pose_point_depth_mv.evaluate_omni_reconviagen_slat15k25k_shape \
+  --label_manifest "${OMNI}/M11E_holdout64_mesh_o_labels_v1/runtime_o_label_manifest.json" \
+  --reconviagen_manifest "${OMNI}/M11K_holdout64_reconviagen_original_seed42_v1/inference_manifest.json" \
+  --slat15000_manifest "${ROOT}/01_official_ss2k_slat15k_seed42/inference_manifest.json" \
+  --slat25000_manifest "${ROOT}/02_official_ss2k_slat25k_seed42/inference_manifest.json" \
+  --output_dir "${ROOT}/04_fast_bbox_normalized_shape_v1" \
+  --expected_objects 64 --seed 42 --surface_samples 20000 \
+  --bootstrap_samples 10000 --metric_seed 20260816 \
+  --skip_proper_sim3 --resume
+
+echo "fast report: ${ROOT}/04_fast_bbox_normalized_shape_v1/report.json"
+echo "current terminal remains open"
+
+
+产物位置
+========
+
+原版 ReconViaGen Mesh（复用，不复制）：
+  /data/zjr/omni_real_video500_download_20260804_v2/
+    M11K_holdout64_reconviagen_original_seed42_v1/meshes/
+
+official SS2k + SLat15k Mesh：
+  /data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1/
+    01_official_ss2k_slat15k_seed42/meshes/
+
+official SS2k + SLat25k Mesh：
+  /data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1/
+    02_official_ss2k_slat25k_seed42/meshes/
+
+主 shape-only 报告：
+  /data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1/
+    03_normalized_and_proper_sim3_shape_v1/report.json
+
+主简表：
+  /data/zjr/omni_holdout64_recon_vs_official_ss2k_slat15k25k_shape_20260816_v1/
+    03_normalized_and_proper_sim3_shape_v1/summary.txt
+
+
+实现和测试
+==========
+
+实现：
+  pose_point_depth_mv/evaluate_omni_reconviagen_slat15k25k_shape.py
+
+单元测试：
+  pose_point_depth_mv/test_evaluate_omni_reconviagen_slat15k25k_shape.py
+
+测试命令：
+  cd /home/zjr/Tracker
+  MPLCONFIGDIR=/tmp/matplotlib \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_evaluate_omni_reconviagen_slat15k25k_shape

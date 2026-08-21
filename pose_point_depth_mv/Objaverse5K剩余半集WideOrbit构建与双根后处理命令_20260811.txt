@@ -1,0 +1,380 @@
+Objaverse 5K：剩余半集 Wide-Orbit v2 构建与双根后处理
+=========================================================
+
+目标
+----
+
+1. 冻结旧 render v1 的 shard_000-007，保留为 limited-view 数据。
+2. 停止旧 render worker，旧根中 shard_008-011 的半成品只保留、不读取、不删除。
+3. 用同一份冻结 source plan 的 shard_008-015 构建 wide-orbit v2：
+   - 24 个连续 AR-like 候选视图；
+   - 方位跨度随机 285-330 度；
+   - 按物体中心方位角确定性选 8 张；
+   - 硬门 coverage >= 240 度、maximum gap <= 120 度；
+   - 继续执行 mask、bbox、Blender bounds 和 projection-support 门。
+4. CPU watcher 同时读取旧根 000-007 和新根 008-015；DINO watcher继续复用原 work root。
+
+新根与旧根严格分离，任何命令都不会删除旧数据。
+
+
+A0. 静态检查与单元测试
+======================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/dataset_tools/build_objaverse_multiview_sparse_data.py \
+  pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+  pose_point_depth_mv/dataset_tools/process_objaverse5k_cache_shards.py
+
+"${PY}" -m unittest -v \
+  pose_point_depth_mv.test_mixed_multiview_render_guards \
+  pose_point_depth_mv.dataset_tools.test_objaverse5k_cache_shards
+
+
+A1. 冻结旧半集并停止旧 render worker
+=====================================
+
+# 先停止旧 worker 冻结旧根，再确认恰好只有 shard_000-007 完成。
+# 如果数字不是8，不要继续；先检查新增完成的 shard，
+# 再调整新半集边界，避免同一 shard 在两个根重复。
+
+(
+  set -euo pipefail
+  OLD_RENDER=/data/zjr/objaverse5k_single_subject_render512_20260810_v1
+
+  for WORKER_INDEX in 0 1 2 3; do
+    systemctl --user stop \
+      "objaverse5k-render-w${WORKER_INDEX}-20260810-v1.service" || true
+  done
+
+  for WORKER_INDEX in 0 1 2 3; do
+    test "$(systemctl --user is-active \
+      "objaverse5k-render-w${WORKER_INDEX}-20260810-v1.service" || true)" != active
+  done
+
+  OLD_READY=$(find "${OLD_RENDER}/objaverse" \
+    -name _WORKER_COMPLETE.json | wc -l)
+  echo "old completed shards: ${OLD_READY}"
+  test "${OLD_READY}" -eq 8
+
+  for INDEX in $(seq 0 7); do
+    test -f "${OLD_RENDER}/objaverse/shard_$(printf '%03d' "${INDEX}")/_WORKER_COMPLETE.json"
+  done
+
+  systemctl --user --no-pager --plain list-units \
+    'objaverse5k-render-w*-20260810-v1.service'
+)
+
+
+A2. 四对象 Wide-Orbit Blender smoke
+====================================
+
+# 先在 GPU 1 上跑 shard_008 的前4个对象、每对象1条序列。正式根不会被写入。
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  PLAN=/data/zjr/objaverse5k_single_subject_stratified_20260810_v1/build_plan.json
+  SMOKE=/data/zjr/objaverse5k_wideorbit_smoke_20260811_v2
+
+  CUDA_VISIBLE_DEVICES=1 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  PYOPENGL_PLATFORM=egl \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u \
+    pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+      --source_plan "${PLAN}" \
+      --render_root "${SMOKE}/render" \
+      --preview_root "${SMOKE}/preview" \
+      --log_root "${SMOKE}/logs" \
+      --worker_index 0 \
+      --num_workers 1 \
+      --sources objaverse \
+      --python "${PY}" \
+      --blender_path /tmp/blender-3.0.1-linux-x64/blender \
+      --blender_engine CYCLES \
+      --blender_samples 16 \
+      --blender_bounds_tolerance 0.001 \
+      --blender_cycles_device CUDA \
+      --seed 20260811 \
+      --sequences_per_object 1 \
+      --candidate_views 24 \
+      --selected_views 8 \
+      --trajectory_profile wide_ar \
+      --shard_start 8 \
+      --shard_end 9 \
+      --vis_count_per_shard 4 \
+      --max_objects_per_shard 4
+
+  MANIFEST=${SMOKE}/render/objaverse/shard_008/manifest.json
+  "${PY}" - "${MANIFEST}" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+rows = payload["samples"]
+assert rows, "smoke produced no accepted samples"
+assert payload["build_config"]["frame_selection_policy"] == "object_azimuth_balanced"
+assert payload["build_config"]["min_selected_azimuth_coverage"] == 240.0
+assert payload["build_config"]["max_selected_azimuth_gap"] == 120.0
+for row in rows:
+    stats = row["frame_selection_stats"]
+    assert stats["azimuth_coverage_degrees"] >= 240.0, stats
+    assert stats["maximum_azimuth_gap_degrees"] <= 120.0, stats
+print(json.dumps({
+    "passed": True,
+    "accepted": len(rows),
+    "failed": len(payload["failures"]),
+    "coverage": [round(x["frame_selection_stats"]["azimuth_coverage_degrees"], 3) for x in rows],
+    "max_gap": [round(x["frame_selection_stats"]["maximum_azimuth_gap_degrees"], 3) for x in rows],
+}, indent=2))
+PY
+)
+
+
+A3. 启动 shard_008-015 四卡 Wide-Orbit 正式构建
+=================================================
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  PLAN=/data/zjr/objaverse5k_single_subject_stratified_20260810_v1/build_plan.json
+  RENDER=/data/zjr/objaverse5k_single_subject_render512_wideorbit_20260811_v2
+  PREVIEW=/data/zjr/objaverse5k_single_subject_render512_wideorbit_previews_20260811_v2
+  LOG_ROOT=/data/zjr/objaverse5k_single_subject_render512_wideorbit_logs_20260811_v2
+
+  mkdir -p "${LOG_ROOT}"
+
+  for WORKER_INDEX in 0 1 2 3; do
+    GPU=$((WORKER_INDEX + 1))
+    UNIT=objaverse5k-wide-render-w${WORKER_INDEX}-20260811-v2
+    LOG=${LOG_ROOT}/worker_${WORKER_INDEX}.service.log
+
+    if systemctl --user is-active --quiet "${UNIT}.service"; then
+      echo "already active: ${UNIT}.service"
+      continue
+    fi
+
+    systemctl --user reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
+    systemd-run --user \
+      --unit="${UNIT}" \
+      --collect \
+      --property=WorkingDirectory=/home/zjr/Tracker \
+      --property="StandardOutput=append:${LOG}" \
+      --property="StandardError=append:${LOG}" \
+      /usr/bin/env \
+        CUDA_VISIBLE_DEVICES="${GPU}" \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        PYOPENGL_PLATFORM=egl \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u \
+          pose_point_depth_mv/dataset_tools/run_mixed_multiview_render_worker.py \
+            --source_plan "${PLAN}" \
+            --render_root "${RENDER}" \
+            --preview_root "${PREVIEW}" \
+            --log_root "${LOG_ROOT}" \
+            --worker_index "${WORKER_INDEX}" \
+            --num_workers 4 \
+            --sources objaverse \
+            --python "${PY}" \
+            --blender_path /tmp/blender-3.0.1-linux-x64/blender \
+            --blender_engine CYCLES \
+            --blender_samples 16 \
+            --blender_bounds_tolerance 0.001 \
+            --blender_cycles_device CUDA \
+            --seed 20260811 \
+            --sequences_per_object 2 \
+            --candidate_views 24 \
+            --selected_views 8 \
+            --trajectory_profile wide_ar \
+            --shard_start 8 \
+            --shard_end 16 \
+            --vis_count_per_shard 8 \
+            --max_objects_per_shard 0
+
+    echo "started ${UNIT}.service on physical GPU ${GPU}"
+  done
+)
+
+
+A4. 重启 CPU watcher，使其读取两个互斥 render 根
+===================================================
+
+# 建议等旧 shard_000-007 全部 CPU ready 后执行，避免中断正在运行的单 shard CPU 后处理。
+# Direct DINO watcher不需要重启；它只观察同一个 WORK/shards 目录。
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  OLD_RENDER=/data/zjr/objaverse5k_single_subject_render512_20260810_v1
+  WIDE_RENDER=/data/zjr/objaverse5k_single_subject_render512_wideorbit_20260811_v2
+  WORK=/data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1
+  LOG_ROOT=${WORK}/logs
+  LOG=${LOG_ROOT}/cpu_shard_watcher_dual_render_root.log
+  UNIT=tracker-objaverse5k-cpu-cache-shards-v1
+
+  OLD_CPU_READY=$(find "${WORK}/shards" -path '*/shard_00[0-7]/_CPU_SHARD_READY.json' | wc -l)
+  echo "old CPU ready: ${OLD_CPU_READY}/8"
+  test "${OLD_CPU_READY}" -eq 8
+
+  systemctl --user stop "${UNIT}.service" || true
+  systemctl --user reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
+  mkdir -p "${LOG_ROOT}"
+
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property="StandardOutput=append:${LOG}" \
+    --property="StandardError=append:${LOG}" \
+    /usr/bin/ionice -c 2 -n 7 \
+    /usr/bin/nice -n 10 \
+    "${PY}" -u -m \
+      pose_point_depth_mv.dataset_tools.process_objaverse5k_cache_shards \
+        --stage cpu \
+        --render_root "${OLD_RENDER}" \
+        --render_root "${WIDE_RENDER}" \
+        --work_root "${WORK}" \
+        --python "${PY}" \
+        --exclude_manifest \
+          /data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/train.json \
+        --exclude_manifest \
+          /data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/val.json \
+        --exclude_manifest \
+          /data/zjr/reviewed_mixed1k_semantic_object_ss_repaired_v1_20260730/test.json \
+        --exclude_manifest \
+          /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O0_frozen_objaverse_test16_v1.json \
+        --audit_workers 8 \
+        --prior_seed 42 \
+        --log_every 10 \
+        --expected_shards 16 \
+        --poll_seconds 60 \
+        --watch
+
+  echo "unit: ${UNIT}.service"
+  echo "log:  ${LOG}"
+)
+
+
+A5. 监视剩余半集与完整后处理
+=============================
+
+watch -n 20 '
+cd /home/zjr/Tracker || exit
+/home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+  pose_point_depth_mv.dataset_tools.monitor_objaverse5k_pipeline
+'
+
+该监视器显示：16 个 shard 的 render/CPU/DINO 状态、未完成 Wide shard
+的 sequence 进度、accepted/failed、ETA、日志新鲜度、worker 服务状态以及
+GPU 0-4 占用。它不再输出 systemd 的冗长完整命令行。
+
+
+A5B. Wide render worker 释放后启动互斥分片 DINO
+====================================================
+
+当 w0/w1/w2 各自完成后，分别执行对应命令。启动脚本会硬检查：
+
+- 对应 render worker 已退出；
+- 该 worker 的两个 render shard 均有 completion marker；
+- 旧的 `--shards all` DINO watcher 没有运行。
+
+固定映射为 GPU1=`008,012`、GPU2=`009,013`、GPU3=`010,014`，因此
+不会与 GPU4 的 `011,015` 同时写入同一 shard。
+
+GPU1（w0 完成后）：
+
+cd /home/zjr/Tracker
+/usr/bin/bash \
+  pose_point_depth_mv/background_jobs/start_objaverse5k_partitioned_dino.sh 0
+
+GPU2（w1 完成后）：
+
+cd /home/zjr/Tracker
+/usr/bin/bash \
+  pose_point_depth_mv/background_jobs/start_objaverse5k_partitioned_dino.sh 1
+
+GPU3（w2 完成后）：
+
+cd /home/zjr/Tracker
+/usr/bin/bash \
+  pose_point_depth_mv/background_jobs/start_objaverse5k_partitioned_dino.sh 2
+
+同时跟踪三个 DINO 日志：
+
+tail -n 30 -F \
+  /data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1/logs/direct_dino_p0_gpu1.log \
+  /data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1/logs/direct_dino_p1_gpu2.log \
+  /data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1/logs/direct_dino_p2_gpu3.log
+
+按 Ctrl-C 只退出 `tail`，不会停止 systemd 中的 DINO worker。
+
+
+A6. Wide 半集完成后的覆盖合同审计
+=================================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+WIDE=/data/zjr/objaverse5k_single_subject_render512_wideorbit_20260811_v2
+
+"${PY}" - "${WIDE}" <<'PY'
+import glob, json, os, statistics, sys
+root = sys.argv[1]
+manifests = sorted(glob.glob(os.path.join(root, "objaverse/shard_*/manifest.json")))
+assert len(manifests) == 8, manifests
+coverage, gaps, samples, failures = [], [], 0, 0
+for path in manifests:
+    payload = json.load(open(path, encoding="utf-8"))
+    assert payload["build_config"]["frame_selection_policy"] == "object_azimuth_balanced"
+    for row in payload["samples"]:
+        stats = row["frame_selection_stats"]
+        coverage.append(float(stats["azimuth_coverage_degrees"]))
+        gaps.append(float(stats["maximum_azimuth_gap_degrees"]))
+        assert coverage[-1] >= 240.0, (path, row["uid"], stats)
+        assert gaps[-1] <= 120.0, (path, row["uid"], stats)
+    samples += len(payload["samples"])
+    failures += len(payload["failures"])
+print(json.dumps({
+    "passed": True,
+    "manifests": len(manifests),
+    "samples": samples,
+    "failures": failures,
+    "coverage_min_median_max": [min(coverage), statistics.median(coverage), max(coverage)],
+    "max_gap_min_median_max": [min(gaps), statistics.median(gaps), max(gaps)],
+}, indent=2))
+PY
+
+
+A7. 16个 DINO shard 完成后的最终合并
+=====================================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+WORK=/data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1
+
+"${PY}" -u -m \
+  pose_point_depth_mv.dataset_tools.merge_dino_only_lifting_shards \
+    --input_root "${WORK}" \
+    --shards 0-15 \
+    --output_dir "${WORK}/merged_limited8_wide8_final16_v2" \
+    --expected_shards 16
+
+echo "training manifest: ${WORK}/merged_limited8_wide8_final16_v2/lifting_manifest.json"

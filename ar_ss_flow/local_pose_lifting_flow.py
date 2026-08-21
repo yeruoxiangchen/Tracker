@@ -23,6 +23,26 @@ from ar_ss_flow.shared_object_preprocessing import canonical_json_sha256
 LOCAL_LIFTING_ADAPTER_VERSION = "ar_ss_flow.local_pose_lifting_velocity.v2"
 
 
+def resolve_ss_latent_path(
+    row: dict[str, Any], payload: dict[str, Any], root: str | Path
+) -> Path:
+    """Resolve a manifest-bound SS target, falling back to the sample payload.
+
+    Large lifting tensors are intentionally reusable across target rebuilds.  A
+    derived manifest can therefore bind a newly audited SS latent without
+    rewriting the original ``lifting.pt`` file.  Existing manifests keep their
+    old behaviour because the payload path remains the fallback.
+    """
+
+    raw = row.get("ss_latent", payload.get("ss_latent"))
+    if not raw:
+        raise ValueError(f"uid={row.get('uid', payload.get('uid'))} lacks ss_latent")
+    path = Path(str(raw)).expanduser()
+    if not path.is_absolute():
+        path = Path(root) / path
+    return path.resolve()
+
+
 def parse_indices(spec: str, size: int) -> list[int]:
     text = str(spec).strip().lower()
     if text in {"", "all"}:
@@ -65,6 +85,7 @@ class PoseLiftingCacheDataset(Dataset):
         self.feature_metadata = dict(payload["feature_metadata"])
         self.config = dict(payload.get("config", {}))
         self.config_hash = str(payload.get("config_hash", ""))
+        self.manifest_payload = payload
         if not self.config_hash:
             raise ValueError("lifting cache manifest is missing config_hash")
         self.source_cache_manifest = str(payload.get("source_cache_manifest", ""))
@@ -148,8 +169,8 @@ class PoseLiftingCacheDataset(Dataset):
         )
         if not all(bool(torch.isfinite(value.float()).all().item()) for value in tensors):
             raise ValueError(f"uid={row['uid']} cache contains non-finite tensors")
-        latent_path = Path(payload["ss_latent"])
-        with np.load(latent_path) as latent:
+        latent_path = resolve_ss_latent_path(row, payload, self.root)
+        with np.load(latent_path, allow_pickle=False) as latent:
             target = np.asarray(latent["z"], dtype=np.float32)
             target_coords = np.asarray(latent["target_coords"], dtype=np.int64)[:, -3:]
         if target.ndim == 5 and target.shape[0] == 1:
@@ -160,6 +181,7 @@ class PoseLiftingCacheDataset(Dataset):
         result.update(
             {
                 "cache_path": str(path),
+                "target_path": str(latent_path),
                 "target": torch.from_numpy(target),
                 "target_coords": torch.from_numpy(target_coords),
             }

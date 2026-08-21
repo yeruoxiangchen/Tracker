@@ -1,0 +1,444 @@
+ProObjaverse official 30K no-VGGT compact-v2
+兼容审计与 F39 256-object Pilot 命令（2026-08-16）
+======================================================================
+
+重要说明
+----------------------------------------------------------------------
+
+1. 本文所有可执行段均采用：
+
+   set +e
+   (
+     set -euo pipefail
+     ...
+   )
+   RC=$?
+
+   内层失败只会结束子 shell，不会关闭当前交互终端。
+
+2. 不要在当前终端直接执行裸的：
+
+   set -euo pipefail
+
+   然后再填写占位路径。只要某个 test/conda/path 检查失败，当前终端就可能退出。
+
+3. A 在源服务器执行：
+
+     project = /home/zjr/Tracker
+     conda   = /home/zjr/anaconda3/envs/reconviagen
+
+   A 的真实单对象 legacy-v1/compact-v2 exact-equivalence audit 已由
+   Codex 执行完成；本文 A 命令现在只读复核已生成证据。
+
+   B 才在 F39 的 root 环境执行：
+
+     project = /root/Tracker
+     conda   = /root/miniconda3/envs/reconviagen-bw
+
+   B 是 F39 8-GPU、256-object compact pilot，会实际构建cache；
+   Codex 未执行 B。
+
+4. B 中的 SS_REPORT 必须使用与原 official Train2000 no-VGGT SLat 训练
+   绑定的同一 Native-SS deployment report；不能随意替换为较新的 SS report。
+   report 所绑定的 checkpoint 也必须在 F39 可见，且内容哈希一致。
+
+
+======================================================================
+A. 源服务器：已完成的真实 legacy-v1 vs compact-v2 exact-equivalence audit
+======================================================================
+
+当前源服务器没有预先存在的完整 compact-v2 cache，因此 Codex 没有伪造 V2
+路径，也没有擅自启动约2000对象的长时间转换。
+
+已经使用真实 legacy cache 第1个对象完成：
+
+  V1=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/cache_train2000_protocol2128_views8_v1
+
+  V2=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/cache_v1_to_compact_v2_real1_exact_20260816_v1
+
+  OUT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/cache_v1_to_compact_v2_real1_exact_audit_20260816_v1/report.json
+
+真实UID：
+
+  4a979f5b0a09eee92448a2b028b1f88e7e605870b1094311204e51d5d00e0cd1
+
+结果：
+
+  conversion passed=true
+  conversion object_count=1
+  compact_payload_bytes=22435628
+  convert_seconds=46.943
+
+  equivalence passed=true
+  equivalence sample_count=1
+  audit_seconds=4.147
+
+  target_coords_feats_exact=true
+  legacy_gt_placeholders_exact_in_memory=true
+  positive_negative_slat_context_exact=true
+  stock_ss_context_exact=true
+  dino_intrinsics_extrinsics_exact=true
+  actual_projection_output_exact=true
+
+  audit report SHA256：
+  348f0ad485739559da152dfbd7072941455e36d26915c0c8367f0502194e1ea5
+
+下面只做已完成结果的只读复核，不重复转换或重跑audit：
+
+set +e
+(
+  set -euo pipefail
+
+  PROJECT=/home/zjr/Tracker
+  CONDA_SH=/home/zjr/anaconda3/etc/profile.d/conda.sh
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  test -d "${PROJECT}"
+  test -r "${PROJECT}/pose_point_depth_mv/audit_proobjaverse_official_slat_cache_v1_v2.py"
+  test -r "${CONDA_SH}"
+  test -x "${PY}"
+
+  cd "${PROJECT}"
+
+  source "${CONDA_SH}"
+  conda activate reconviagen
+
+  export PYTHONPATH="${PROJECT}:${PROJECT}/ReconViaGen:${PROJECT}/ReconViaGen/wheels/vggt"
+  export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+
+  V1=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/cache_train2000_protocol2128_views8_v1
+  V2=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/cache_v1_to_compact_v2_real1_exact_20260816_v1
+  OUT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/cache_v1_to_compact_v2_real1_exact_audit_20260816_v1/report.json
+
+  echo "===== input guards ====="
+  test -x "${PY}"
+  test -s "${V1}/slat_manifest.json"
+  test -s "${V1}/lifting_manifest.json"
+  test -s "${V2}/slat_manifest.json"
+  test -s "${V2}/lifting_manifest.json"
+  test -s "${V2}/report.json"
+  test -s "${OUT}"
+
+  echo "===== verify completed real-object result ====="
+
+  "${PY}" - "${OUT}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+report = json.load(open(path, encoding="utf-8"))
+assert report["passed"] is True
+assert report["sample_count"] == 1
+assert all(report["checks"].values())
+print(json.dumps({
+    "passed": report["passed"],
+    "sample_count": report["sample_count"],
+    "checks": report["checks"],
+    "report": path,
+}, indent=2, ensure_ascii=False))
+PY
+
+  test "$(sha256sum "${OUT}" | awk '{print $1}')" = \
+    348f0ad485739559da152dfbd7072941455e36d26915c0c8367f0502194e1ea5
+
+  echo "REAL-OBJECT V1/V2 EXACT-EQUIVALENCE EVIDENCE VERIFIED"
+)
+A_RC=$?
+echo "A_RC=${A_RC} (0=PASS；非0时终端仍保持打开，请检查上方第一处错误)"
+echo "current terminal remains open"
+
+
+======================================================================
+B. F39 root环境：30K protocol freeze + 8-GPU 256-object compact pilot
+======================================================================
+
+先修改/确认：
+
+  RAW
+  SELECTION
+  SS_REPORT
+  FREEZE
+
+PROTOCOL 和 PILOT 必须是尚不存在的新目录，避免覆盖旧证据。
+
+set +e
+(
+  set -euo pipefail
+
+  PROJECT=/root/Tracker
+  CONDA_SH=/root/miniconda3/etc/profile.d/conda.sh
+  PY=/root/miniconda3/envs/reconviagen-bw/bin/python
+
+  test "$(id -u)" -eq 0
+  test -d "${PROJECT}"
+  test -r "${PROJECT}/pose_point_depth_mv/prepare_proobjaverse_official_slat_compact_cache.py"
+  test -r "${CONDA_SH}"
+  test -x "${PY}"
+
+  cd "${PROJECT}"
+
+  source "${CONDA_SH}"
+  conda activate reconviagen-bw
+
+  export PYTHONPATH="${PROJECT}:${PROJECT}/ReconViaGen:${PROJECT}/ReconViaGen/wheels/vggt"
+  export CUDA_HOME=/usr/local/cuda
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+  export CUMM_CUDA_ARCH_LIST=12.0
+  export SPCONV_ALGO=native
+  export ATTN_BACKEND=flash_attn
+  export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+  export TORCH_HOME=/root/.cache/torch
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+  export OMP_NUM_THREADS=4
+  export MKL_NUM_THREADS=4
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+
+  RAW=/root/autodl-tmp/ProObjaverse-300K-ReconViaGen-30K
+  SELECTION=/root/autodl-tmp/ProObjaverse-300K-ReconViaGen-30K-state/combined_audit/combined_selection_30k.json
+
+  # 下面两项必须替换为F39上的真实、内容一致路径。
+  SS_REPORT=/root/autodl-tmp/path/to/original_2k_training_native_ss_report.json
+  FREEZE=/root/autodl-tmp/path/to/stock_slat_freeze_v2.json
+
+  PROTOCOL=/root/autodl-tmp/proobjaverse_official_slat_protocol30k_seed20260813_v1
+  PILOT=/root/autodl-tmp/proobjaverse_official_slat_compact_v2_pilot256_8gpu_v1
+
+  echo "===== preflight guards ====="
+
+  test -x "${PY}"
+  test -d "${RAW}"
+  test -s "${SELECTION}"
+  test -s "${SS_REPORT}"
+  test -s "${FREEZE}"
+  test ! -e "${PROTOCOL}"
+  test ! -e "${PILOT}"
+
+  nvidia-smi \
+    --query-gpu=index,name,memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits
+
+  GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | wc -l)
+  test "${GPU_COUNT}" -eq 8
+
+  echo "===== freeze exact 30K protocol ====="
+
+  "${PY}" -u -m pose_point_depth_mv.proobjaverse_official_slat_protocol \
+    freeze \
+    --data_root "${RAW}" \
+    --selection "${SELECTION}" \
+    --output_dir "${PROTOCOL}" \
+    --pair_count 30000 \
+    --train_count 29872 \
+    --seed 20260813
+
+  SPLIT=${PROTOCOL}/train.json
+  test -s "${PROTOCOL}/protocol.json"
+  test -s "${SPLIT}"
+
+  mkdir -p "${PILOT}/logs"
+  GPU_LOG=${PILOT}/gpu_memory_samples.csv
+  START=$(date +%s)
+
+  echo "===== start 1-second GPU-memory sampler ====="
+
+  (
+    while true; do
+      nvidia-smi \
+        --query-gpu=timestamp,index,memory.used \
+        --format=csv,noheader,nounits
+      sleep 1
+    done
+  ) >"${GPU_LOG}" &
+  MONITOR_PID=$!
+
+  echo "===== launch 8 workers / 256 total objects ====="
+
+  PIDS=()
+  for WORKER in 0 1 2 3 4 5 6 7; do
+    CUDA_VISIBLE_DEVICES="${WORKER}" \
+    "${PY}" -u -m \
+      pose_point_depth_mv.prepare_proobjaverse_official_slat_compact_cache \
+      --split_manifest "${SPLIT}" \
+      --native_ss_report "${SS_REPORT}" \
+      --stock_slat_freeze "${FREEZE}" \
+      --output_dir "${PILOT}" \
+      --dino_model dinov2_vitl14_reg \
+      --selected_views 8 \
+      --max_objects 256 \
+      --ss_context_tokens 4096 \
+      --worker_index "${WORKER}" \
+      --worker_count 8 \
+      --materialize_only \
+      >"${PILOT}/logs/worker_${WORKER}.log" 2>&1 &
+    WORKER_PID=$!
+    PIDS+=("${WORKER_PID}")
+    echo "worker=${WORKER} pid=${WORKER_PID} log=${PILOT}/logs/worker_${WORKER}.log"
+  done
+
+  WORKER_RC=0
+  for PID in "${PIDS[@]}"; do
+    if ! wait "${PID}"; then
+      WORKER_RC=1
+    fi
+  done
+
+  kill "${MONITOR_PID}" 2>/dev/null || true
+  wait "${MONITOR_PID}" 2>/dev/null || true
+
+  test "${WORKER_RC}" -eq 0
+
+  echo "===== finalize immutable compact manifests ====="
+
+  CUDA_VISIBLE_DEVICES=0 \
+  "${PY}" -u -m \
+    pose_point_depth_mv.prepare_proobjaverse_official_slat_compact_cache \
+    --split_manifest "${SPLIT}" \
+    --native_ss_report "${SS_REPORT}" \
+    --stock_slat_freeze "${FREEZE}" \
+    --output_dir "${PILOT}" \
+    --dino_model dinov2_vitl14_reg \
+    --selected_views 8 \
+    --max_objects 256 \
+    --ss_context_tokens 4096 \
+    --finalize_only
+
+  END=$(date +%s)
+  ELAPSED=$((END - START))
+
+  test -s "${PILOT}/slat_manifest.json"
+  test -s "${PILOT}/lifting_manifest.json"
+  test -s "${PILOT}/report.json"
+
+  echo "===== pilot statistics ====="
+
+  "${PY}" - "${PILOT}" "${ELAPSED}" "${GPU_LOG}" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+elapsed = int(sys.argv[2])
+gpu_log = Path(sys.argv[3])
+
+report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+objects = int(report["object_count"])
+assert report["passed"] is True
+assert objects == 256
+
+cache_files = []
+for path in root.rglob("*"):
+    if not path.is_file():
+        continue
+    relative = path.relative_to(root)
+    if relative.parts[0] == "logs":
+        continue
+    if path.name in {"gpu_memory_samples.csv", "pilot_summary.json"}:
+        continue
+    cache_files.append(path)
+
+total_bytes = sum(path.stat().st_size for path in cache_files)
+payload_bytes = int(report["compact_payload_bytes"])
+
+peak_by_gpu = {}
+with gpu_log.open(newline="", encoding="utf-8") as handle:
+    for row in csv.reader(handle):
+        if len(row) < 3:
+            continue
+        try:
+            gpu = int(row[-2].strip())
+            used_mib = int(row[-1].strip())
+        except ValueError:
+            continue
+        peak_by_gpu[gpu] = max(peak_by_gpu.get(gpu, 0), used_mib)
+
+objects_per_hour = objects * 3600.0 / elapsed
+scale = 30000.0 / objects
+
+summary = {
+    "passed": True,
+    "object_count": objects,
+    "total_cache_bytes": total_bytes,
+    "compact_payload_bytes": payload_bytes,
+    "total_MiB_per_object": total_bytes / objects / 2**20,
+    "payload_MiB_per_object": payload_bytes / objects / 2**20,
+    "elapsed_seconds": elapsed,
+    "objects_per_hour": objects_per_hour,
+    "sampled_peak_gpu_memory_MiB": peak_by_gpu,
+    "peak_memory_contract": (
+        "1-second nvidia-smi system-wide sampled high-water mark; "
+        "diagnostic, not exact torch allocator peak"
+    ),
+    "projected_full_30k_total_cache_GiB": total_bytes * scale / 2**30,
+    "projected_full_30k_payload_GiB": payload_bytes * scale / 2**30,
+    "projected_full_30k_hours": elapsed * scale / 3600.0,
+}
+
+(root / "pilot_summary.json").write_text(
+    json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+PY
+
+  echo "F39 256-OBJECT COMPACT PILOT PASS"
+  echo "summary=${PILOT}/pilot_summary.json"
+)
+B_RC=$?
+echo "B_RC=${B_RC} (0=PASS；非0时终端仍保持打开，请检查worker日志)"
+echo "current terminal remains open"
+
+
+======================================================================
+C. Pilot 运行期间的只读监视命令（另开终端）
+======================================================================
+
+PILOT=/root/autodl-tmp/proobjaverse_official_slat_compact_v2_pilot256_8gpu_v1
+
+watch -n 5 '
+date
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+echo
+for f in /root/autodl-tmp/proobjaverse_official_slat_compact_v2_pilot256_8gpu_v1/logs/worker_*.log; do
+  test -e "$f" || continue
+  printf "%s  " "$(basename "$f")"
+  grep -c "\[official_slat_compact\]" "$f" || true
+done
+'
+
+或查看某个 worker：
+
+tail -n 80 -f \
+  /root/autodl-tmp/proobjaverse_official_slat_compact_v2_pilot256_8gpu_v1/logs/worker_0.log
+
+
+======================================================================
+D. 结果判读
+======================================================================
+
+A_RC=0：
+  legacy-v1 与 compact-v2 的 runtime tensor 和实际 projection exact-equivalent。
+
+B_RC=0：
+  exact 30K protocol 已冻结；256对象已由8卡构建并完成manifest finalize；
+  pilot_summary.json包含：
+
+  object_count
+  total_cache_bytes
+  compact_payload_bytes
+  total_MiB_per_object
+  payload_MiB_per_object
+  elapsed_seconds
+  objects_per_hour
+  sampled_peak_gpu_memory_MiB
+  projected_full_30k_total_cache_GiB
+  projected_full_30k_payload_GiB
+  projected_full_30k_hours
+
+注意：
+  sampled_peak_gpu_memory_MiB 是1秒一次的nvidia-smi系统级采样，属于诊断值；
+  当前builder没有输出 torch.cuda.max_memory_allocated，因此不能称为精确的
+  PyTorch allocator peak。

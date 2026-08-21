@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+#
+# Bunny：恢复 Pixal3D / 原版 ReconViaGen stock，并生成可直接查看的并排法线渲染。
+#
+# 说明：
+# - Pixal3D 使用冻结 view 0，关闭 gated RMBG，使用协议已生成的 RGBA。
+# - ReconViaGen stock 使用冻结 view 0--4，不加载任何本地 SS/SLAT checkpoint。
+# - 两路均跳过昂贵的 textured-GLB 后处理；仍会生成用于几何审查的 OBJ/GLB。
+# - 现有未完成 stock 目录先移动到带时间戳的 partial archive，不删除。
+# - 最终渲染包含 reference / Pixal3D / ReconViaGen stock 三列。
+
+cd /home/zjr/Tracker
+set +e
+set -o pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PIXAL_PY=/home/zjr/anaconda3/envs/pixal3d/bin/python
+BUNNY_GPU=${BUNNY_GPU:-4}
+PROJECT_TOOLS=/home/zjr/Tracker/pose_point_depth_mv/tools
+
+OUT=/home/zjr/Tracker/pose_point_depth_mv/bunny/outputs/bunny_human_review_20260727_v1
+PROTOCOL=${OUT}/protocol.json
+LOG_ROOT=${OUT}/logs
+
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+PIXAL_REVISION=0b31f9160aa400719af409098bff7936a932f726
+PIXAL_SNAPSHOT=/home/zjr/.cache/huggingface/hub/models--TencentARC--Pixal3D/snapshots/${PIXAL_REVISION}
+
+NAF_COMMIT=37f2dfc180f2de53d98bd601109c0da0dd6b0f43
+NAF_ROOT=/data/zjr/models/valeoai_NAF_${NAF_COMMIT}
+NAF_REPO=${NAF_ROOT}/repo
+NAF_CKPT=${NAF_ROOT}/naf_release.pth
+NAF_SOURCE_MANIFEST=${NAF_ROOT}/source_manifest.sha256
+
+mkdir -p "${LOG_ROOT}"
+
+
+###############################################################################
+# R0. 输入和依赖检查
+###############################################################################
+
+R0_RC=0
+test -s "${PROTOCOL}" || R0_RC=96
+test -s "${PIXAL_SNAPSHOT}/pipeline.json" || R0_RC=96
+test -s "${NAF_REPO}/hubconf.py" || R0_RC=96
+test -s "${NAF_CKPT}" || R0_RC=96
+test -s "${NAF_SOURCE_MANIFEST}" || R0_RC=96
+test -x "${PROJECT_TOOLS}/ninja" || R0_RC=96
+PATH="${PROJECT_TOOLS}:${PATH}" ninja --version >/dev/null 2>&1 || R0_RC=96
+
+echo "R0_RC=${R0_RC}"
+echo "protocol=${PROTOCOL}"
+echo "GPU=${BUNNY_GPU}"
+if [ "${R0_RC}" -ne 0 ]; then
+  echo "R0 failed; stop before GPU inference"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# R1. 原版单视图 Pixal3D，生成 geometry OBJ
+###############################################################################
+
+R1_RC=0
+PIXAL_RESULT=${OUT}/methods/pixal3d/result.json
+PIXAL_DIR=${OUT}/methods/pixal3d
+PIXAL_PARTIAL=${OUT}/methods/pixal3d_partial_before_geometry_v1
+
+if [ "${R0_RC}" -ne 0 ]; then
+  R1_RC=96
+elif [ -s "${PIXAL_RESULT}" ]; then
+  echo "reuse complete Pixal3D result: ${PIXAL_RESULT}"
+else
+  if [ -e "${PIXAL_DIR}" ]; then
+    if [ -e "${PIXAL_PARTIAL}" ]; then
+      echo "R1 blocked: Pixal3D partial archive already exists:"
+      echo "${PIXAL_PARTIAL}"
+      echo "inspect current partial directory:"
+      echo "${PIXAL_DIR}"
+      R1_RC=98
+    else
+      mv "${PIXAL_DIR}" "${PIXAL_PARTIAL}"
+      echo "preserved old Pixal3D partial/empty output: ${PIXAL_PARTIAL}"
+    fi
+  fi
+
+  if [ "${R1_RC}" -eq 0 ]; then
+    CUDA_VISIBLE_DEVICES="${BUNNY_GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=sdpa \
+    SPARSE_ATTN_BACKEND=sdpa \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PIXAL_PY}" -u -m pose_point_depth_mv.bunny_review.infer_pixal3d \
+      --protocol "${PROTOCOL}" \
+      --method_id pixal3d \
+      --display_name "Pixal3D official single-view" \
+      --model_path "${PIXAL_SNAPSHOT}" \
+      --naf_repo "${NAF_REPO}" \
+      --naf_checkpoint "${NAF_CKPT}" \
+      --naf_source_manifest "${NAF_SOURCE_MANIFEST}" \
+      --device cuda \
+      --low_vram \
+      --fixed_fov 0.857556 \
+      --resolution 1024 \
+      --sampling_steps 12 \
+      --seed 42 \
+      --skip_textured_glb \
+      2>&1 | tee "${LOG_ROOT}/pixal3d_geometry_v1.log"
+    R1_RC=${PIPESTATUS[0]}
+  fi
+fi
+
+printf '%s\n' "${R1_RC}" > "${LOG_ROOT}/pixal3d_geometry_v1.log.exit_code"
+echo "R1_RC=${R1_RC}"
+if [ "${R1_RC}" -eq 0 ] && [ -s "${PIXAL_DIR}/mesh.obj" ]; then
+  echo "Pixal3D Mesh: ${PIXAL_DIR}/mesh.obj"
+else
+  echo "Pixal3D Mesh 尚未生成；检查: ${LOG_ROOT}/pixal3d_geometry_v1.log"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# R2. 原版 ReconViaGen stock 五视图；归档旧 partial 后重新运行
+###############################################################################
+
+R2_RC=0
+STOCK_DIR=${OUT}/methods/reconviagen_stock
+STOCK_RESULT=${STOCK_DIR}/result.json
+STOCK_PARTIAL=${OUT}/methods/reconviagen_stock_partial_20260728_0116
+
+if [ "${R0_RC}" -ne 0 ]; then
+  R2_RC=96
+elif [ -s "${STOCK_RESULT}" ]; then
+  echo "reuse complete ReconViaGen stock result: ${STOCK_RESULT}"
+else
+  if [ -e "${STOCK_DIR}" ]; then
+    if [ -e "${STOCK_PARTIAL}" ]; then
+      echo "R2 blocked: stock partial archive already exists:"
+      echo "${STOCK_PARTIAL}"
+      R2_RC=98
+    else
+      mv "${STOCK_DIR}" "${STOCK_PARTIAL}"
+      echo "preserved old stock partial output: ${STOCK_PARTIAL}"
+    fi
+  fi
+
+  if [ "${R2_RC}" -eq 0 ]; then
+    CUDA_VISIBLE_DEVICES="${BUNNY_GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.bunny_review.infer_reconviagen \
+      --protocol "${PROTOCOL}" \
+      --method_id reconviagen_stock \
+      --display_name "ReconViaGen original stock 5-view" \
+      --pretrained "${PRETRAINED}" \
+      --device cuda \
+      --low_vram \
+      --seed 42 \
+      --ss_steps 30 \
+      --slat_steps 12 \
+      --multiimage_algo multidiffusion \
+      --skip_textured_glb \
+      2>&1 | tee "${LOG_ROOT}/reconviagen_stock_geometry_v1.log"
+    R2_RC=${PIPESTATUS[0]}
+  fi
+fi
+
+printf '%s\n' "${R2_RC}" > \
+  "${LOG_ROOT}/reconviagen_stock_geometry_v1.log.exit_code"
+echo "R2_RC=${R2_RC}"
+if [ "${R2_RC}" -eq 0 ] && [ -s "${STOCK_DIR}/mesh_canonical.obj" ]; then
+  echo "stock canonical Mesh: ${STOCK_DIR}/mesh_canonical.obj"
+  echo "stock view GLB: ${STOCK_DIR}/mesh_view.glb"
+else
+  echo "ReconViaGen stock Mesh 尚未生成；检查: ${LOG_ROOT}/reconviagen_stock_geometry_v1.log"
+fi
+echo "current terminal remains open"
+
+
+###############################################################################
+# R3. 严格状态检查：reference / Pixal3D / stock 三路必须全部完成
+###############################################################################
+
+"${PY}" -m pose_point_depth_mv.bunny_review.status \
+  --protocol "${PROTOCOL}" \
+  --methods reference,pixal3d,reconviagen_stock \
+  --require_complete
+R3_RC=$?
+
+echo "R3_RC=${R3_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# R4. 统一相机的法线转台、并排 contact sheet、MP4 和 HTML
+###############################################################################
+
+R4_RC=0
+REVIEW_ID=pixal3d_vs_reconviagen_stock_geometry_v1
+REVIEW_DIR=${OUT}/comparison/${REVIEW_ID}
+
+if [ "${R3_RC}" -ne 0 ]; then
+  echo "R4 blocked: R1/R2 results are incomplete"
+  R4_RC=96
+else
+  PATH="${PROJECT_TOOLS}:${PATH}" \
+  CUDA_VISIBLE_DEVICES="${BUNNY_GPU}" \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  "${PY}" -u -m pose_point_depth_mv.bunny_review.finalize \
+    --protocol "${PROTOCOL}" \
+    --methods reference,pixal3d,reconviagen_stock \
+    --review_id "${REVIEW_ID}" \
+    --device cuda \
+    --render_frames 72 \
+    --render_resolution 320 \
+    --contact_frames 6 \
+    --fps 12 \
+    2>&1 | tee "${LOG_ROOT}/${REVIEW_ID}.log"
+  R4_RC=${PIPESTATUS[0]}
+fi
+
+if [ "${R4_RC}" -eq 0 ]; then
+  for REQUIRED in \
+    "${REVIEW_DIR}/index.html" \
+    "${REVIEW_DIR}/normal_contact_sheet.png" \
+    "${REVIEW_DIR}/normal_side_by_side.mp4"; do
+    if [ ! -s "${REQUIRED}" ]; then
+      echo "R4 invalid success: required artifact is missing: ${REQUIRED}"
+      R4_RC=3
+    fi
+  done
+fi
+
+printf '%s\n' "${R4_RC}" > \
+  "${LOG_ROOT}/${REVIEW_ID}.log.exit_code"
+echo "R4_RC=${R4_RC}"
+if [ "${R4_RC}" -eq 0 ]; then
+  echo "HTML: ${REVIEW_DIR}/index.html"
+  echo "并排图: ${REVIEW_DIR}/normal_contact_sheet.png"
+  echo "并排视频: ${REVIEW_DIR}/normal_side_by_side.mp4"
+else
+  echo "comparison 尚未生成；不要使用此前打印的预期路径。"
+  R1_SAVED_RC=$(tr -d '\n' < "${LOG_ROOT}/pixal3d_geometry_v1.log.exit_code")
+  R2_SAVED_RC=$(tr -d '\n' < "${LOG_ROOT}/reconviagen_stock_geometry_v1.log.exit_code")
+  echo "R1 exit code: ${R1_SAVED_RC}"
+  echo "R2 exit code: ${R2_SAVED_RC}"
+  echo "R4 log（仅在 R4 实际启动后存在）: ${LOG_ROOT}/${REVIEW_ID}.log"
+fi
+echo "current terminal remains open"

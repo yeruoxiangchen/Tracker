@@ -1,0 +1,3015 @@
+# ============================================================================
+# 0. 安装、静态检查
+# ============================================================================
+cd /home/zjr/Tracker || exit 1
+
+# 将下载的zip放到当前目录，或把下面路径换成实际下载路径。
+unzip -o pose_point_depth_mv_tools.zip
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  pose_point_depth_mv/__init__.py \
+  pose_point_depth_mv/geometry.py \
+  pose_point_depth_mv/audit_geometry.py \
+  pose_point_depth_mv/eval_flow.py \
+  pose_point_depth_mv/test_pose_point_depth_mv.py
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  pose_point_depth_mv.test_pose_point_depth_mv
+
+
+# ============================================================================
+# 1. Stage PPD-1：几何corruption audit，不加载SS Flow
+# ============================================================================
+cd /home/zjr/Tracker || exit 1
+
+export GPU=${GPU:-0}
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+OUT=pose_point_depth_mv/outputs/ppd_geometry_fresh48_v1
+
+rm -rf "${OUT}"
+rm -f "${OUT}.log" "${OUT}.exit_code"
+
+(
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.audit_geometry \
+    --cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --indices 16-63 \
+    --max_samples 0 \
+    --device cuda \
+    --volume_side 16 \
+    --minimum_depth_tolerance 0.02 \
+    --maximum_depth_tolerance 0.15 \
+    --surface_threshold 0.30 \
+    --free_threshold 0.30 \
+    --minimum_surface_views 2 \
+    --minimum_free_views 2 \
+    --prior_radius_voxels 1.5 \
+    --gate_floor 0.25 \
+    --min_depth_matches 8 \
+    --affine_improvement_ratio 0.90 \
+    --min_correct_calibration_rate 0.70 \
+    --min_object_win_rate 0.60
+) 2>&1 | tee "${OUT}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${OUT}.exit_code"
+echo "PPD geometry audit status=${STATUS}"
+
+
+# ============================================================================
+# 2. Stage PPD-2：固定C2 checkpoint的local gate Flow causal audit
+#    - 不训练
+#    - 不修改ar_ss_flow
+#    - 使用全新noise seeds 48/49/50
+#    - 先只测已经独立确认有效的t>=0.5
+# ============================================================================
+cd /home/zjr/Tracker || exit 1
+
+export GPU=${GPU:-0}
+CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+CKPT=ar_ss_flow/outputs/c2_object_gate_pose_lifting_train16_s50_seed42/checkpoints/last.pt
+OUT=pose_point_depth_mv/outputs/ppd_local_gate_fresh48_s50_noise48_50_late_v1
+
+rm -rf "${OUT}"
+rm -f "${OUT}.log" "${OUT}.exit_code"
+
+(
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.eval_flow \
+    --cache_manifest "${CACHE}" \
+    --checkpoint "${CKPT}" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16-63 \
+    --max_samples 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --t_values 0.5,0.7,0.9 \
+    --adapter_hidden_dim 96 \
+    --base_residual_scale 0.5 \
+    --object_cap 1.0 \
+    --time_gate_start 0.5 \
+    --time_gate_ramp 0.0 \
+    --amp_dtype bf16 \
+    --minimum_depth_tolerance 0.02 \
+    --maximum_depth_tolerance 0.15 \
+    --surface_threshold 0.30 \
+    --free_threshold 0.30 \
+    --minimum_surface_views 2 \
+    --minimum_free_views 2 \
+    --prior_radius_voxels 1.5 \
+    --gate_floor 0.25 \
+    --min_depth_matches 8 \
+    --affine_improvement_ratio 0.90 \
+    --bootstrap_samples 10000 \
+    --min_object_win_vs_matched 0.55 \
+    --min_object_win_vs_corrupt 0.60 \
+    --min_correct_object_gain -0.001
+) 2>&1 | tee "${OUT}.log"
+
+STATUS=${PIPESTATUS[0]}
+echo "${STATUS}" | tee "${OUT}.exit_code"
+echo "PPD local-gate Flow audit status=${STATUS}"
+
+
+# ============================================================================
+# 3. 打印最终报告关键项
+# ============================================================================
+cd /home/zjr/Tracker || exit 1
+OUT=pose_point_depth_mv/outputs/ppd_local_gate_fresh48_s50_noise48_50_late_v1
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - "${OUT}/report.json" <<'PY'
+import json
+import sys
+
+d = json.load(open(sys.argv[1]))
+print("=" * 100)
+print("stage:", d["stage"])
+print("passed:", d["passed"])
+print("objects:", d["eligible_object_count"], "records:", d["record_count"])
+print("off_max_abs:", d["residual_off_max_abs_diff"])
+print("positive_t:", d["positive_t_count"])
+
+print("\nBRANCHES")
+for name, row in d["branch_summary"].items():
+    gain = row["object_balanced_gain"]
+    print(
+        name,
+        f"mean={gain['mean']:+.8f}",
+        f"median={gain['median']:+.8f}",
+        f"min={gain['min']:+.8f}",
+        f"positive={row['object_positive_rate']:.4f}",
+        f"ci={row['object_bootstrap_95_ci']}",
+        f"delta_rms={row['mean_delta_rms']:.8f}",
+    )
+
+print("\nCORRECT LOCAL COMPARISONS")
+for name, row in d["comparisons"].items():
+    gap = row["object_difference"]
+    print(
+        "correct_vs", name,
+        f"mean={gap['mean']:+.8f}",
+        f"median={gap['median']:+.8f}",
+        f"win={row['object_win_rate']:.4f}",
+        f"ci={row['object_bootstrap_95_ci']}",
+    )
+
+print("\nCHECKS")
+for key, value in d["checks"].items():
+    print(key, "=", value)
+PY
+
+
+# ============================================================================
+# 追加：PPD-v2 frozen cross-fit + applied-residual energy matching（2026-07-15）
+#
+# 代码/模型语义：
+#   1. correct sparse points按UID确定性拆成fit/held-out，二者不重叠；
+#   2. 只用fit points + correct K/T拟合VGGT depth scale，默认禁止affine；
+#   3. 所有pose/depth/point corruption共用该冻结标定；
+#   4. fit points作为模型证据，held-out correct points只用于共同评分；
+#   5. sparse z-buffer在mask过滤后执行；
+#   6. local gate只允许positive surface，mask-zero/negative/neutral严格为0；
+#   7. Flow对照先匹配gate均值，再匹配raw_delta*gate的实际RMS。
+#
+# 注意：PPD-v2仍是“冻结旧C2 residual的因果审计”，不是新depth模型训练。
+# PPD-1和PPD-2未全部通过前，不运行PPD-3训练，也不要把旧C2训练命令称为
+# depth-conditioned training。
+# ============================================================================
+
+
+# ============================================================================
+# V2.1 静态检查和7项CPU单元测试
+# - 真实退出码写入文件；命令块本身最终返回0，不会关闭当前终端。
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || { echo 97 > /tmp/ppd_v2_static.exit_code; exit 0; }
+
+  OUT=/tmp/ppd_v2_static_20260715
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    ar_ss_flow/pose_lifting.py \
+    pose_point_depth_mv/__init__.py \
+    pose_point_depth_mv/geometry.py \
+    pose_point_depth_mv/audit_geometry.py \
+    pose_point_depth_mv/eval_flow.py \
+    pose_point_depth_mv/test_pose_point_depth_mv.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    ar_ss_flow.test_pose_lifting \
+    2>&1 | tee "${OUT}/unit_test.log"
+  TEST_CODE=${PIPESTATUS[0]}
+
+  if [ "${COMPILE_CODE}" -eq 0 ] && [ "${TEST_CODE}" -eq 0 ]; then
+    CODE=0
+  else
+    CODE=1
+  fi
+  echo "${CODE}" | tee "${OUT}/V2.1.exit_code"
+  echo "PPD-v2 static/unit-test code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V2.2 CPU 4-object runtime smoke（只检查完整数据路径，不作为科学结论）
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+  OUT=pose_point_depth_mv/outputs/ppd_v2_crossfit_geometry_smoke4_20260715
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V2.2.exit_code"
+    exit 0
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.audit_geometry \
+    --cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --indices 16-23 \
+    --max_samples 4 \
+    --device cpu \
+    --calibration_fit_fraction 0.5 \
+    --calibration_split_seed 20260715 \
+    --minimum_points_per_split 4 \
+    --min_depth_matches 8 \
+    --min_heldout_matches 8 \
+    --calibration_mask_threshold 0.5 \
+    --calibration_zbuffer_cell_size 14 \
+    --maximum_heldout_median_residual 0.25 \
+    --maximum_heldout_p90_residual 0.60 \
+    --quality_reference_residual 0.25 \
+    --min_correct_calibration_rate 0.50 \
+    --min_object_win_rate 0.0 \
+    --max_inactive_gate_abs 0.0 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V2.2.exit_code"
+  echo "PPD-v2 4-object smoke code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V2.3 正式PPD-1：fresh48 frozen/cross-fit geometry audit
+# - 不加载SS Flow，不训练。
+# - 这是进入任何后续Flow实验的硬门。
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-0}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+  OUT=pose_point_depth_mv/outputs/ppd_v2_crossfit_geometry_fresh48_20260715
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V2.3.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.audit_geometry \
+    --cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --indices 16-63 \
+    --max_samples 0 \
+    --device cuda \
+    --volume_side 16 \
+    --minimum_depth_tolerance 0.02 \
+    --maximum_depth_tolerance 0.15 \
+    --surface_threshold 0.30 \
+    --free_threshold 0.30 \
+    --minimum_surface_views 2 \
+    --minimum_free_views 2 \
+    --prior_radius_voxels 1.5 \
+    --gate_floor 0.25 \
+    --calibration_fit_fraction 0.5 \
+    --calibration_split_seed 20260715 \
+    --minimum_points_per_split 4 \
+    --min_depth_matches 8 \
+    --min_heldout_matches 8 \
+    --calibration_mask_threshold 0.5 \
+    --calibration_zbuffer_cell_size 14 \
+    --maximum_heldout_median_residual 0.25 \
+    --maximum_heldout_p90_residual 0.60 \
+    --quality_reference_residual 0.25 \
+    --min_correct_calibration_rate 0.70 \
+    --min_object_win_rate 0.60 \
+    --max_inactive_gate_abs 0.0 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V2.3.exit_code"
+  echo "PPD-v2 full geometry code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V2.4 正式PPD-2：固定C2 residual的energy-matched Flow causal audit
+# - 仅当V2.3 report.json中的passed=true才会启动。
+# - 这是测试命令，不会更新任何checkpoint。
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-0}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+  GEOMETRY=pose_point_depth_mv/outputs/ppd_v2_crossfit_geometry_fresh48_20260715/report.json
+  CKPT=ar_ss_flow/outputs/c2_object_gate_pose_lifting_train16_s50_seed42/checkpoints/last.pt
+  # r1将effective gate严格限制在[0,1]。10x只作为scale分布诊断阈值；
+  # 1000x是饱和搜索上限。真正的硬门是目标RMS在不放大raw residual时可达。
+  OUT=pose_point_depth_mv/outputs/ppd_v2_energy_matched_flow_fresh48_noise48_50_r1_20260715
+  mkdir -p pose_point_depth_mv/outputs
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c \
+    'import json,sys; p=json.load(open(sys.argv[1])); raise SystemExit(0 if p.get("passed") else 2)' \
+    "${GEOMETRY}"
+  GATE_CODE=$?
+  if [ "${GATE_CODE}" -ne 0 ]; then
+    echo "V2.3 did not pass; PPD-2 Flow audit is intentionally not started."
+    echo 99 > "${OUT}.V2.4.exit_code"
+    exit 0
+  fi
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V2.4.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.eval_flow \
+    --cache_manifest "${CACHE}" \
+    --checkpoint "${CKPT}" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16-63 \
+    --max_samples 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --t_values 0.5,0.7,0.9 \
+    --adapter_hidden_dim 96 \
+    --base_residual_scale 0.5 \
+    --object_cap 1.0 \
+    --time_gate_start 0.5 \
+    --time_gate_ramp 0.0 \
+    --amp_dtype bf16 \
+    --minimum_depth_tolerance 0.02 \
+    --maximum_depth_tolerance 0.15 \
+    --surface_threshold 0.30 \
+    --free_threshold 0.30 \
+    --minimum_surface_views 2 \
+    --minimum_free_views 2 \
+    --prior_radius_voxels 1.5 \
+    --gate_floor 0.25 \
+    --calibration_fit_fraction 0.5 \
+    --calibration_split_seed 20260715 \
+    --minimum_points_per_split 4 \
+    --min_depth_matches 8 \
+    --min_heldout_matches 8 \
+    --calibration_mask_threshold 0.5 \
+    --calibration_zbuffer_cell_size 14 \
+    --maximum_heldout_median_residual 0.25 \
+    --maximum_heldout_p90_residual 0.60 \
+    --quality_reference_residual 0.25 \
+    --min_eligible_ratio 0.70 \
+    --max_inactive_gate_abs 0.0 \
+    --max_energy_match_scale 10.0 \
+    --hard_max_energy_match_scale 1000.0 \
+    --max_energy_match_relative_error 1.0e-5 \
+    --bootstrap_samples 10000 \
+    --min_object_win_vs_matched 0.55 \
+    --min_object_win_vs_corrupt 0.60 \
+    --min_correct_object_gain -0.001 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V2.4.exit_code"
+  echo "PPD-v2 energy-matched Flow audit code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V2.5 打印V2.3/V2.4判定；缺失报告只打印MISSING，不关闭终端
+# ============================================================================
+(
+  cd /home/zjr/Tracker || exit 0
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+from pathlib import Path
+
+paths = [
+    Path("pose_point_depth_mv/outputs/ppd_v2_crossfit_geometry_fresh48_20260715/report.json"),
+    Path("pose_point_depth_mv/outputs/ppd_v2_energy_matched_flow_fresh48_noise48_50_r1_20260715/report.json"),
+]
+for path in paths:
+    print("\n====", path)
+    if not path.exists():
+        print("MISSING")
+        continue
+    report = json.loads(path.read_text(encoding="utf-8"))
+    print("stage=", report.get("stage"))
+    print("passed=", report.get("passed"))
+    print("checks=", report.get("checks"))
+    if "comparisons" in report:
+        for name, row in report["comparisons"].items():
+            print(name, row)
+' 
+  exit 0
+)
+
+
+# ============================================================================
+# V2.6 训练准入说明（当前没有可执行的新训练命令）
+# ============================================================================
+# 只有V2.3和V2.4同时PASS，才实现并运行PPD-3：
+#
+#   input:
+#     x_t + stock velocity + 17-channel PPD evidence
+#
+#   model:
+#     same-voxel / local-neighborhood geometry-conditioned residual adapter
+#
+#   loss:
+#     correct flow matching
+#     hard-corruption -> stock preservation
+#     neutral exact preservation
+#     residual norm control
+#
+# 当前旧C2 checkpoint从未读取17通道PPD evidence。重新运行C2训练不能回答
+# “VGGT depth是否改善模型”，因此这里不提供误导性的C2重训命令。
+
+
+# ============================================================================
+# PPD-3A：16^3 local-target learnability probe（2026-07-15）
+# ============================================================================
+#
+# 当前模型结构：
+#
+#   frozen ReconViaGen stock SS Flow
+#       x_t + stock_condition -> v_stock
+#
+#   strict PPD evidence cache（17通道，16^3）：
+#       correct + 6种paired corruption
+#       pose_cyclic1 / pose_reverse
+#       depth_view_cyclic1 / depth_spatial
+#       point_reflect / point_cross_object
+#
+#   trainable probe（约1k参数，rank=16/32）：
+#       state = [x_t(8), v_stock(8), t/1000(1)]
+#       state_hidden = 1x1x1 Conv(state)
+#       evidence_hidden = 1x1x1 Conv(PPD evidence)
+#       interaction = [evidence_hidden,
+#                      state_hidden * evidence_hidden]
+#       delta = zero-init 1x1x1 low-rank MLP(interaction)
+#       delta *= (positive_label OR negative_label)
+#
+#   没有全局attention；没有跨voxel mixing；没有加载旧C2 residual；
+#   physical-off、null evidence（保留XYZ）和neutral voxel严格输出零。
+#
+# 训练目标：
+#   correct active voxel -> v_gt - v_stock
+#   corruption active voxel -> 0
+#   correct flow gain > 0
+#   correct flow loss < paired corruption flow loss
+#
+# 目的：先回答“严格几何证据能否在SS Flow的同体素局部目标上被学习”。
+# PPD-3A PASS之后才实现更大的PPD-3B adapter；FAIL则停止继续扩大该分支。
+
+
+# ============================================================================
+# V3.1 静态编译 + 15项结构/几何单测
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/ppd3a_static_tests_20260715
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/local_target_probe.py \
+    pose_point_depth_mv/build_probe_evidence_cache.py \
+    pose_point_depth_mv/train_local_target_probe.py \
+    pose_point_depth_mv/eval_local_target_probe.py \
+    pose_point_depth_mv/test_local_target_probe.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_local_target_probe \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    2>&1 | tee "${OUT}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+
+  if [ "${COMPILE_CODE}" -eq 0 ] && [ "${TEST_CODE}" -eq 0 ]; then
+    CODE=0
+  else
+    CODE=1
+  fi
+  echo "${CODE}" | tee "${OUT}/V3.1.exit_code"
+  echo "PPD-3A static/unit-test code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.2 构建全64对象strict cross-fit evidence cache（CPU即可）
+# - 一次生成correct和六类corruption，后续训练/评估读取完全相同的证据。
+# - 非finite、label overlap、correct active为空会硬失败。
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  SOURCE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+  OUT=/data/ppd3a_probe_evidence_all64_v1_20260715
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V3.2.exit_code"
+    exit 0
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.build_probe_evidence_cache \
+    --cache_manifest "${SOURCE}" \
+    --output_dir "${OUT}" \
+    --indices all \
+    --device cpu \
+    --calibration_fit_fraction 0.5 \
+    --calibration_split_seed 20260715 \
+    --minimum_points_per_split 4 \
+    --min_depth_matches 8 \
+    --min_heldout_matches 8 \
+    --calibration_mask_threshold 0.5 \
+    --calibration_zbuffer_cell_size 14 \
+    --maximum_heldout_median_residual 0.25 \
+    --maximum_heldout_p90_residual 0.60 \
+    --quality_reference_residual 0.25 \
+    --min_eligible_ratio 0.70 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V3.2.exit_code"
+  echo "PPD-3A evidence cache code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.3 打印cache审计；passed=false时不要继续训练
+# ============================================================================
+(
+  cd /home/zjr/Tracker || exit 0
+  CACHE=/data/ppd3a_probe_evidence_all64_v1_20260715
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+from pathlib import Path
+p = Path("/data/ppd3a_probe_evidence_all64_v1_20260715/report.json")
+if not p.exists():
+    print("MISSING:", p)
+else:
+    r = json.loads(p.read_text(encoding="utf-8"))
+    print("passed=", r.get("passed"))
+    print("checks=", r.get("checks"))
+    print("sample/eligible=", r.get("sample_count"), r.get("eligible_count"))
+    print("train eligible 0-15=", r.get("train_eligible_count_0_15"))
+    print("fresh eligible 16-63=", r.get("fresh_eligible_count_16_63"))
+'
+  exit 0
+)
+
+
+# ============================================================================
+# V3.4 单卡BF16 s5 smoke（只做数值与梯度门）
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ppd3a_probe_evidence_all64_v1_20260715/manifest.json
+  OUT=pose_point_depth_mv/outputs/ppd3a_probe_train4_s5_seed42_bf16_20260715
+  mkdir -p pose_point_depth_mv/outputs
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V3.4.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.train_local_target_probe \
+    --probe_cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-3 \
+    --max_steps 5 \
+    --save_every 5 \
+    --log_every 1 \
+    --num_workers 0 \
+    --seed 42 \
+    --lr 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --rank 32 \
+    --physical_scale 1.0 \
+    --t_schedule uniform \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V3.4.exit_code"
+  echo "PPD-3A s5 code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.5 s5 finite checkpoint audit
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/ppd3a_probe_train4_s5_seed42_bf16_20260715
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 5 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json" \
+    2>&1 | tee "${RUN}/finite_run_audit.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${RUN}/V3.5.exit_code"
+  echo "PPD-3A s5 finite audit code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.6 正式低成本train16 s100（单GPU；不要用旧C2 checkpoint resume）
+# - 仅在V3.2 report passed=true且V3.5 audit passed=true后运行。
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ppd3a_probe_evidence_all64_v1_20260715/manifest.json
+  OUT=pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V3.6.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.train_local_target_probe \
+    --probe_cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-15 \
+    --max_steps 100 \
+    --save_every 25 \
+    --log_every 5 \
+    --num_workers 0 \
+    --seed 42 \
+    --lr 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --rank 32 \
+    --physical_scale 1.0 \
+    --t_schedule uniform \
+    --local_target_weight 1.0 \
+    --flow_weight 0.10 \
+    --corrupt_zero_weight 0.25 \
+    --gain_weight 0.10 \
+    --gain_margin 0.001 \
+    --rank_weight 0.10 \
+    --rank_margin 0.001 \
+    --delta_norm_weight 0.01 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V3.6.exit_code"
+  echo "PPD-3A train16 s100 code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.7 s100 finite audit
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 100 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json" \
+    2>&1 | tee "${RUN}/finite_run_audit.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${RUN}/V3.7.exit_code"
+  echo "PPD-3A s100 finite audit code=${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.8 train16 paired teacher-forced evaluation
+# - 3 noise seeds x 5 t；六类corruption共享同一target/noise/x_t/t/stock。
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ppd3a_probe_evidence_all64_v1_20260715/manifest.json
+  RUN=pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715
+  OUT=${RUN}/eval_train16_noise484950_t013579
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V3.8.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.eval_local_target_probe \
+    --probe_cache_manifest "${CACHE}" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-15 \
+    --max_samples 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --t_values 0.1,0.3,0.5,0.7,0.9 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 10000 \
+    --min_correct_object_win_rate 0.65 \
+    --min_corruption_object_win_rate 0.60 \
+    --min_positive_t_count 4 \
+    --max_neutral_abs 0.0 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V3.8.exit_code"
+  echo "PPD-3A train16 eval runtime code=${CODE}; scientific decision is in report.json"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.9 fresh48 object-disjoint paired evaluation（PPD-3A最终门）
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ppd3a_probe_evidence_all64_v1_20260715/manifest.json
+  RUN=pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715
+  OUT=${RUN}/eval_fresh48_noise484950_t013579
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists, keep it unchanged: ${OUT}"
+    echo 98 > "${OUT}.V3.9.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=${GPU} \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.eval_local_target_probe \
+    --probe_cache_manifest "${CACHE}" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16-63 \
+    --max_samples 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --t_values 0.1,0.3,0.5,0.7,0.9 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 10000 \
+    --min_correct_object_win_rate 0.65 \
+    --min_corruption_object_win_rate 0.60 \
+    --min_positive_t_count 4 \
+    --max_neutral_abs 0.0 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" | tee "${OUT}.V3.9.exit_code"
+  echo "PPD-3A fresh48 eval runtime code=${CODE}; scientific decision is in report.json"
+  exit 0
+)
+
+
+# ============================================================================
+# V3.10 汇总train16/fresh48判定（只打印，不关闭终端）
+# ============================================================================
+(
+  cd /home/zjr/Tracker || exit 0
+  RUN=pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+from pathlib import Path
+paths = [
+    Path("pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715/eval_train16_noise484950_t013579/report.json"),
+    Path("pose_point_depth_mv/outputs/ppd3a_probe_train16_s100_seed42_bf16_20260715/eval_fresh48_noise484950_t013579/report.json"),
+]
+for path in paths:
+    print("\n====", path)
+    if not path.exists():
+        print("MISSING")
+        continue
+    report = json.loads(path.read_text(encoding="utf-8"))
+    print("passed=", report.get("passed"))
+    print("objects/records=", report.get("object_count"), report.get("record_count"))
+    print("stock preservation=", report.get("stock_preservation"))
+    print("checks=", report.get("decision", {}).get("checks"))
+    stock = report.get("comparisons", {}).get("correct_vs_stock", {})
+    print("correct-vs-stock object=", stock.get("object"))
+    print("correct-vs-stock object win=", stock.get("object_win_rate"))
+    for name, row in report.get("comparisons", {}).get("correct_vs_corruptions", {}).items():
+        print(name, "flow object=", row.get("flow", {}).get("object"),
+              "win=", row.get("flow", {}).get("object_win_rate"))
+'
+  exit 0
+)
+
+
+# PPD-3A最终准入：
+#   V3.8 train16 passed=true
+#   且 V3.9 fresh48 passed=true
+# 才实现PPD-3B较大same-voxel/local-3x3x3 adapter。
+# 任一FAIL都不增加rank、不启用Flow LoRA、不继续堆训练步数。
+
+
+# ============================================================================
+# V4 Point-only Local-anchor V2（2026-07-15）
+# ============================================================================
+#
+# 目标：
+#   对聚合17通道PPD路线做完停止诊断后，只保留证据最明确的稀疏点局部锚点。
+#   本阶段不再输入pose/depth，不训练bridge，不训练原SS Flow，也不启用Flow LoRA。
+#
+# 模型结构：
+#   frozen ReconViaGen stock condition + frozen stock SS Flow
+#                           |
+#            x_t + v_stock + normalized t
+#                           |
+#   point evidence: occupancy/confidence/distance + active/neutral + XYZ
+#                           |
+#             same-voxel low-rank probe（3104 params, rank=32）
+#                           |
+#       delta * fixed_correct_point_mask * physical_scale
+#                           |
+#                    v_stock + delta
+#
+# 关键协议：
+#   1. point active区域是16^3中距correct point <= 1 voxel的并集；
+#   2. 最多确定性保留512点，防止稠密样本把“局部锚点”变成全局修改；
+#   3. train16和fresh48内部分别选择cross-object control，禁止跨split借负样本；
+#   4. correct/control确定性下采样到共同点数，confidence多重集合严格相同；
+#   5. correct与六种control全部使用correct active mask；
+#   6. 每个optimizer update同时训练全部六种control：
+#      reflect / axis-cycle / spatial-roll / matched-cross-object /
+#      point-drop(active-mask-only) / constant-prior；
+#   7. physical-off、null evidence、非anchor位置必须bit-exact stock；
+#   8. 所有命令外层最终exit 0，不会因科学FAIL关闭当前终端；真实状态写入.exit_code。
+#
+# 已完成的开发验证：
+#   - 26个相关单元/回归测试通过；
+#   - 全64对象cache smoke PASS；
+#   - active ratio mean/max = 0.1024 / 0.2944；
+#   - 单步BF16训练、反向、optimizer、checkpoint、finite audit均PASS。
+#
+# 不能复用：
+#   旧PPD-3A checkpoint、旧17通道probe cache、旧point residual checkpoint。
+#
+
+
+# ============================================================================
+# V4.1 静态编译与回归测试
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/point_anchor_v2_static_20260715
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/point_anchor_v2.py \
+    pose_point_depth_mv/build_point_anchor_v2_cache.py \
+    pose_point_depth_mv/train_point_anchor_v2.py \
+    pose_point_depth_mv/eval_point_anchor_v2.py \
+    pose_point_depth_mv/summarize_point_anchor_v2.py \
+    pose_point_depth_mv/test_point_anchor_v2.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+  echo "${COMPILE_CODE}" > "${OUT}/py_compile.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_point_anchor_v2 \
+    pose_point_depth_mv.test_local_target_probe \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    2>&1 | tee "${OUT}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+  echo "${TEST_CODE}" > "${OUT}/unittest.exit_code"
+
+  echo "V4.1 compile/test codes: ${COMPILE_CODE}/${TEST_CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.2 构建全64对象point-only cache
+# ============================================================================
+# 这是新cache；不要覆盖已有目录。若目录存在，先人工判断是否是完整成功结果。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  SOURCE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714/manifest.json
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+
+  if [ -e "${CACHE}" ]; then
+    echo "cache path already exists; no overwrite: ${CACHE}"
+    exit 0
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.build_point_anchor_v2_cache \
+    --source_cache_manifest "${SOURCE}" \
+    --output_dir "${CACHE}" \
+    --indices all \
+    --radius_voxels 1.0 \
+    --max_points 512 \
+    --matching_seed 20260715 \
+    --max_active_ratio 0.35 \
+    2>&1 | tee "${CACHE}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${CACHE}.exit_code"
+  echo "V4.2 cache build code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.3 cache硬审计摘要
+# ============================================================================
+# 必须同时满足：passed=true、64样本、16/48对象、全部checks=true。
+(
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  REPORT=${CACHE}/report.json
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("MISSING:", path)
+    raise SystemExit(2)
+report = json.loads(path.read_text(encoding="utf-8"))
+checks = report.get("checks", {})
+passed = (
+    bool(report.get("passed"))
+    and int(report.get("sample_count", -1)) == 64
+    and int(report.get("train_object_count", -1)) == 16
+    and int(report.get("fresh_object_count", -1)) == 48
+    and bool(checks)
+    and all(bool(value) for value in checks.values())
+)
+print(json.dumps({
+    "passed": passed,
+    "checks": checks,
+    "sample_count": report.get("sample_count"),
+    "train/fresh": [report.get("train_object_count"), report.get("fresh_object_count")],
+    "active_ratio_mean": report.get("active_ratio_mean"),
+    "active_ratio_max": report.get("active_ratio_max"),
+    "point_count_mean": report.get("point_count_mean"),
+}, indent=2))
+raise SystemExit(0 if passed else 2)
+' "${REPORT}"
+
+  CODE=$?
+  echo "${CODE}" > "${CACHE}/cache_decision.exit_code"
+  echo "V4.3 cache decision code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.4 单卡BF16 s5数值门（seed42）
+# ============================================================================
+# cache_decision必须为0后才运行。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  OUT=pose_point_depth_mv/outputs/point_anchor_v2_train16_s5_seed42_bf16_20260715
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+  mkdir -p "$(dirname "${OUT}")"
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_point_anchor_v2 \
+    --point_cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-15 \
+    --max_steps 5 \
+    --save_every 5 \
+    --log_every 1 \
+    --num_workers 0 \
+    --seed 42 \
+    --lr 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --rank 32 \
+    --physical_scale 1.0 \
+    --t_schedule uniform \
+    --local_target_weight 1.0 \
+    --flow_weight 0.10 \
+    --control_zero_weight 0.25 \
+    --gain_weight 0.10 \
+    --gain_margin 0.00005 \
+    --rank_weight 0.25 \
+    --rank_margin 0.00001 \
+    --delta_norm_weight 0.01 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "V4.4 s5 training code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.5 s5 finite checkpoint audit
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s5_seed42_bf16_20260715
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 5 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json" \
+    2>&1 | tee "${RUN}/finite_run_audit.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${RUN}/finite_run_audit.exit_code"
+  echo "V4.5 finite audit code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.6 fresh seed42 s100机制训练（不从s5 resume）
+# ============================================================================
+# 只有V4.5 passed=true才运行。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  OUT=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260715
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+  mkdir -p "$(dirname "${OUT}")"
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_point_anchor_v2 \
+    --point_cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-15 \
+    --max_steps 100 \
+    --save_every 25 \
+    --log_every 5 \
+    --num_workers 0 \
+    --seed 42 \
+    --lr 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --rank 32 \
+    --physical_scale 1.0 \
+    --t_schedule uniform \
+    --local_target_weight 1.0 \
+    --flow_weight 0.10 \
+    --control_zero_weight 0.25 \
+    --gain_weight 0.10 \
+    --gain_margin 0.00005 \
+    --rank_weight 0.25 \
+    --rank_margin 0.00001 \
+    --delta_norm_weight 0.01 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "V4.6 seed42 s100 training code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.7 seed42 s100 finite audit
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260715
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 100 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json" \
+    2>&1 | tee "${RUN}/finite_run_audit.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${RUN}/finite_run_audit.exit_code"
+  echo "V4.7 seed42 finite audit code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.8 seed42 train16 + object-disjoint fresh48严格评估
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260715
+
+  for SPEC in train16:0-15 fresh48:16-63; do
+    SPLIT=${SPEC%%:*}
+    INDICES=${SPEC#*:}
+    OUT=${RUN}/eval_${SPLIT}_noise484950_t013579
+
+    if [ -f "${OUT}/report.json" ]; then
+      echo "reuse complete report: ${OUT}/report.json"
+      continue
+    fi
+    if [ -e "${OUT}" ]; then
+      echo "incomplete output exists; no overwrite: ${OUT}"
+      echo 98 > "${OUT}.exit_code"
+      continue
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.eval_point_anchor_v2 \
+      --point_cache_manifest "${CACHE}/manifest.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices "${INDICES}" \
+      --split_name "${SPLIT}" \
+      --max_samples 0 \
+      --device cuda \
+      --seeds 48,49,50 \
+      --t_values 0.1,0.3,0.5,0.7,0.9 \
+      --physical_scale 1.0 \
+      --bootstrap_samples 10000 \
+      --min_object_win_rate 0.65 \
+      --min_positive_t_count 4 \
+      2>&1 | tee "${OUT}.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+    echo "V4.8 seed42 ${SPLIT} eval code: ${CODE}"
+  done
+
+  exit 0
+)
+
+
+# ============================================================================
+# V4.9 seed42科学判定（只打印和记录，不关闭终端）
+# ============================================================================
+(
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260715
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+paths = [Path(value) for value in sys.argv[1:]]
+passed = True
+for path in paths:
+    print("\n====", path)
+    if not path.is_file():
+        print("MISSING")
+        passed = False
+        continue
+    report = json.loads(path.read_text(encoding="utf-8"))
+    print("passed=", report.get("passed"))
+    print("stock preservation=", report.get("stock_preservation"))
+    print("checks=", report.get("decision", {}).get("checks"))
+    print("correct-vs-stock=", report.get("correct_vs_stock", {}).get("object"))
+    print("correct object win=", report.get("correct_vs_stock", {}).get("object_win_rate"))
+    for name, row in report.get("controls", {}).items():
+        metric = row.get("correct_advantage_flow", {})
+        print(name, "object=", metric.get("object"),
+              "win=", metric.get("object_win_rate"),
+              "CI=", metric.get("object_bootstrap_95_ci"))
+    passed = passed and bool(report.get("passed"))
+print("\nseed42 paired decision:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' \
+    "${RUN}/eval_train16_noise484950_t013579/report.json" \
+    "${RUN}/eval_fresh48_noise484950_t013579/report.json"
+
+  CODE=$?
+  echo "${CODE}" > "${RUN}/seed42_paired_decision.exit_code"
+  echo "V4.9 seed42 paired decision code: ${CODE}"
+  exit 0
+)
+
+
+# ============================================================================
+# V4.10 只有seed42 paired PASS后，fresh训练seed43/44
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+
+  for TRAIN_SEED in 43 44; do
+    OUT=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed${TRAIN_SEED}_bf16_20260715
+
+    if [ -e "${OUT}" ]; then
+      echo "output already exists; no overwrite: ${OUT}"
+      continue
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.train_point_anchor_v2 \
+      --point_cache_manifest "${CACHE}/manifest.json" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices 0-15 \
+      --max_steps 100 \
+      --save_every 25 \
+      --log_every 5 \
+      --num_workers 0 \
+      --seed "${TRAIN_SEED}" \
+      --lr 1e-4 \
+      --grad_accum 1 \
+      --grad_clip 1.0 \
+      --amp_dtype bf16 \
+      --nonfinite_policy error \
+      --max_nonfinite_attempts 0 \
+      --rank 32 \
+      --physical_scale 1.0 \
+      --t_schedule uniform \
+      --local_target_weight 1.0 \
+      --flow_weight 0.10 \
+      --control_zero_weight 0.25 \
+      --gain_weight 0.10 \
+      --gain_margin 0.00005 \
+      --rank_weight 0.25 \
+      --rank_margin 0.00001 \
+      --delta_norm_weight 0.01 \
+      2>&1 | tee "${OUT}.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+    echo "V4.10 seed${TRAIN_SEED} training code: ${CODE}"
+  done
+
+  exit 0
+)
+
+
+# ============================================================================
+# V4.11 seed43/44 finite audits
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  for TRAIN_SEED in 43 44; do
+    RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed${TRAIN_SEED}_bf16_20260715
+
+    if [ ! -f "${RUN}/train_report.json" ] || [ ! -f "${RUN}/checkpoints/last.pt" ]; then
+      echo "missing completed seed${TRAIN_SEED} run; skip audit"
+      echo 98 > "${RUN}.finite_audit.exit_code"
+      continue
+    fi
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+      --train_report "${RUN}/train_report.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --expected_updates 100 \
+      --max_nonfinite_attempts 0 \
+      --output "${RUN}/finite_run_audit.json" \
+      2>&1 | tee "${RUN}/finite_run_audit.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${RUN}/finite_run_audit.exit_code"
+    echo "V4.11 seed${TRAIN_SEED} finite audit code: ${CODE}"
+  done
+
+  exit 0
+)
+
+
+# ============================================================================
+# V4.12 seed43/44 train16 + fresh48评估
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+
+  for TRAIN_SEED in 43 44; do
+    RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed${TRAIN_SEED}_bf16_20260715
+    CHECKPOINT=${RUN}/checkpoints/last.pt
+    if [ ! -f "${CHECKPOINT}" ]; then
+      echo "missing checkpoint for seed${TRAIN_SEED}; skip evaluation"
+      continue
+    fi
+
+    for SPEC in train16:0-15 fresh48:16-63; do
+      SPLIT=${SPEC%%:*}
+      INDICES=${SPEC#*:}
+      OUT=${RUN}/eval_${SPLIT}_noise484950_t013579
+
+      if [ -f "${OUT}/report.json" ]; then
+        echo "reuse complete report: ${OUT}/report.json"
+        continue
+      fi
+      if [ -e "${OUT}" ]; then
+        echo "incomplete output exists; no overwrite: ${OUT}"
+        echo 98 > "${OUT}.exit_code"
+        continue
+      fi
+
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+        pose_point_depth_mv.eval_point_anchor_v2 \
+        --point_cache_manifest "${CACHE}/manifest.json" \
+        --checkpoint "${CHECKPOINT}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices "${INDICES}" \
+        --split_name "${SPLIT}" \
+        --max_samples 0 \
+        --device cuda \
+        --seeds 48,49,50 \
+        --t_values 0.1,0.3,0.5,0.7,0.9 \
+        --physical_scale 1.0 \
+        --bootstrap_samples 10000 \
+        --min_object_win_rate 0.65 \
+        --min_positive_t_count 4 \
+        2>&1 | tee "${OUT}.log"
+
+      CODE=${PIPESTATUS[0]}
+      echo "${CODE}" > "${OUT}.exit_code"
+      echo "V4.12 seed${TRAIN_SEED} ${SPLIT} eval code: ${CODE}"
+    done
+  done
+
+  exit 0
+)
+
+
+# ============================================================================
+# V4.13 三训练seed严格汇总
+# ============================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUTPUT_ROOT=pose_point_depth_mv/outputs
+  SUMMARY=${OUTPUT_ROOT}/point_anchor_v2_train16_fresh48_s100_multiseed_20260715
+
+  if [ -e "${SUMMARY}" ]; then
+    echo "summary output already exists; no overwrite: ${SUMMARY}"
+    exit 0
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.summarize_point_anchor_v2 \
+    --train_reports \
+      "${OUTPUT_ROOT}/point_anchor_v2_train16_s100_seed42_bf16_20260715/eval_train16_noise484950_t013579" \
+      "${OUTPUT_ROOT}/point_anchor_v2_train16_s100_seed43_bf16_20260715/eval_train16_noise484950_t013579" \
+      "${OUTPUT_ROOT}/point_anchor_v2_train16_s100_seed44_bf16_20260715/eval_train16_noise484950_t013579" \
+    --fresh_reports \
+      "${OUTPUT_ROOT}/point_anchor_v2_train16_s100_seed42_bf16_20260715/eval_fresh48_noise484950_t013579" \
+      "${OUTPUT_ROOT}/point_anchor_v2_train16_s100_seed43_bf16_20260715/eval_fresh48_noise484950_t013579" \
+      "${OUTPUT_ROOT}/point_anchor_v2_train16_s100_seed44_bf16_20260715/eval_fresh48_noise484950_t013579" \
+    --expected_seeds 42,43,44 \
+    --output_dir "${SUMMARY}" \
+    2>&1 | tee "${SUMMARY}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${SUMMARY}.exit_code"
+
+  if [ -f "${SUMMARY}/report.json" ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(json.dumps({
+    "passed": report.get("passed"),
+    "checks": report.get("checks"),
+    "fresh_correct_mean_across_seeds": report.get("fresh_correct_mean_across_seeds"),
+}, indent=2))
+raise SystemExit(0 if report.get("passed") else 2)
+' "${SUMMARY}/report.json"
+    DECISION_CODE=$?
+  else
+    DECISION_CODE=98
+  fi
+
+  echo "${DECISION_CODE}" > "${SUMMARY}.decision_code"
+  echo "V4.13 summary/decision codes: ${CODE}/${DECISION_CODE}"
+  exit 0
+)
+
+
+# V4最终准入标准（全部是硬条件）：
+#   - 三个训练seed的train16和fresh48均passed=true；
+#   - correct-vs-stock mean/median > 0、object win >= 65%、bootstrap CI下界 > 0；
+#   - correct对六种control逐项满足mean/median > 0、win >= 65%、CI下界 > 0；
+#   - correct-vs-stock至少4/5个t为正；
+#   - physical-off/null/non-anchor全部exact stock；
+#   - 三seed协议hash、对象集合、checkpoint step、noise/t及loss配置一致。
+#
+# 任一seed或任一control FAIL：
+#   停止当前point-only same-voxel表示；不加rank、不加步数、不启用Flow LoRA。
+#
+# 只有V4.13 PASS：
+#   才把point-only local anchor作为可复现机制保留，并进入更大object-disjoint训练集；
+#   pose主线另行进入“保留view identity的pose-guided visual lifting”，不与本阶段混训。
+
+
+# ==========================================================================
+# V5 Point-only Local-anchor V2 fixed-noise rollout（2026-07-16）
+# ==========================================================================
+#
+# 本阶段不重新训练，直接复用V4已经通过的三个s100 checkpoint。目的不是继续优化
+# teacher-forced loss，而是检查局部velocity收益能否穿过原生25步SS采样并改善坐标结果。
+#
+# 每个采样步：
+#   v_pos    = frozen SS Flow(x_t, t, stock_cond)
+#   v_native = ReconViaGen原生CFG(v_pos, v_neg)
+#   delta    = PointAnchorProbe(x_t, v_pos, t, point_evidence)
+#   v_final  = v_native + delta
+#
+# 这种post-CFG注入避免CFG=5把训练得到的delta再次放大；probe仍读取与训练一致的
+# positive conditional stock velocity。stock、correct和六种control共享完全相同的初始噪声。
+# correct与六类control批处理，所有分支继续使用correct fixed active mask。
+#
+# 原生采样协议硬锁定为checkpoint pipeline默认值：
+#   steps=25, cfg_strength=5.0, cfg_interval=[0.5,1.0], rescale_t=3.0,
+#   guidance_rescale=0.0。
+#
+# 正式主门：
+#   - native stock loop latent和decode坐标bit-exact；
+#   - correct local IoU和correct-anchor hit优于stock；
+#   - correct local IoU逐项优于六类matched controls；
+#   - object win >=65%，bootstrap CI下界>0；
+#   - 三个noise seed至少2个方向为正；
+#   - global IoU/precision、outside IoU、component指标不发生超阈值退化。
+#
+# 所有shell块最终exit 0，不会因科学FAIL关闭终端；真实运行状态写入.exit_code，
+# 科学裁决写入.decision_code和report.json。
+
+
+# ==========================================================================
+# V5.1 静态编译与回归测试
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/point_anchor_rollout_v2_static_20260716
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/eval_point_anchor_rollout_v2.py \
+    pose_point_depth_mv/summarize_point_anchor_rollout_v2.py \
+    pose_point_depth_mv/test_point_anchor_rollout_v2.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+  echo "${COMPILE_CODE}" > "${OUT}/py_compile.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_point_anchor_rollout_v2 \
+    pose_point_depth_mv.test_point_anchor_v2 \
+    2>&1 | tee "${OUT}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+  echo "${TEST_CODE}" > "${OUT}/unittest.exit_code"
+
+  echo "V5.1 compile/test codes: ${COMPILE_CODE}/${TEST_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V5.2 单对象原生25步结构smoke（只判stock等价，不判科学收益）
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260716
+  OUT=${RUN}/rollout_smoke_fresh1_noise48_native25_v2_20260716
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.eval_point_anchor_rollout_v2 \
+    --point_cache_manifest "${CACHE}/manifest.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16 \
+    --split_name fresh48 \
+    --max_samples 1 \
+    --device cuda \
+    --seeds 48 \
+    --steps 25 \
+    --cfg_strength 5.0 \
+    --cfg_interval 0.5,1.0 \
+    --rescale_t 3.0 \
+    --guidance_rescale 0.0 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 100 \
+    --min_object_win_rate 0.65 \
+    --min_positive_seed_count 1 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+checks = report["decision"]["checks"]
+passed = (
+    checks["native_stock_rollout_bit_exact"]
+    and checks["direct_non_anchor_delta_exact_zero"]
+    and checks["object_disjoint_if_fresh"]
+)
+print(json.dumps({
+    "structure_passed": passed,
+    "stock": report["stock_rollout_equivalence"],
+    "direct_neutral_delta_abs_max": report["direct_neutral_delta_abs_max"],
+    "scientific_passed_not_used_for_smoke": report["passed"],
+}, indent=2))
+raise SystemExit(0 if passed else 2)
+' "${OUT}/report.json"
+  STRUCTURE_CODE=$?
+  echo "${STRUCTURE_CODE}" > "${OUT}.structure_decision_code"
+  echo "V5.2 run/structure codes: ${CODE}/${STRUCTURE_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V5.3 seed42完整fresh48 fixed-noise rollout
+# ==========================================================================
+# 只有V5.2 structure_decision_code=0才运行。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260716
+  OUT=${RUN}/rollout_fresh48_noise484950_native25_v2_20260716
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.eval_point_anchor_rollout_v2 \
+    --point_cache_manifest "${CACHE}/manifest.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16-63 \
+    --split_name fresh48 \
+    --max_samples 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --steps 25 \
+    --cfg_strength 5.0 \
+    --cfg_interval 0.5,1.0 \
+    --rescale_t 3.0 \
+    --guidance_rescale 0.0 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 10000 \
+    --min_object_win_rate 0.65 \
+    --min_positive_seed_count 2 \
+    --max_global_iou_mean_degradation 0.001 \
+    --max_global_precision_mean_degradation 0.005 \
+    --max_outside_iou_mean_degradation 0.001 \
+    --max_component_count_mean_increase 5.0 \
+    --max_largest_component_ratio_mean_degradation 0.02 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "V5.3 seed42 rollout code: ${CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V5.4 seed42科学裁决
+# ==========================================================================
+(
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260716
+  REPORT=${RUN}/rollout_fresh48_noise484950_native25_v2_20260716/report.json
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("MISSING:", path)
+    raise SystemExit(98)
+report = json.loads(path.read_text(encoding="utf-8"))
+print(json.dumps({
+    "passed": report.get("passed"),
+    "checks": report.get("decision", {}).get("checks"),
+    "correct_vs_stock_local_iou": report.get("comparisons", {})
+        .get("correct_vs_stock", {}).get("local_iou"),
+    "per_noise_seed": report.get("per_noise_seed_correct_local_iou_delta"),
+}, indent=2))
+raise SystemExit(0 if report.get("passed") else 2)
+' "${REPORT}"
+
+  CODE=$?
+  echo "${CODE}" > "${RUN}/rollout_fresh48_noise484950_native25_v2_20260716.decision_code"
+  echo "V5.4 seed42 rollout decision code: ${CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V5.5 仅seed42 PASS后运行seed43/44完整fresh48 rollout
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/pose_point_depth_mv_point_anchor_v2_r1_cap512_all64_20260715
+  SEED42_REPORT=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260716/rollout_fresh48_noise484950_native25_v2_20260716/report.json
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+raise SystemExit(0 if path.is_file() and json.loads(path.read_text())["passed"] else 2)
+' "${SEED42_REPORT}"
+  if [ $? -ne 0 ]; then
+    echo "seed42 rollout did not PASS; stop before seed43/44"
+    exit 0
+  fi
+
+  for SPEC in 43:2 44:3; do
+    TRAIN_SEED=${SPEC%%:*}
+    GPU_ID=${SPEC#*:}
+    RUN=pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed${TRAIN_SEED}_bf16_20260716
+    OUT=${RUN}/rollout_fresh48_noise484950_native25_v2_20260716
+
+    if [ -e "${OUT}" ]; then
+      echo "output already exists; no overwrite: ${OUT}"
+      continue
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.eval_point_anchor_rollout_v2 \
+      --point_cache_manifest "${CACHE}/manifest.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices 16-63 \
+      --split_name fresh48 \
+      --max_samples 0 \
+      --device cuda \
+      --seeds 48,49,50 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --guidance_rescale 0.0 \
+      --physical_scale 1.0 \
+      --bootstrap_samples 10000 \
+      --min_object_win_rate 0.65 \
+      --min_positive_seed_count 2 \
+      --max_global_iou_mean_degradation 0.001 \
+      --max_global_precision_mean_degradation 0.005 \
+      --max_outside_iou_mean_degradation 0.001 \
+      --max_component_count_mean_increase 5.0 \
+      --max_largest_component_ratio_mean_degradation 0.02 \
+      2>&1 | tee "${OUT}.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+    echo "V5.5 seed${TRAIN_SEED} rollout code: ${CODE}"
+  done
+
+  exit 0
+)
+
+
+# ==========================================================================
+# V5.6 三训练seed rollout严格汇总
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  ROOT=pose_point_depth_mv/outputs
+  SUMMARY=${ROOT}/point_anchor_rollout_v2_fresh48_s100_multiseed_20260716
+
+  if [ -e "${SUMMARY}" ]; then
+    echo "summary output already exists; no overwrite: ${SUMMARY}"
+    exit 0
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.summarize_point_anchor_rollout_v2 \
+    --report_dirs \
+      "${ROOT}/point_anchor_v2_train16_s100_seed42_bf16_20260716/rollout_fresh48_noise484950_native25_v2_20260716" \
+      "${ROOT}/point_anchor_v2_train16_s100_seed43_bf16_20260716/rollout_fresh48_noise484950_native25_v2_20260716" \
+      "${ROOT}/point_anchor_v2_train16_s100_seed44_bf16_20260716/rollout_fresh48_noise484950_native25_v2_20260716" \
+    --expected_training_seeds 42,43,44 \
+    --output_dir "${SUMMARY}" \
+    2>&1 | tee "${SUMMARY}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${SUMMARY}.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+print(json.dumps({
+    "passed": report.get("passed"),
+    "checks": report.get("checks"),
+    "seed_results": report.get("seed_results"),
+}, indent=2))
+raise SystemExit(0 if report.get("passed") else 2)
+' "${SUMMARY}/report.json"
+  DECISION_CODE=$?
+  echo "${DECISION_CODE}" > "${SUMMARY}.decision_code"
+  echo "V5.6 summary/decision codes: ${CODE}/${DECISION_CODE}"
+  exit 0
+)
+
+
+# V5最终裁决：
+#   - V5.2只要求结构门PASS；单对象科学FAIL不影响正式评估；
+#   - V5.4 FAIL：停止，不运行seed43/44，不启用Flow LoRA；
+#   - V5.6三seed PASS：Point-anchor才获得rollout级机制证据；
+#   - 即使V5.6 PASS，也先扩大object-disjoint评估，再考虑physical-gated Flow LoRA；
+#   - 本阶段只评估SS occupancy/coordinates，不宣称最终SLAT mesh质量提升。
+
+
+# ==========================================================================
+# V6 View-identity Pose-guided Visual Lifting V1（2026-07-16）
+# ==========================================================================
+#
+# 当前模型结构：
+#
+#   frozen per-view VGGT(2048) + DINO(1024) patch features
+#                         │
+#                         ├── K/T投影到canonical 16^3 voxel
+#                         ├── calibrated VGGT depth/depth confidence
+#                         ├── mask/visibility
+#                         └── world ray + camera origin + patch uv
+#                                      │
+#                                      ▼
+#                      [view, voxel, visual/geometry token]
+#                                      │
+#                 same-voxel pairwise visual consistency（保留view维）
+#                                      │
+#       SS state query(x_t + positive stock velocity + t + canonical xyz)
+#                                      │
+#                         same-voxel view attention
+#                                      │
+#                         zero-centered local residual
+#                                      │
+#                  native guided stock velocity + local delta
+#
+# 关键边界：
+#   - view维一直保留到每个voxel内部attention之后，不再提前mean/max；
+#   - 不使用4096x4096全局attention，不混合不同voxel；
+#   - correct/corrupt训练与主评估共享correct view weight和support gate；
+#   - frozen ReconViaGen bridge、SS Flow、decoder；Flow LoRA关闭；
+#   - physical-off、null evidence和非support区域严格退化到stock；
+#   - 点云只通过既有cache参与VGGT depth标定，本版不直接输入point anchor。
+#   - 当前cache仍使用数据集提供的pixal3d_rotation canonical frame；V6只验证
+#     view identity是否能把pose/depth信号传到SS Flow，不宣称已经解决真实AR中
+#     “未知物体位姿/未知canonical frame”的在线估计问题。
+#
+# Controls：
+#   pose_cyclic1, pose_reverse,
+#   depth_view_cyclic1, depth_spatial,
+#   visual_view_cyclic1
+#
+# 所有命令块最终exit 0，不会关闭当前终端。真实程序返回码写入
+# *.exit_code，科学裁决写入*.decision_code或report.json。
+
+
+# ==========================================================================
+# V6.1 静态编译和回归测试
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_static_20260716
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/view_identity_lifting.py \
+    pose_point_depth_mv/audit_view_identity_lifting.py \
+    pose_point_depth_mv/train_view_identity_lifting.py \
+    pose_point_depth_mv/eval_view_identity_lifting.py \
+    pose_point_depth_mv/summarize_view_identity_lifting.py \
+    pose_point_depth_mv/eval_view_identity_rollout.py \
+    pose_point_depth_mv/test_view_identity_lifting.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+  echo "${COMPILE_CODE}" > "${OUT}/py_compile.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_view_identity_lifting \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    pose_point_depth_mv.test_local_target_probe \
+    pose_point_depth_mv.test_point_anchor_v2 \
+    pose_point_depth_mv.test_point_anchor_rollout_v2 \
+    2>&1 | tee "${OUT}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+  echo "${TEST_CODE}" > "${OUT}/unittest.exit_code"
+
+  echo "V6.1 compile/test codes: ${COMPILE_CODE}/${TEST_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.2 全64对象输入层因果审计（训练前硬门）
+# ==========================================================================
+# 主方向指标：
+#   pose/visual corruption：correct cross-view cosine更高；
+#   depth corruption：correct calibrated depth residual更低。
+# 同时要求每种control确实改变输入，且correct multi-view support非空。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_input_audit_all64_20260716
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.audit_view_identity_lifting \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${OUT}" \
+    --indices all \
+    --max_samples 0 \
+    --device cuda \
+    --min_multiview_support_ratio 0.01 \
+    --min_nonidentity_ratio 0.80 \
+    --min_direction_ratio 0.60 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+passed = path.is_file() and bool(json.loads(path.read_text())["passed"])
+print("V6.2 input audit:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' "${OUT}/report.json"
+  DECISION_CODE=$?
+  echo "${DECISION_CODE}" > "${OUT}.decision_code"
+  echo "V6.2 run/decision codes: ${CODE}/${DECISION_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.3 单卡BF16 s5 smoke + finite checkpoint audit
+# ==========================================================================
+# 首步预期只有output projection有梯度；从第2步起visual/geometry/view-attention/
+# pairwise应出现finite非零梯度。24GB 3090已通过真实单步smoke。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_smoke_s5_seed42_bf16_20260716
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_view_identity_lifting \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-1 \
+    --max_steps 5 \
+    --save_every 5 \
+    --log_every 1 \
+    --num_workers 0 \
+    --seed 42 \
+    --lr 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --hidden_dim 96 \
+    --pair_dim 32 \
+    --min_views 2 \
+    --physical_scale 1.0 \
+    --t_schedule uniform \
+    --local_target_weight 1.0 \
+    --flow_weight 0.10 \
+    --corrupt_zero_weight 0.25 \
+    --gain_weight 0.10 \
+    --gain_margin 0.00005 \
+    --rank_weight 0.25 \
+    --rank_margin 0.00001 \
+    --delta_norm_weight 0.01 \
+    2>&1 | tee "${OUT}.log"
+
+  TRAIN_CODE=${PIPESTATUS[0]}
+  echo "${TRAIN_CODE}" > "${OUT}.train.exit_code"
+
+  if [ -f "${OUT}/train_report.json" ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+      --train_report "${OUT}/train_report.json" \
+      --checkpoint "${OUT}/checkpoints/last.pt" \
+      --expected_updates 5 \
+      --max_nonfinite_attempts 0 \
+      --output "${OUT}/finite_run_audit.json" \
+      2>&1 | tee "${OUT}/finite_run_audit.log"
+    AUDIT_CODE=${PIPESTATUS[0]}
+  else
+    AUDIT_CODE=98
+  fi
+  echo "${AUDIT_CODE}" > "${OUT}.audit.exit_code"
+  echo "V6.3 train/audit codes: ${TRAIN_CODE}/${AUDIT_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.4 seed42 overfit16 s100（只有V6.2和V6.3通过后运行）
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  INPUT_AUDIT=pose_point_depth_mv/outputs/view_identity_v1_input_audit_all64_20260716/report.json
+  SMOKE_AUDIT=pose_point_depth_mv/outputs/view_identity_v1_smoke_s5_seed42_bf16_20260716/finite_run_audit.json
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+paths = [Path(value) for value in sys.argv[1:]]
+raise SystemExit(0 if all(path.is_file() and json.loads(path.read_text())["passed"] for path in paths) else 2)
+' "${INPUT_AUDIT}" "${SMOKE_AUDIT}"
+  if [ $? -ne 0 ]; then
+    echo "V6.2/V6.3 gate did not pass; skip V6.4"
+    exit 0
+  fi
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_view_identity_lifting \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 0-15 \
+    --max_steps 100 \
+    --save_every 25 \
+    --log_every 5 \
+    --num_workers 0 \
+    --seed 42 \
+    --lr 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --hidden_dim 96 \
+    --pair_dim 32 \
+    --min_views 2 \
+    --physical_scale 1.0 \
+    --t_schedule uniform \
+    --local_target_weight 1.0 \
+    --flow_weight 0.10 \
+    --corrupt_zero_weight 0.25 \
+    --gain_weight 0.10 \
+    --gain_margin 0.00005 \
+    --rank_weight 0.25 \
+    --rank_margin 0.00001 \
+    --delta_norm_weight 0.01 \
+    2>&1 | tee "${OUT}.log"
+
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.train.exit_code"
+  if [ -f "${OUT}/train_report.json" ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+      --train_report "${OUT}/train_report.json" \
+      --checkpoint "${OUT}/checkpoints/last.pt" \
+      --expected_updates 100 \
+      --max_nonfinite_attempts 0 \
+      --output "${OUT}/finite_run_audit.json"
+    AUDIT_CODE=$?
+  else
+    AUDIT_CODE=98
+  fi
+  echo "${AUDIT_CODE}" > "${OUT}.audit.exit_code"
+  echo "V6.4 train/audit codes: ${CODE}/${AUDIT_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.5 seed42 train16 + fresh48严格teacher-forced评估
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+
+  for SPEC in train16:0-15 fresh48:16-63; do
+    SPLIT=${SPEC%%:*}
+    INDICES=${SPEC#*:}
+    OUT=${RUN}/eval_${SPLIT}_noise484950_t013579
+    if [ -e "${OUT}" ]; then
+      echo "output already exists; no overwrite: ${OUT}"
+      continue
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.eval_view_identity_lifting \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices "${INDICES}" \
+      --split_name "${SPLIT}" \
+      --max_samples 0 \
+      --device cuda \
+      --seeds 48,49,50 \
+      --t_values 0.1,0.3,0.5,0.7,0.9 \
+      --physical_scale 1.0 \
+      --bootstrap_samples 10000 \
+      --min_object_win_rate 0.65 \
+      --min_positive_t_count 4 \
+      2>&1 | tee "${OUT}.log"
+
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.exit_code"
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+passed = path.is_file() and bool(json.loads(path.read_text())["passed"])
+raise SystemExit(0 if passed else 2)
+' "${OUT}/report.json"
+    DECISION_CODE=$?
+    echo "${DECISION_CODE}" > "${OUT}.decision_code"
+    echo "V6.5 ${SPLIT} run/decision codes: ${CODE}/${DECISION_CODE}"
+  done
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.6 seed43/44 fresh训练（仅seed42 train和fresh都PASS后运行）
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  BASE=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+paths = [Path(value) for value in sys.argv[1:]]
+raise SystemExit(0 if all(path.is_file() and json.loads(path.read_text())["passed"] for path in paths) else 2)
+' "${BASE}/eval_train16_noise484950_t013579/report.json" \
+  "${BASE}/eval_fresh48_noise484950_t013579/report.json"
+  if [ $? -ne 0 ]; then
+    echo "seed42 teacher-forced gate did not pass; stop before seed43/44"
+    exit 0
+  fi
+
+  for SPEC in 43:2 44:3; do
+    SEED=${SPEC%%:*}
+    GPU_ID=${SPEC#*:}
+    OUT=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed${SEED}_bf16_20260716
+    if [ -e "${OUT}" ]; then
+      echo "output already exists; no overwrite: ${OUT}"
+      continue
+    fi
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.train_view_identity_lifting \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --indices 0-15 \
+      --max_steps 100 \
+      --save_every 25 \
+      --log_every 5 \
+      --num_workers 0 \
+      --seed "${SEED}" \
+      --lr 1e-4 \
+      --grad_accum 1 \
+      --grad_clip 1.0 \
+      --amp_dtype bf16 \
+      --nonfinite_policy error \
+      --max_nonfinite_attempts 0 \
+      --hidden_dim 96 \
+      --pair_dim 32 \
+      --min_views 2 \
+      --physical_scale 1.0 \
+      --t_schedule uniform \
+      --local_target_weight 1.0 \
+      --flow_weight 0.10 \
+      --corrupt_zero_weight 0.25 \
+      --gain_weight 0.10 \
+      --gain_margin 0.00005 \
+      --rank_weight 0.25 \
+      --rank_margin 0.00001 \
+      --delta_norm_weight 0.01 \
+      2>&1 | tee "${OUT}.log"
+    CODE=${PIPESTATUS[0]}
+    echo "${CODE}" > "${OUT}.train.exit_code"
+    echo "V6.6 seed${SEED} train code: ${CODE}"
+  done
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.7 seed43/44评估 + 三seed严格汇总
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  for SPEC in 43:2 44:3; do
+    SEED=${SPEC%%:*}
+    GPU_ID=${SPEC#*:}
+    RUN=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed${SEED}_bf16_20260716
+    for SPLIT_SPEC in train16:0-15 fresh48:16-63; do
+      SPLIT=${SPLIT_SPEC%%:*}
+      INDICES=${SPLIT_SPEC#*:}
+      OUT=${RUN}/eval_${SPLIT}_noise484950_t013579
+      if [ -e "${OUT}" ]; then
+        echo "output already exists; no overwrite: ${OUT}"
+        continue
+      fi
+      CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+        pose_point_depth_mv.eval_view_identity_lifting \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --checkpoint "${RUN}/checkpoints/last.pt" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices "${INDICES}" \
+        --split_name "${SPLIT}" \
+        --max_samples 0 \
+        --device cuda \
+        --seeds 48,49,50 \
+        --t_values 0.1,0.3,0.5,0.7,0.9 \
+        --physical_scale 1.0 \
+        --bootstrap_samples 10000 \
+        --min_object_win_rate 0.65 \
+        --min_positive_t_count 4 \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+      echo "${CODE}" > "${OUT}.exit_code"
+      echo "V6.7 seed${SEED} ${SPLIT} code: ${CODE}"
+    done
+  done
+
+  ROOT=pose_point_depth_mv/outputs
+  SUMMARY=${ROOT}/view_identity_v1_train16_fresh48_s100_multiseed_20260716
+  if [ ! -e "${SUMMARY}" ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.summarize_view_identity_lifting \
+      --train_reports \
+        "${ROOT}/view_identity_v1_train16_s100_seed42_bf16_20260716/eval_train16_noise484950_t013579" \
+        "${ROOT}/view_identity_v1_train16_s100_seed43_bf16_20260716/eval_train16_noise484950_t013579" \
+        "${ROOT}/view_identity_v1_train16_s100_seed44_bf16_20260716/eval_train16_noise484950_t013579" \
+      --fresh_reports \
+        "${ROOT}/view_identity_v1_train16_s100_seed42_bf16_20260716/eval_fresh48_noise484950_t013579" \
+        "${ROOT}/view_identity_v1_train16_s100_seed43_bf16_20260716/eval_fresh48_noise484950_t013579" \
+        "${ROOT}/view_identity_v1_train16_s100_seed44_bf16_20260716/eval_fresh48_noise484950_t013579" \
+      --expected_seeds 42,43,44 \
+      --output_dir "${SUMMARY}" \
+      2>&1 | tee "${SUMMARY}.log"
+    SUMMARY_CODE=${PIPESTATUS[0]}
+    echo "${SUMMARY_CODE}" > "${SUMMARY}.exit_code"
+  else
+    echo "summary output already exists; no overwrite: ${SUMMARY}"
+  fi
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.8 单对象原生25步rollout smoke（仅V6.7三seed汇总PASS后运行）
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+  SUMMARY=pose_point_depth_mv/outputs/view_identity_v1_train16_fresh48_s100_multiseed_20260716/report.json
+  OUT=${RUN}/rollout_smoke_fresh1_noise48_native25
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+raise SystemExit(0 if path.is_file() and json.loads(path.read_text())["passed"] else 2)
+' "${SUMMARY}"
+  if [ $? -ne 0 ]; then
+    echo "V6.7 multi-seed teacher-forced gate did not pass; skip rollout"
+    exit 0
+  fi
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.eval_view_identity_rollout \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16 \
+    --split_name fresh48 \
+    --max_samples 1 \
+    --device cuda \
+    --seeds 48 \
+    --steps 25 \
+    --cfg_strength 5.0 \
+    --cfg_interval 0.5,1.0 \
+    --rescale_t 3.0 \
+    --guidance_rescale 0.0 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 100 \
+    --min_object_win_rate 0.0 \
+    --min_positive_seed_count 0 \
+    2>&1 | tee "${OUT}.log"
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+checks = json.loads(path.read_text())["decision"]["checks"]
+passed = (
+    checks["native_stock_rollout_bit_exact"]
+    and checks["direct_non_support_delta_exact_zero"]
+    and checks["object_disjoint_if_fresh"]
+)
+print("V6.8 rollout structure:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' "${OUT}/report.json"
+  STRUCTURE_CODE=$?
+  echo "${STRUCTURE_CODE}" > "${OUT}.structure_decision_code"
+  echo "V6.8 rollout/structure codes: ${CODE}/${STRUCTURE_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.9 seed42 fresh48完整原生25步rollout（V6.8结构检查后人工运行）
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+  SMOKE=${RUN}/rollout_smoke_fresh1_noise48_native25/report.json
+  OUT=${RUN}/rollout_fresh48_noise484950_native25
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+checks = json.loads(path.read_text())["decision"]["checks"]
+raise SystemExit(0 if (
+    checks["native_stock_rollout_bit_exact"]
+    and checks["direct_non_support_delta_exact_zero"]
+    and checks["object_disjoint_if_fresh"]
+) else 2)
+' "${SMOKE}"
+  if [ $? -ne 0 ]; then
+    echo "V6.8 rollout structure did not pass; skip V6.9"
+    exit 0
+  fi
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.eval_view_identity_rollout \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --indices 16-63 \
+    --split_name fresh48 \
+    --max_samples 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --steps 25 \
+    --cfg_strength 5.0 \
+    --cfg_interval 0.5,1.0 \
+    --rescale_t 3.0 \
+    --guidance_rescale 0.0 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 10000 \
+    --min_object_win_rate 0.65 \
+    --min_positive_seed_count 2 \
+    --max_global_iou_mean_degradation 0.001 \
+    --max_global_precision_mean_degradation 0.005 \
+    --max_outside_iou_mean_degradation 0.001 \
+    --max_component_count_mean_increase 5.0 \
+    --max_largest_component_ratio_mean_degradation 0.02 \
+    2>&1 | tee "${OUT}.log"
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+passed = path.is_file() and bool(json.loads(path.read_text())["passed"])
+print("V6.9 rollout:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' "${OUT}/report.json"
+  DECISION_CODE=$?
+  echo "${DECISION_CODE}" > "${OUT}.decision_code"
+  echo "V6.9 run/decision codes: ${CODE}/${DECISION_CODE}"
+  exit 0
+)
+
+
+# V6准入与停止条件：
+#   1. V6.2 FAIL：不训练，先修坐标/深度/视角绑定；
+#   2. seed42 fresh teacher-forced FAIL：停止，不跑seed43/44；
+#   3. 三seed任一train16/fresh48 FAIL：不进入rollout；
+#   4. V6.9 FAIL：停止当前view-aware local probe，不启用Flow LoRA；
+#   5. 只有V6.9 PASS，才运行seed43/44 rollout并考虑扩大对象数；
+#   6. 即使teacher-forced PASS，也不能宣称生成质量提高，必须以rollout为准。
+
+
+# ==========================================================================
+# V6.10-V6.12 checkpoint trajectory + controlled ablations（2026-07-17）
+# ==========================================================================
+#
+# 目的：
+#   1. 使用已有step25/50/75/100，不重新训练；
+#   2. 每个sample/noise/t只计算一次stock Flow；
+#   3. full轨迹覆盖四个checkpoint；六类消融只在step100运行；
+#   4. correct/control始终共享correct view weight和support gate；
+#   5. step100 full必须复现现有V6.5报告，否则诊断无效。
+#
+# 消融语义：
+#   full              原V6 V1；
+#   state_only        固定correct support，visual/geometry内容清零；剩余delta只来自
+#                     历史output bias，用于测generic correction，不是新模型；
+#   visual_only       保留visual token，删除geometry token；
+#   geometry_only     保留geometry token，删除visual token和pairwise项；
+#   pairwise_off      保留full token，只关闭pairwise consensus logit偏置；
+#   view_identity_off 保留同voxel加权visual/geometry均值，删除逐view identity、
+#                     pairwise和view disagreement。
+#
+# 所有命令块最终exit 0，不会因科学FAIL关闭终端。真实程序返回码、结构码和
+# 科学decision分别写入*.exit_code / *.structure_code / *.decision_code。
+
+
+# ==========================================================================
+# V6.10 静态检查、39项回归测试、1+1对象GPU smoke
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+  STATIC=pose_point_depth_mv/outputs/view_identity_v1_diagnostic_static_20260717
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_diagnostic_smoke_20260717
+
+  mkdir -p "${STATIC}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/view_identity_lifting.py \
+    pose_point_depth_mv/diagnose_view_identity_checkpoints.py \
+    pose_point_depth_mv/test_view_identity_lifting.py \
+    2>&1 | tee "${STATIC}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+  echo "${COMPILE_CODE}" > "${STATIC}/py_compile.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_view_identity_lifting \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    pose_point_depth_mv.test_local_target_probe \
+    pose_point_depth_mv.test_point_anchor_v2 \
+    pose_point_depth_mv.test_point_anchor_rollout_v2 \
+    2>&1 | tee "${STATIC}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+  echo "${TEST_CODE}" > "${STATIC}/unittest.exit_code"
+
+  if [ "${COMPILE_CODE}" -ne 0 ] || [ "${TEST_CODE}" -ne 0 ]; then
+    echo "V6.10 static gate failed; skip GPU smoke"
+    echo 97 > "${STATIC}/gpu_smoke.exit_code"
+    exit 0
+  fi
+
+  if [ -e "${OUT}" ]; then
+    echo "smoke output already exists; no overwrite: ${OUT}"
+  else
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+      pose_point_depth_mv.diagnose_view_identity_checkpoints \
+      --cache_manifest "${CACHE}/manifest.json" \
+      --checkpoint_dir "${RUN}/checkpoints" \
+      --checkpoint_steps 25,100 \
+      --ablation_steps 100 \
+      --ablation_modes \
+        full,state_only,visual_only,geometry_only,pairwise_off,view_identity_off \
+      --output_dir "${OUT}" \
+      --pretrained Stable-X/trellis-vggt-v0-2 \
+      --train_indices 0-15 \
+      --fresh_indices 16-63 \
+      --max_samples_per_split 1 \
+      --device cuda \
+      --seeds 48 \
+      --t_values 0.5 \
+      --physical_scale 1.0 \
+      --bootstrap_samples 100 \
+      --min_object_win_rate 0.0 \
+      --min_positive_t_count 0 \
+      2>&1 | tee "${OUT}.log"
+    SMOKE_CODE=${PIPESTATUS[0]}
+    echo "${SMOKE_CODE}" > "${OUT}.exit_code"
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+report = json.loads(path.read_text(encoding="utf-8"))
+expected = {
+    "full", "state_only", "visual_only", "geometry_only",
+    "pairwise_off", "view_identity_off",
+}
+checks = [
+    report["stock_preservation"]["physical_off_max_abs"] == 0.0,
+    report["stock_preservation"]["null_evidence_max_abs"] == 0.0,
+    report["stock_preservation"]["neutral_max_abs"] == 0.0,
+    set(report["results"]["train16"]["100"]) == expected,
+    set(report["results"]["fresh48"]["100"]) == expected,
+    (path.parent / "checkpoint_trajectory.csv").is_file(),
+    (path.parent / "ablation_summary.csv").is_file(),
+    (path.parent / "report.md").is_file(),
+]
+passed = all(checks)
+print("V6.10 diagnostic smoke structure:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' "${OUT}/diagnostic_report.json"
+  STRUCTURE_CODE=$?
+  echo "${STRUCTURE_CODE}" > "${OUT}.structure_code"
+  echo "V6.10 compile/test/structure codes: ${COMPILE_CODE}/${TEST_CODE}/${STRUCTURE_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.11 全量checkpoint trajectory + step100六路消融
+# ==========================================================================
+# 预计比单次V6.5更重，但脚本已缓存每个checkpoint/evidence的visual/geometry编码，
+# 不会对15组noise/t重复运行3072->96视觉投影。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  GPU=${GPU:-1}
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/view_identity_v1_train16_s100_seed42_bf16_20260716
+  SMOKE=pose_point_depth_mv/outputs/view_identity_v1_diagnostic_smoke_20260717
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_checkpoint_sweep_ablation_20260717
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+report = json.loads(path.read_text(encoding="utf-8"))
+stock = report["stock_preservation"]
+raise SystemExit(0 if all(float(value) == 0.0 for value in stock.values()) else 2)
+' "${SMOKE}/diagnostic_report.json"
+  GATE_CODE=$?
+  echo "${GATE_CODE}" > "${OUT}.preflight_code"
+  if [ "${GATE_CODE}" -ne 0 ]; then
+    echo "V6.10 smoke structure did not pass; skip V6.11"
+    exit 0
+  fi
+
+  if [ -e "${OUT}" ]; then
+    echo "output already exists; no overwrite: ${OUT}"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.diagnose_view_identity_checkpoints \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --checkpoint_dir "${RUN}/checkpoints" \
+    --checkpoint_steps 25,50,75,100 \
+    --ablation_steps 100 \
+    --ablation_modes \
+      full,state_only,visual_only,geometry_only,pairwise_off,view_identity_off \
+    --output_dir "${OUT}" \
+    --pretrained Stable-X/trellis-vggt-v0-2 \
+    --train_indices 0-15 \
+    --fresh_indices 16-63 \
+    --max_samples_per_split 0 \
+    --device cuda \
+    --seeds 48,49,50 \
+    --t_values 0.1,0.3,0.5,0.7,0.9 \
+    --physical_scale 1.0 \
+    --bootstrap_samples 10000 \
+    --min_object_win_rate 0.65 \
+    --min_positive_t_count 4 \
+    --reference_train_report \
+      "${RUN}/eval_train16_noise484950_t013579/report.json" \
+    --reference_fresh_report \
+      "${RUN}/eval_fresh48_noise484950_t013579/report.json" \
+    --max_reference_metric_diff 1.0e-7 \
+    2>&1 | tee "${OUT}.log"
+  RUN_CODE=${PIPESTATUS[0]}
+  echo "${RUN_CODE}" > "${OUT}.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+report = json.loads(path.read_text(encoding="utf-8"))
+passed = bool(report["reference_reproduction_passed"])
+print("V6.11 reference reproduction:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' "${OUT}/diagnostic_report.json"
+  REPRO_CODE=$?
+  echo "${REPRO_CODE}" > "${OUT}.reproduction_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+passed = bool(json.loads(path.read_text(encoding="utf-8"))["passed"])
+print("V6.11 paired early-checkpoint decision:", "PASS" if passed else "FAIL")
+raise SystemExit(0 if passed else 2)
+' "${OUT}/diagnostic_report.json"
+  DECISION_CODE=$?
+  echo "${DECISION_CODE}" > "${OUT}.decision_code"
+  echo "V6.11 run/reproduction/decision codes: ${RUN_CODE}/${REPRO_CODE}/${DECISION_CODE}"
+  exit 0
+)
+
+
+# ==========================================================================
+# V6.12 高信号结果提取
+# ==========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/view_identity_v1_checkpoint_sweep_ablation_20260717
+  REPORT=${OUT}/diagnostic_report.json
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("MISSING", path)
+    raise SystemExit(98)
+report = json.loads(path.read_text(encoding="utf-8"))
+print("overall passed=", report["passed"])
+print("reference reproduction=", report["reference_reproduction"])
+print("paired pass by step=", report["paired_train_fresh_pass_by_step"])
+print("stock preservation=", report["stock_preservation"])
+
+for split in ("train16", "fresh48"):
+    print("\n====", split, "full trajectory")
+    for step in ("25", "50", "75", "100"):
+        row = report["results"][split][step]["full"]
+        correct = row["correct_vs_stock"]
+        minimum = min(
+            float(value["correct_advantage_flow"]["object"]["mean"])
+            for value in row["controls"].values()
+        )
+        print(
+            "step", step,
+            "mean/median/win=",
+            correct["object"]["mean"],
+            correct["object"]["median"],
+            correct["object_win_rate"],
+            "CI=", correct["object_bootstrap_95_ci"],
+            "min_control_adv=", minimum,
+            "+t=", row["decision"]["positive_t_count"],
+            "PASS=", row["decision"]["passed"],
+        )
+
+    print("\n====", split, "step100 ablations")
+    for mode, row in report["results"][split]["100"].items():
+        correct = row["correct_vs_stock"]
+        print(
+            mode,
+            "mean/median/win=",
+            correct["object"]["mean"],
+            correct["object"]["median"],
+            correct["object_win_rate"],
+            "delta_rms=", row["correct_delta_rms"]["object"]["mean"],
+        )
+' "${REPORT}" 2>&1 | tee "${OUT}/result_summary.txt"
+  CODE=${PIPESTATUS[0]}
+  echo "${CODE}" > "${OUT}.summary_code"
+  echo "V6.12 summary code: ${CODE}"
+  exit 0
+)
+
+
+# V6.10-V6.12裁决：
+#   - reproduction_code非0：诊断实现与V6.5不一致，先修代码，不解释结果；
+#   - 任一step只有train PASS而fresh FAIL：对象记忆或generic correction，不是early stop；
+#   - 只有同一step的train16和fresh48严格门都PASS，才允许讨论early stopping；
+#   - 若25/50/75/100全部paired FAIL：正式停止V6 V1，不运行V6.6-V6.9；
+#   - pairwise_off约等于full且view_identity_off约等于full：逐view/pairwise路径未被使用；
+#   - state_only接近full：收益主要来自output bias/generic correction；
+#   - visual_only约等于full、geometry_only明显弱：主要使用视觉内容而非pose/depth；
+#   - geometry_only有correct-vs-corrupt specificity才支持保留当前几何表示；
+#   - 消融结论只作失败归因，不可用来放宽预注册的fresh因果门。

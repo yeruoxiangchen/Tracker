@@ -27,6 +27,10 @@ from pose_point_depth_mv.direct_flow import (
     volume_xyz_to_flow_tokens,
 )
 from pose_point_depth_mv.direct_slat_data import DirectSLatCacheDataset
+from pose_point_depth_mv.proobjaverse_official_slat_compact import (
+    CompactNativeConditionBackend,
+    is_compact_manifest_pair,
+)
 
 
 NATIVE_3D_CONDITION_VERSION = "pose_point_depth_mv.native_3d_condition.v1"
@@ -1350,6 +1354,36 @@ class NativeConditionSLatDataset(Dataset):
         indices: str = "all",
         verify_hashes: bool = False,
     ) -> None:
+        self.compact_backend: CompactNativeConditionBackend | None = None
+        if is_compact_manifest_pair(slat_manifest, lifting_manifest):
+            compact = CompactNativeConditionBackend(
+                slat_manifest,
+                lifting_manifest,
+                indices=indices,
+                verify_hashes=verify_hashes,
+            )
+            self.compact_backend = compact
+            self.slat = compact.slat_view
+            self.lifting = compact.lifting_view
+            self.lifting_indices = list(range(len(compact)))
+            self.rows = compact.rows
+            self.config = compact.config
+            self.config_hash = compact.config_hash
+            self.slat_normalization = compact.slat_normalization
+            self.slat_normalization_hash = compact.slat_normalization_hash
+            self.identity = {
+                "version": NATIVE_3D_CONDITION_VERSION,
+                "slat_manifest": str(Path(slat_manifest).resolve()),
+                "slat_manifest_sha256": sha256_file(slat_manifest),
+                "lifting_manifest": str(Path(lifting_manifest).resolve()),
+                "lifting_manifest_sha256": sha256_file(lifting_manifest),
+                "uid_count": len(self.rows),
+                "uid_hash": canonical_json_sha256(
+                    sorted(str(row["uid"]) for row in self.rows)
+                ),
+                "compact_cache_layout": True,
+            }
+            return
         self.slat = DirectSLatCacheDataset(
             slat_manifest, indices=indices, verify_hashes=verify_hashes
         )
@@ -1384,10 +1418,27 @@ class NativeConditionSLatDataset(Dataset):
         }
 
     def __len__(self) -> int:
+        if self.compact_backend is not None:
+            return len(self.compact_backend)
         return len(self.slat)
 
     def limit_objects(self, max_objects: int) -> None:
         if int(max_objects) <= 0:
+            return
+        if self.compact_backend is not None:
+            self.compact_backend.limit_objects(max_objects)
+            self.rows = self.compact_backend.rows
+            self.lifting_indices = list(range(len(self.rows)))
+            allowed = {str(row["object_uid"]) for row in self.rows}
+            self.identity.update(
+                {
+                    "uid_count": len(self.rows),
+                    "object_count": len(allowed),
+                    "uid_hash": canonical_json_sha256(
+                        sorted(str(row["uid"]) for row in self.rows)
+                    ),
+                }
+            )
             return
         allowed = set(
             sorted({str(row["object_uid"]) for row in self.rows})[: int(max_objects)]
@@ -1411,6 +1462,8 @@ class NativeConditionSLatDataset(Dataset):
         )
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if self.compact_backend is not None:
+            return self.compact_backend[index]
         slat_sample = self.slat[index]
         lifting_sample = self.lifting[self.lifting_indices[index]]
         if str(slat_sample["uid"]) != str(lifting_sample["uid"]):

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# 已消费 Holdout64 的事后 shape-only 比较：
+#   current mixed Point+Mask No-VGGT vs ReconViaGen original vs GT Mesh。
+#
+# 三路 Mesh 各自按 AABB 中心平移、最长边等比归一化到 1；ReconViaGen 先应用
+# 固定 decoder -> reference 轴变换 (x,y,z)->(x,z,-y)。禁止逐对象旋转 ICP、
+# reflection、各向异性尺度和 best-of-transform。结果不能解释为 runtime-O/world
+# placement，也不能重新称为首次 formal Holdout64。
+
+set -euo pipefail
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+LABEL=${ROOT}/M11E_holdout64_mesh_o_labels_v1/runtime_o_label_manifest.json
+CURRENT=${ROOT}/M11H_holdout64_native_no_vggt_mixed1244_seed42_v1/inference_manifest.json
+RECON=${ROOT}/M11K_holdout64_reconviagen_original_seed42_v1/inference_manifest.json
+OUT=${ROOT}/M11S_holdout64_current_vs_reconviagen_normalized_shape_posthoc_v1
+REPORT=${OUT}/report.json
+
+"${PY}" -u -m pose_point_depth_mv.evaluate_holdout64_current_vs_reconviagen_shape \
+  --label_manifest "${LABEL}" \
+  --current_manifest "${CURRENT}" \
+  --reconviagen_manifest "${RECON}" \
+  --output_dir "${OUT}" \
+  --surface_samples 20000 \
+  --workers -1 \
+  --resume
+
+"${PY}" -c '
+import json,sys
+r=json.load(open(sys.argv[1]))
+assert r["passed"] is True
+assert r["formal"] is False and r["post_hoc"] is True
+assert r["object_count"] == 64 and r["record_count"] == 128
+out={
+  "passed":r["passed"],
+  "formal":r["formal"],
+  "post_hoc":r["post_hoc"],
+  "protocol_scope":r["protocol_scope"],
+  "surface_samples":r["surface_samples"],
+  "summary":r["summary"],
+  "paired_comparison":r["paired_comparison"],
+}
+print(json.dumps(out,indent=2,ensure_ascii=False))
+' "${REPORT}"
+
+echo "report: ${REPORT}"

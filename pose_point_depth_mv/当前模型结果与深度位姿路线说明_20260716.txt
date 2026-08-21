@@ -1,0 +1,214 @@
+当前模型结果与深度/位姿路线说明
+日期：2026-07-16
+
+一、当前实际完成评估的模型是什么
+
+当前最新模型是 Point-only Local-anchor V2，而不是 pose/depth 多视角融合模型。
+
+基础路径：
+
+  cached ReconViaGen stock condition
+  + frozen ReconViaGen SS Flow
+  + PointAnchorProbe
+
+PointAnchorProbe输入：
+
+  x_t
+  stock positive-condition velocity
+  normalized t
+  prior occupancy
+  prior confidence
+  prior distance
+  fixed active/neutral mask
+  canonical XYZ
+
+PointAnchorProbe不输入：
+
+  相机内参K
+  相机外参T
+  VGGT predicted depth
+  depth confidence
+  per-view patch feature
+  per-view ray
+  mask/depth跨视图一致性
+
+模型metadata明确记录：
+
+  uses_pose_depth = false
+  uses_flow_lora = false
+
+它只在16^3 SS空间中correct point邻域约9.3%的体素上加入same-voxel velocity
+residual，其他位置的直接delta严格为0。
+
+二、当前模型结果
+
+1. Teacher-forced阶段（V4）
+
+三个训练seed 42/43/44均通过train16和object-disjoint fresh48评估：
+
+  fresh correct-vs-stock velocity gain均值：
+    seed42  1.3794e-4
+    seed43  1.5828e-4
+    seed44  1.4421e-4
+
+  object win：91.67%--97.92%
+  bootstrap CI下界均大于0
+  correct在velocity MSE上优于六类matched point controls
+
+这证明：在固定GT附近的x_t和t上，小probe能够学习局部GT velocity residual。
+
+2. 原生25步rollout阶段（V5.4）
+
+seed42在fresh48、三个固定noise seed上的正式结果为FAIL。
+
+工程与协议检查全部通过：
+
+  native/custom stock latent max_abs_diff = 0
+  threshold/top-k坐标集合完全相同
+  direct non-anchor delta = 0
+  fresh/train对象严格隔离
+  全局退化未超过预注册阈值
+
+但科学指标没有通过：
+
+  Correct-vs-stock Local IoU：
+    mean        1.3037e-5
+    median      0
+    object win  47.92%
+    95% CI      [-3.8650e-5, 6.8793e-5]
+
+  Correct anchor-cell hit：
+    mean        -8.6865e-5
+    object win  4.17%
+
+  Local precision轻微上升，但local recall下降。
+  predicted local voxel平均减少0.389，GT intersection平均减少0.132。
+
+这说明模型主要进行了很弱的局部pruning/阈值校准，没有把正确稀疏点转化为稳定的
+surface-presence anchor。
+
+Correct也没有稳定优于任何control。matched cross-object和constant prior的Local IoU
+甚至略高于correct。top-k oracle-count同样只有50% object win，因此不是threshold=0
+造成的假失败。
+
+当前不能声称相对ReconViaGen baseline获得生成质量提升，也不应继续运行seed43/44
+rollout、增加rank/scale/训练步数或启用Flow LoRA。
+
+三、现在有没有利用深度和位姿进行类似Pixal3D的多视角改进
+
+简短回答：当前最新Point-anchor V2没有。
+
+需要区分三个层次：
+
+1. ReconViaGen stock condition
+
+stock condition包含image/DINO和VGGT视觉特征。VGGT内部可能隐式编码多视角几何，但当前
+V5没有把数据集提供的真实K/T和VGGT depth作为新的显式条件输入SS Flow。
+
+2. cache中存在depth/pose不等于当前模型使用depth/pose
+
+当前point cache继承自ar_ss_flow cache，所以sample文件中仍保存：
+
+  visual_patch_features
+  predicted_depth
+  depth_confidence
+  masks
+  intrinsics
+  extrinsics
+
+但是PointAnchorProbe和V5 rollout只读取stock_condition、point evidence、target和
+target_coords。上述depth/pose字段没有参与当前residual计算。
+
+3. 此前做过pose/depth lifting，但不是完整Pixal3D式模型
+
+ar_ss_flow/pose_lifting.py和此前PPD路线曾经执行：
+
+  per-view VGGT/DINO patch feature
+  + K/T投影
+  + VGGT predicted depth/depth confidence
+  + mask/visibility
+  -> 聚合成16^3 visual/pose/depth volume
+  -> same-voxel SS adapter
+
+它与Pixal3D相似的部分是“用相机几何把2D视觉特征lift到3D”。
+
+但关键差异是：此前实现很早就跨view聚合，进入adapter时已经丢失：
+
+  view identity
+  哪个patch来自哪个view
+  patch-ray绑定
+  per-view depth residual
+  view-pair correspondence
+  correct pose下的跨视图匹配结构
+
+因此它更准确地说是：
+
+  pose/depth-guided aggregated 3D statistics
+
+而不是：
+
+  保留多视角身份和对应关系的Pixal3D式pose-aware visual fusion
+
+此前结果也表明，聚合后的volume可以对pose corruption产生数值变化，但correct几何并没有
+稳定转化成Flow/rollout收益。当前还没有完成并验证真正保留view identity的新版本。
+
+四、下一步应实现的多视角主线
+
+下一版主线应当是Pose-guided View-identity Visual Lifting：
+
+  每个view保留：
+    VGGT patch feature
+    DINO/Image patch feature
+    camera ray origin/direction
+    K/T
+    calibrated VGGT depth和confidence
+    mask/visibility
+    patch-to-voxel采样权重
+
+  在进入SS adapter前保持：
+    [view, patch, voxel]对应关系
+
+  SS融合只允许：
+    同voxel
+    或3x3x3局部邻域
+
+第一版不要把所有view直接mean/max成17通道，也不要使用4096x4096全局attention。
+
+推荐实验顺序：
+
+  P0：独立几何审计
+    correct pose跨视图一致性 > pose shuffle/reverse/depth corruption
+
+  P1：冻结ReconViaGen和SS Flow，只训练小型view-aware local adapter
+    correct > stock
+    correct > pose shuffled
+    correct > depth corrupted
+    pose/depth off严格回到stock
+
+  P2：train16/fresh48 object-disjoint teacher-forced门
+
+  P3：固定noise原生25步rollout门
+
+  P4：只有P3通过后再考虑Flow LoRA或更大数据训练
+
+点云在这条主线中的合理职责是：
+
+  标定VGGT depth尺度/偏移
+  提供局部surface anchor
+  提供ray前方free-space约束
+
+点云不再负责全局对象识别，也不应替代保留view identity的视觉/位姿对应。
+
+五、最终状态
+
+  当前Point-only V2：teacher-forced PASS，完整rollout FAIL，停止。
+
+  此前aggregated pose/depth路线：已实现和测试，但不是完整Pixal3D式融合，结果未通过。
+
+  真正保留view identity的pose-guided visual lifting：尚未完成训练与验证，是下一条主线。
+
+详细实验数据见：
+
+  pose_point_depth_mv/审计.md
+  pose_point_depth_mv/outputs/point_anchor_v2_train16_s100_seed42_bf16_20260716/
+    rollout_fresh48_noise484950_native25_v2_20260716/report.json

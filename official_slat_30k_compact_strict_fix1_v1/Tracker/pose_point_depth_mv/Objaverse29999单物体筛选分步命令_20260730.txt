@@ -1,0 +1,189 @@
+Objaverse 29,999 源 Mesh 单物体筛选分步命令（2026-07-30）
+============================================================
+
+目的
+----
+
+只审计已经下载并冻结的 Objaverse GLB，不再读取 OmniObject3D Scan.obj。
+
+输入：
+
+  /data/zjr/dataset10k_20260726/source_freeze_objaverse_v1/build_plan.json
+
+其中包含 29,999 个 Objaverse GLB。额外读取已经完成的 Objaverse256 pilot
+manifest，作为少量渲染/纹理证据。输出仍是 draft A/B/C/R 候选池，不是训练
+cache，也不会启动训练。
+
+运行约定
+--------
+
+1. 每一节单独复制运行；运行 O0 不会自动进入 O1。
+2. 全部前台执行，实时显示 mesh N/29999，不启动后台 service。
+3. 完整输出存在时复用；不完整输出存在时保留并返回 98。
+4. CPU-only，不占 GPU。默认 4 workers；不要同时启动大内存训练。
+5. O1 完成后先运行 O2，把结果交给审计，再决定是否进入 filtered render pilot。
+
+
+O0. 代码和单元测试
+==================
+
+(
+  set -uo pipefail
+  CODE=97
+
+  if cd /home/zjr/Tracker; then
+    PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+    "${PY}" -m py_compile \
+      pose_point_depth_mv/dataset_tools/restructure_single_object_dataset.py \
+      pose_point_depth_mv/dataset_tools/test_restructure_single_object_dataset.py
+    COMPILE_CODE=$?
+
+    "${PY}" -m unittest -v \
+      pose_point_depth_mv.dataset_tools.test_restructure_single_object_dataset
+    TEST_CODE=$?
+
+    if [ "${COMPILE_CODE}" -eq 0 ] && [ "${TEST_CODE}" -eq 0 ]; then
+      CODE=0
+    else
+      CODE=2
+    fi
+  fi
+
+  echo "O0_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+O1. 前台筛选 29,999 个 Objaverse GLB
+====================================
+
+(
+  set -uo pipefail
+  CODE=97
+
+  if cd /home/zjr/Tracker; then
+    PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+    SOURCE_PLAN=/data/zjr/dataset10k_20260726/source_freeze_objaverse_v1/build_plan.json
+    OBJ_RENDER=/data/zjr/dataset10k_20260726/pilot_objaverse256_cyclescuda_v2
+    OUT=/data/zjr/single_object_restructure_20260730/objaverse29999_render256_draft_v1
+    LOG=${OUT}.log
+
+    if [ -s "${OUT}/report.json" ]; then
+      echo "reuse complete immutable Objaverse audit: ${OUT}/report.json"
+      "${PY}" -c \
+        'import json,sys; r=json.load(open(sys.argv[1])); raise SystemExit(0 if r.get("passed") is True and r["summary"]["source_counts"]=={"objaverse":29999} else 3)' \
+        "${OUT}/report.json"
+      CODE=$?
+    elif [ -e "${OUT}" ]; then
+      echo "O1 blocked: partial output exists; preserve and inspect: ${OUT}"
+      CODE=98
+    else
+      /usr/bin/ionice -c 2 -n 7 \
+      /usr/bin/nice -n 10 \
+      "${PY}" -u -m \
+        pose_point_depth_mv.dataset_tools.restructure_single_object_dataset \
+          --source_plan "${SOURCE_PLAN}" \
+          --render_root "${OBJ_RENDER}" \
+          --output_dir "${OUT}" \
+          --workers 4 \
+          --write_previews \
+          --preview_frames 4 \
+          --max_previews_per_tier 64 \
+        2>&1 | tee "${LOG}"
+      CODE=${PIPESTATUS[0]}
+    fi
+
+    echo "${CODE}" | tee "${OUT}.exit_code"
+    echo "report: ${OUT}/report.json"
+    echo "review: ${OUT}/review/index.html"
+    echo "draft filtered plan: ${OUT}/training_candidate_source_plan/build_plan.json"
+  fi
+
+  echo "O1_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+O2. 完成后验收数量、分层和 source-plan 绑定
+===========================================
+
+(
+  set -uo pipefail
+  CODE=97
+
+  if cd /home/zjr/Tracker; then
+    PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+    OUT=/data/zjr/single_object_restructure_20260730/objaverse29999_render256_draft_v1
+
+    if [ ! -s "${OUT}/report.json" ]; then
+      echo "O2 blocked: O1 report is missing"
+      CODE=96
+    else
+      "${PY}" -c '
+import hashlib
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+root = Path(sys.argv[1])
+report = json.load(open(root / "report.json"))
+objects = json.load(open(root / "objects.json"))
+plan_path = root / "training_candidate_source_plan" / "build_plan.json"
+plan = json.load(open(plan_path))
+
+tiers = Counter(row["final_tier"] for row in objects)
+mesh_valid = sum(bool(row["mesh_audit"]["mesh_valid"]) for row in objects)
+
+result = {
+    "passed": report["passed"],
+    "object_count": len(objects),
+    "mesh_valid_count": mesh_valid,
+    "tier_counts": {tier: tiers.get(tier, 0) for tier in ("A", "B", "C", "R")},
+    "summary": report["summary"],
+    "policy": report["policy"],
+    "candidate_plan": report["training_candidate_source_plan"],
+    "candidate_plan_sources": plan["sources"],
+    "candidate_objaverse_count": plan["objaverse"]["object_count"],
+}
+print(json.dumps(result, indent=2, ensure_ascii=False))
+
+ok = (
+    report.get("passed") is True
+    and len(objects) == 29999
+    and report["summary"]["source_counts"] == {"objaverse": 29999}
+    and plan["sources"] == ["objaverse"]
+    and plan["objaverse"]["object_count"] == tiers["A"] + tiers["B"]
+)
+raise SystemExit(0 if ok else 3)
+' "${OUT}"
+      CODE=$?
+    fi
+  fi
+
+  echo "O2_RC=${CODE}"
+  echo "O2 通过只表示 draft 筛选产物自洽；不表示已经批准全面渲染或训练。"
+  echo "current terminal remains open"
+  true
+)
+
+
+O3. 人工查看少量预览
+====================
+
+完成 O1 后查看：
+
+  /data/zjr/single_object_restructure_20260730/objaverse29999_render256_draft_v1/review/index.html
+
+以及：
+
+  /data/zjr/single_object_restructure_20260730/objaverse29999_render256_draft_v1/report.json
+
+不要直接运行旧文档中的 D4/D6。先把 O2 输出交给审计，再单独生成：
+
+  1. filtered-plan 256-object render pilot；
+  2. pilot 接受率与 A/B/C 偏差分析；
+  3. 通过后才冻结正式 10k render plan。

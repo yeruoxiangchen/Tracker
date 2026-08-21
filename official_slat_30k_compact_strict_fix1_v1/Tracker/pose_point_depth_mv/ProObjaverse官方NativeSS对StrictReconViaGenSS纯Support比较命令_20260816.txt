@@ -1,0 +1,279 @@
+ProObjaverse 官方 Native-SS 对 strict ReconViaGen Stock-SS：纯 Support 比较
+================================================================================
+
+本测试只运行：
+
+  strict 路线：冻结 RGBA 8视图 -> VGGT -> Stock SS -> 64^3 support
+  native 路线：复用已冻结 posed-DINO -> official Native-SS step2000 EMA support
+
+两路都相对同一个 official GT-SLat coordinate support 计算：
+
+  IoU / Precision / Recall / F1
+  support数量比、数量log误差
+  component count及其相对GT误差
+  largest-component ratio及其相对GT误差
+
+不运行 SLat，不运行 Mesh decoder，不生成 Mesh。
+
+主集合固定为未参与 Native-SS CFG 校准的 Dev[16:64)，即 held-out Dev48，
+每个对象固定 seed 42/43/44；统计单位先对每个对象的三个seed取均值，再做对象bootstrap。
+
+
+S0. 只读预检（先运行；不占GPU、不创建输出目录）
+================================================================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+CURRENT=${ROOT}/eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1/step_025000/dev48_predicted
+STRICT=${ROOT}/eval_dev64_reconviagen_original_seed424344_quantitative_v1
+
+STRICT_REPORTS=${STRICT}/worker_00_of_05/report.json,${STRICT}/worker_01_of_05/report.json,${STRICT}/worker_02_of_05/report.json,${STRICT}/worker_03_of_05/report.json,${STRICT}/worker_04_of_05/report.json
+TARGET_CACHES=${CURRENT}/shard0_16_26/target_mesh_cache,${CURRENT}/shard1_26_36/target_mesh_cache,${CURRENT}/shard2_36_46/target_mesh_cache,${CURRENT}/shard3_46_55/target_mesh_cache,${CURRENT}/shard4_55_64/target_mesh_cache
+
+${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_ss_support_vs_reconviagen \
+  worker \
+  --dev_split ${ROOT}/protocol2128_train2000_v1/dev.json \
+  --cache_report ${ROOT}/cache_dev64_protocol2128_views8_v1/report.json \
+  --target_report ${ROOT}/eval_dev64_B_scale_step4000_seed424344_v1/report.json \
+  --target_mesh_root ${ROOT}/eval_dev64_B_scale_step4000_seed424344_v1/targets \
+  --paired_target_cache_roots "${TARGET_CACHES}" \
+  --slat_manifest ${ROOT}/cache_dev64_protocol2128_views8_v1/slat_manifest.json \
+  --strict_recon_reports "${STRICT_REPORTS}" \
+  --output_dir /tmp/proobj_ss_support_preflight_unused \
+  --object_start 16 --object_end 64 \
+  --worker_index 0 --num_workers 1 \
+  --dry_run
+
+echo "S0 PASS：应显示object_indices=[16,17,...,63]、objects=48、records=144。"
+echo "current terminal remains open"
+
+
+S1. 单张物理GPU 3后台生成 strict ReconViaGen Stock-SS support
+================================================================================
+
+默认只使用物理GPU 3；一个worker完整覆盖 Dev[16:64) x seed42/43/44，
+共48个对象、144条object-seed support记录。
+
+如果先前GPU-noise错误版本已经失败：先在监视终端按Ctrl-C，然后直接重新运行本节。
+不需要删除OUT；--resume会复用通过合同的记录。旧失败发生在首条记录写盘前，
+因此当前实际会从Dev索引16、seed42重新开始。新unit和新log不复用旧错误日志。
+
+修复后已在物理GPU 3真实重放该对象，三个seed均与历史完整ReconViaGen精确一致：
+seed42=17917、seed43=17357、seed44=18689，replay=True（3/3）。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-3}
+
+ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+CURRENT=${ROOT}/eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1/step_025000/dev48_predicted
+STRICT=${ROOT}/eval_dev64_reconviagen_original_seed424344_quantitative_v1
+OUT=/data/zjr/proobjaverse_official_native_ss_vs_strict_reconviagen_ss_support_20260816_v1
+
+STRICT_REPORTS=${STRICT}/worker_00_of_05/report.json,${STRICT}/worker_01_of_05/report.json,${STRICT}/worker_02_of_05/report.json,${STRICT}/worker_03_of_05/report.json,${STRICT}/worker_04_of_05/report.json
+TARGET_CACHES=${CURRENT}/shard0_16_26/target_mesh_cache,${CURRENT}/shard1_26_36/target_mesh_cache,${CURRENT}/shard2_36_46/target_mesh_cache,${CURRENT}/shard3_46_55/target_mesh_cache,${CURRENT}/shard4_55_64/target_mesh_cache
+
+test ! -e ${OUT}/aggregate_v1
+mkdir -p ${OUT}/logs
+
+WORKER_OUT=${OUT}/worker_00_of_01
+LOG=${OUT}/logs/worker_00_gpu${GPU}_sharedrun_v2.log
+UNIT=tracker-proobj-strict-rg-ss-support-gpu3-sharedrun-v2
+
+systemd-run --user \
+  --unit=${UNIT} \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:${LOG} \
+  --property=StandardError=append:${LOG} \
+  /usr/bin/env \
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    ${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_ss_support_vs_reconviagen \
+      worker \
+      --dev_split ${ROOT}/protocol2128_train2000_v1/dev.json \
+      --cache_report ${ROOT}/cache_dev64_protocol2128_views8_v1/report.json \
+      --target_report ${ROOT}/eval_dev64_B_scale_step4000_seed424344_v1/report.json \
+      --target_mesh_root ${ROOT}/eval_dev64_B_scale_step4000_seed424344_v1/targets \
+      --paired_target_cache_roots "${TARGET_CACHES}" \
+      --slat_manifest ${ROOT}/cache_dev64_protocol2128_views8_v1/slat_manifest.json \
+      --strict_recon_reports "${STRICT_REPORTS}" \
+      --output_dir ${WORKER_OUT} \
+      --object_start 16 --object_end 64 \
+      --worker_index 0 --num_workers 1 \
+      --seeds 42,43,44 \
+      --device cuda:0 --low_vram --resume
+
+echo "S1 launched on physical GPU: ${GPU}"
+echo "output: ${OUT}"
+echo "current terminal remains open"
+
+
+S2. 监视单个GPU 3后台worker
+================================================================================
+
+下面是普通bash循环，不嵌套 watch/bash -lc，避免先前的引号和重定向错误。
+Ctrl-C只停止监视，不停止后台评测。
+
+cd /home/zjr/Tracker
+
+OUT=/data/zjr/proobjaverse_official_native_ss_vs_strict_reconviagen_ss_support_20260816_v1
+UNIT=tracker-proobj-strict-rg-ss-support-gpu3-sharedrun-v2.service
+WORKER_OUT=${OUT}/worker_00_of_01
+LOG=${OUT}/logs/worker_00_gpu3_sharedrun_v2.log
+
+while true; do
+  date -u
+  printf 'GPU3 worker service='
+  systemctl --user is-active ${UNIT} 2>/dev/null || true
+  printf '  completed support records / 144: '
+  find ${WORKER_OUT}/records -name 'seed_*.json' -type f 2>/dev/null | wc -l
+  if [ -s ${WORKER_OUT}/report.json ]; then echo '  report: COMPLETE'; fi
+  tail -n 1 ${LOG} 2>/dev/null || true
+  if ! systemctl --user is-active --quiet ${UNIT}; then
+    if [ -s ${WORKER_OUT}/report.json ]; then
+      echo 'worker finished successfully; run S3 next.'
+    else
+      echo 'worker stopped without report; inspect the log above.'
+    fi
+    break
+  fi
+  sleep 20
+done
+
+
+S3. CPU聚合纯Support结果
+================================================================================
+
+只有单个worker的report.json存在后再运行。
+退出码0表示预设Support门全部通过；退出码3表示科学门未全过，不是程序崩溃。
+
+cd /home/zjr/Tracker
+set -u
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+CURRENT=${ROOT}/eval_trajectory_step15000_20000_25000_seed424344_5gpu_strict_fix1_v1/step_025000/dev48_predicted
+OUT=/data/zjr/proobjaverse_official_native_ss_vs_strict_reconviagen_ss_support_20260816_v1
+FINAL=${OUT}/aggregate_v1
+
+STRICT_SUPPORT_REPORTS=${OUT}/worker_00_of_01/report.json
+NATIVE_REPORTS=${CURRENT}/shard0_16_26/report.json,${CURRENT}/shard1_26_36/report.json,${CURRENT}/shard2_36_46/report.json,${CURRENT}/shard3_46_55/report.json,${CURRENT}/shard4_55_64/report.json
+TARGET_CACHES=${CURRENT}/shard0_16_26/target_mesh_cache,${CURRENT}/shard1_26_36/target_mesh_cache,${CURRENT}/shard2_36_46/target_mesh_cache,${CURRENT}/shard3_46_55/target_mesh_cache,${CURRENT}/shard4_55_64/target_mesh_cache
+
+test -s ${STRICT_SUPPORT_REPORTS} || {
+  echo "S3 blocked: missing ${STRICT_SUPPORT_REPORTS}"
+  exit 2
+}
+
+if [ -s ${FINAL}/report.json ]; then
+  echo "reuse aggregate: ${FINAL}/report.json"
+  cat ${FINAL}/summary.txt
+else
+  set +e
+  ${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_ss_support_vs_reconviagen \
+    aggregate \
+    --dev_split ${ROOT}/protocol2128_train2000_v1/dev.json \
+    --cache_report ${ROOT}/cache_dev64_protocol2128_views8_v1/report.json \
+    --target_report ${ROOT}/eval_dev64_B_scale_step4000_seed424344_v1/report.json \
+    --target_mesh_root ${ROOT}/eval_dev64_B_scale_step4000_seed424344_v1/targets \
+    --paired_target_cache_roots "${TARGET_CACHES}" \
+    --slat_manifest ${ROOT}/cache_dev64_protocol2128_views8_v1/slat_manifest.json \
+    --strict_support_reports "${STRICT_SUPPORT_REPORTS}" \
+    --native_reports "${NATIVE_REPORTS}" \
+    --output_dir ${FINAL} \
+    --object_start 16 --object_end 64 \
+    --bootstrap_samples 5000
+  S3_SCIENCE_RC=$?
+  set -e
+  echo "S3_SCIENCE_RC=${S3_SCIENCE_RC}（3=至少一个Support科学门未过，不是程序崩溃）"
+  cat ${FINAL}/summary.txt
+fi
+
+echo "report: ${FINAL}/report.json"
+echo "current terminal remains open"
+
+
+S4. 精简读取最终结论
+================================================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+REPORT=/data/zjr/proobjaverse_official_native_ss_vs_strict_reconviagen_ss_support_20260816_v1/aggregate_v1/report.json
+
+${PY} -c '
+import json,sys
+r=json.load(open(sys.argv[1]))
+print(json.dumps({
+  "runtime_passed":r["passed"],
+  "objects":r["object_count"],
+  "records":r["record_count"],
+  "strict_absolute":r["strict_reconviagen_stock_ss_absolute"],
+  "native_absolute":r["official_native_ss_absolute"],
+  "native_improvement":r["native_minus_strict_improvement"],
+  "support_distribution_overlap":r["native_strict_support_distribution_overlap"],
+  "decision":r["decision"],
+  "comparability":r["comparability"],
+  "scope_guard":r["scope_guard"],
+},indent=2,ensure_ascii=False))
+' ${REPORT}
+
+echo "判读：本报告只裁决SS support质量；即使通过，也不能替代后续Stock-SLat兼容性测试。"
+echo "current terminal remains open"
+
+
+结果目录
+================================================================================
+
+/data/zjr/proobjaverse_official_native_ss_vs_strict_reconviagen_ss_support_20260816_v1/
+├── worker_00_of_01
+│   ├── coords/              strict VGGT Stock-SS坐标
+│   ├── records/             每个object-seed的合同与GT指标
+│   └── report.json
+├── logs/
+└── aggregate_v1/
+    ├── report.json
+    └── summary.txt
+
+
+统计和结论边界
+================================================================================
+
+1. strict support会逐seed核对历史完整strict ReconViaGen report里的coord_count。
+   历史成功记录只要有一个数量不能精确回放，worker立即失败，不生成科学结论。
+   当前实现直接调用Tracker/ReconViaGen原始pipeline.run的SS-only提前返回分支；
+   CPU noise、VGGT、Stock-SS condition、sampler和decoder均与完整原版共享同一路径。
+
+2. Native support直接复用已冻结的144份ss_coords，不重新运行SLat25k；这些support与
+   15k/20k/25k无关，路径只是复用已有冻结产物。
+
+3. 两路使用同一Dev48、同一8张源视图身份、同一GT support和同一64^3坐标合同，
+   但输入接口和部署采样各自保持原方法：strict使用VGGT，Native使用已知pose+DINO。
+   因此这证明的是SS endpoint质量，不是“同condition、同noise的纯网络结构消融”。
+
+4. 只有以下预设门全部通过时，
+   native_ss_support_advantage_established=true：
+
+   - 运行与坐标合同完整；
+   - IoU mean/median为正；
+   - IoU对象胜率>50%；
+   - IoU对象bootstrap 95% CI下界>0；
+   - Precision和Recall均值不退化。
+
+5. Support通过后，才能另行运行：
+
+   Native SS support -> 同一VGGT-conditioned Stock SLat -> Mesh
+
+   该后续实验只裁决Stock-SLat兼容性，不回头改写本纯Support结论。

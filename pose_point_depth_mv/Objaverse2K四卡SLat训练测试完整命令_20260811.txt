@@ -1,0 +1,507 @@
+Objaverse2K 四卡 no-VGGT Native-SLat v2 训练与测试
+===================================================
+
+实验身份
+--------
+
+- 冻结源快照：2199 objects / 4137 sequences / render shards 000-007。
+- 冻结 SS：当前 mixed no-VGGT SS step2000 EMA，25 steps / CFG3。
+- SLat 初始化：当前 M8 SLat step2000 EMA；不继承 optimizer、旧 step 或旧 EMA。
+- 新训练划分：train=2135 objects，dev=64 objects；对象严格互斥。
+- Audit64 不作为 dev；其 64 个对象保留在未来 train2135 中，继续保持
+  `formal=false, training_overlap=true` 的 support gate 身份。
+- 四卡 DDP：默认物理 GPU 0,5,6,7；每卡 batch=1，grad_accum=2，
+  global effective batch=4*2=8。
+- Native-SLat architecture=v2；Stock cross-attention=all views；
+  posed-DINO 3D=all selected views。
+- max_steps 永久固定为 2000。`run_until_step` 只用于 400/800/... 暂停，
+  不改变 checkpoint 身份或学习率计划。
+- dev64 是 checkpoint selection 集，不是 formal holdout；Objaverse16 只在最终选点后跑一次。
+
+
+P0. 代码与 CPU 契约测试（现在可运行，不占 GPU）
+-----------------------------------------------
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/build_local_lh_slats.py \
+  pose_point_depth_mv/objaverse2k_slat_pipeline.py \
+  pose_point_depth_mv/evaluate_objaverse2k_no_vggt_slat.py \
+  pose_point_depth_mv/evaluate_objaverse2k_no_vggt_slat_fourway.py \
+  pose_point_depth_mv/infer_objaverse16_no_vggt_objaverse2k.py
+
+"${PY}" -m unittest \
+  pose_point_depth_mv.test_build_local_lh_slats \
+  pose_point_depth_mv.test_objaverse2k_slat_pipeline \
+  pose_point_depth_mv.test_evaluate_objaverse2k_no_vggt_slat \
+  pose_point_depth_mv.test_evaluate_objaverse2k_no_vggt_slat_fourway \
+  pose_point_depth_mv.test_direct_slat_data \
+  pose_point_depth_mv.test_native_slat_genrecon_v2 \
+  pose_point_depth_mv.test_no_vggt_ss_evidence \
+  pose_point_depth_mv.test_mixed_no_vggt_migration
+
+bash -n pose_point_depth_mv/background_jobs/prepare_objaverse2k_no_vggt_slat_4gpu.sh
+bash -n pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_4gpu.sh
+bash -n pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_eval_4gpu.sh
+bash -n pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_eval_dev16_8gpu.sh
+bash -n pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_fourway_dev16_4gpu.sh
+bash -n pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_fourway_dev16_8gpu.sh
+bash -n pose_point_depth_mv/background_jobs/run_objaverse16_no_vggt_objaverse2k.sh
+
+
+P1. 等待 frozen-SS Audit64 support gate
+----------------------------------------
+
+训练脚本会硬性要求下列 report 已存在且 `passed=true, formal=false`：
+
+AUDIT=/data/zjr/objaverse2k_frozen_ss_audit64_20260811_v1/aggregate_v1/report.json
+test -s "${AUDIT}"
+"${PY}" - "${AUDIT}" <<'PY'
+import json, sys
+p=json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["passed"] is True
+assert p["formal"] is False
+assert p["object_count"] == 64
+assert all(p["checks"].values())
+print({"Audit64_support_gate":"passed", "formal":False, "objects":64})
+PY
+
+Audit64 未完成时可以先做 P2 数据准备，但不得启动 P3 训练。
+
+
+P2. 四卡准备 train/dev64、GT SLat target、frozen-SS cache
+--------------------------------------------------------
+
+该脚本依次执行：
+
+1. 固化 train2135/dev64，并生成对象不跨 worker 的四卡 indices；
+2. CPU 全量预检 2199 对象的原生 target 身份和跨序列坐标 IoU；
+3. 四卡并行构建 native Objaverse local lh-slats；
+4. 四卡并行构建 train seed42 cache 并无复制汇总；
+5. 四卡并行构建 dev seeds42,43,44 cache 并无复制汇总；
+6. 在 dev32 上执行 frozen mesh decoder target audit。
+
+它不会伪造 `object_level_ss_repair.v1`。原始 renderer latent 使用独立的
+`native_objaverse_render_v1` 契约。同一对象的 target 固定取 UID 字典序最小的 primary
+sequence；其余 sequence 的 RGB/mask/camera 仍参与 DINO 融合，但独立 surface voxelization
+得到的 coords/z 不要求逐元素相同。rotation/source GLB 必须完全相同，跨 sequence coords
+IoU 必须不低于 0.75。train/dev manifest 固定按 `(object_uid, uid)` 排序，因此下游
+`min_frame_iou=0.90` 检查读取的第一条 SS sequence 与 primary target 是同一份坐标，而不是
+用 0.75 放宽训练坐标帧门。
+
+真实 2199-object CPU 预检已通过：4137 sequences、1938 次双序列比较，IoU min=0.7710758、
+p01=0.9115384、p05=0.9354552、median=0.9726006，低于0.75为0；rotation和source GLB在
+1938/1938比较中完全一致。
+
+mkdir -p /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-prepare-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/prepare_4gpu.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/prepare_4gpu.service.log \
+  /usr/bin/env OBJAVERSE2K_SLAT_GPUS=0,5,6,7 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/prepare_objaverse2k_no_vggt_slat_4gpu.sh
+
+监视：
+
+watch -n 20 '
+date -u
+RUN=/data/zjr/objaverse2k_no_vggt_slat_20260811_v1
+echo "target rank reports: $(find "${RUN}/lh_slats_native_mv16_v1" -maxdepth 1 -name "rank_*_report.json" 2>/dev/null | wc -l)/4"
+test -s "${RUN}/split_dev64_v1/native_target_preflight.json" && echo "native target preflight: ready" || echo "native target preflight: pending"
+echo "train cache workers: $(find "${RUN}/slat_cache_train_seed42_shards_v1" -mindepth 2 -maxdepth 2 -name manifest.json 2>/dev/null | wc -l)/4"
+echo "dev cache workers:   $(find "${RUN}/slat_cache_dev64_seed424344_shards_v1" -mindepth 2 -maxdepth 2 -name manifest.json 2>/dev/null | wc -l)/4"
+cat "${RUN}/logs/prepare_objaverse2k_slat_4gpu.state" 2>/dev/null || true
+nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader
+'
+
+完成检查：
+
+RUN=/data/zjr/objaverse2k_no_vggt_slat_20260811_v1
+test -s "${RUN}/split_dev64_v1/_OBJAVERSE2K_SLAT_SPLIT_COMPLETE.json"
+test -s "${RUN}/split_dev64_v1/native_target_preflight.json"
+test -s "${RUN}/lh_slats_native_mv16_v1/_OBJAVERSE2K_LOCAL_LH_SLATS_COMPLETE.json"
+test -s "${RUN}/slat_cache_train_seed42_merged_v1/_OBJAVERSE2K_SLAT_CACHE_MERGE_COMPLETE.json"
+test -s "${RUN}/slat_cache_dev64_seed424344_merged_v1/_OBJAVERSE2K_SLAT_CACHE_MERGE_COMPLETE.json"
+test -s "${RUN}/slat_target_decoder_audit_dev32_v1/report.json"
+cat "${RUN}/logs/prepare_objaverse2k_slat_4gpu.exit_code"
+
+P2 可断点续跑。四卡 target/cache worker 会复用已验证 artifact；merge 输出若只有
+半成品而无 completion marker，脚本会拒绝覆盖，必须先审计该目录。
+
+
+P3. 四卡 DDP 训练到指定曲线点
+------------------------------
+
+建议先到 400，再按 dev64 结果决定是否继续 800/1200/1600/2000。
+每次续训必须使用同一输出目录和原 checkpoint 的 optimizer/RNG；脚本自动处理。
+
+2026-08-12 状态：下面的 P2->P3 自动接力命令不再使用。原接力服务已经因
+P2 decoder audit 失败而以 rc=2 结束，不会自动复活。保留命令仅供追溯；
+当前选择是 P2 修复并完整通过后，在前台手动启动 P3。
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-auto-step400-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/auto_p2_to_step400.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/auto_p2_to_step400.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_GPUS=0,5,6,7 \
+    OBJAVERSE2K_SLAT_P2_POLL_SECONDS=60 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/wait_p2_then_train_objaverse2k_step400.sh
+
+同时监视 P2 和自动 P3：
+
+watch -n 20 '
+date -u
+RUN=/data/zjr/objaverse2k_no_vggt_slat_20260811_v1
+echo "=== handoff ==="
+cat "${RUN}/logs/p2_to_p3_step400.state" 2>/dev/null || true
+echo "handoff rc: $(cat "${RUN}/logs/p2_to_p3_step400.exit_code" 2>/dev/null || echo pending)"
+echo "=== P2 ==="
+cat "${RUN}/logs/prepare_objaverse2k_slat_4gpu.state" 2>/dev/null || true
+echo "P2 rc: $(cat "${RUN}/logs/prepare_objaverse2k_slat_4gpu.exit_code" 2>/dev/null || echo pending)"
+for F in "${RUN}"/logs/cache_train_worker_*.log; do
+  test -f "${F}" && printf "%s: " "$(basename "${F}")" && sed -n "/\[direct_slat_cache:cond\]/h; \${x;p;}" "${F}"
+done
+echo "train workers: $(find "${RUN}/slat_cache_train_seed42_shards_v1" -mindepth 2 -maxdepth 2 -name manifest.json 2>/dev/null | wc -l)/4"
+echo "dev workers:   $(find "${RUN}/slat_cache_dev64_seed424344_shards_v1" -mindepth 2 -maxdepth 2 -name manifest.json 2>/dev/null | wc -l)/4"
+echo "=== P3 ==="
+cat "${RUN}/logs/slat_objaverse2135_training.state" 2>/dev/null || echo pending
+test -s "${RUN}/slat_objaverse2135_step2000_seed42_4gpu_v1/checkpoints/step_000400.pt" && echo "step400: ready" || echo "step400: pending"
+tail -n 8 "${RUN}/logs/auto_p2_to_step400.service.log" 2>/dev/null || true
+nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader
+'
+
+上面的接力服务已废弃，不要重新启动。
+
+前台直接训练到 step2000：
+
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  RUN=/data/zjr/objaverse2k_no_vggt_slat_20260811_v1
+  test "$(tr -d '[:space:]' < "${RUN}/logs/prepare_objaverse2k_slat_4gpu.exit_code")" = 0
+  test -s "${RUN}/slat_target_decoder_audit_dev32_v1/report.json"
+  test -s "${RUN}/slat_cache_train_seed42_merged_v1/_OBJAVERSE2K_SLAT_CACHE_MERGE_COMPLETE.json"
+  test -s "${RUN}/slat_cache_dev64_seed424344_merged_v1/_OBJAVERSE2K_SLAT_CACHE_MERGE_COMPLETE.json"
+
+  OBJAVERSE2K_SLAT_RUN="${RUN}" \
+  OBJAVERSE2K_SLAT_GPUS=0,5,6,7 \
+  OBJAVERSE2K_SLAT_RUN_UNTIL_STEP=2000 \
+    /usr/bin/bash \
+    /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_4gpu.sh
+)
+
+这是真正的前台命令：训练日志直接显示在当前终端，命令结束后当前 shell
+仍保持打开。P2 canonical-margin schema 修复后已于 2026-08-12T01:02:48Z
+以 rc=0 完成，32-object decoder audit `passed=true`，所以当前四个硬门已满足。
+仍不得删除或绕过。
+
+后台 systemd 直接训练到 step2000（仅在明确需要后台运行时使用）：
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-train-step2000-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_step2000.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_step2000.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_GPUS=0,5,6,7 \
+    OBJAVERSE2K_SLAT_RUN_UNTIL_STEP=2000 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_4gpu.sh
+
+如果用上面的 systemd 后台命令启动，用 tail 持续监视训练：
+
+tail -n 50 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_step2000.service.log
+
+`tail -F` 会先显示最后 50 行，然后持续跟踪；按 Ctrl-C 只退出监视，
+不会停止 systemd 中的 P3。如果用前台命令启动 P3，当前终端已经
+直接显示训练输出，不需要另外 tail。
+
+继续到 step800 时只改变 stage boundary：
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-train-step800-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_step800.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_step800.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_GPUS=0,5,6,7 \
+    OBJAVERSE2K_SLAT_RUN_UNTIL_STEP=800 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_4gpu.sh
+
+1200/1600/2000 同理，只替换 unit 名、日志名和
+`OBJAVERSE2K_SLAT_RUN_UNTIL_STEP`。不要把 `max_steps` 改成阶段值。
+
+
+P3B. 八卡保持 global batch=8，直接训练到 step2000
+----------------------------------------------------
+
+目标是用 `8 GPU x grad_accum=1 = global batch 8` 替代原四卡的
+`4 GPU x grad_accum=2 = global batch 8`。模型、数据、学习率、warmup、EMA、
+2000-step schedule 和总样本预算不变；只改并行拓扑。由于 world size
+改变后数据顺序/RNG轨迹不同，八卡必须使用新输出目录并从同一
+M8 step2000 EMA 重新初始化，不声称无损续训四卡 checkpoint。
+
+当前四卡轨迹已在 step200 落盘：
+
+```text
+slat_objaverse2135_step2000_seed42_4gpu_v1/checkpoints/step_000200.pt
+```
+
+先停止旧四卡训练，并确认所有 DINO worker 已结束：
+
+systemctl --user stop tracker-objaverse2k-slat-train-step2000-v1.service
+test "$(systemctl --user is-active \
+  tracker-objaverse2k-slat-train-step2000-v1.service || true)" != active
+
+for PARTITION in 0 1 2 3; do
+  test "$(systemctl --user is-active \
+    tracker-objaverse5k-direct-dino-p${PARTITION}-v1.service || true)" != active
+done
+
+test "$(find \
+  /data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1/shards \
+  -name _DINO_ONLY_LIFTING_COMPLETE.json | wc -l)" -eq 16
+
+八卡脚本固定 `max_steps=2000, run_until_step=0`，不再接受阶段暂停变量。
+当前输出目录已经有 step800 时会自动从 `checkpoints/last.pt` 恢复 optimizer、EMA
+和 RNG，并连续运行到 step2000；不会在 1200/1600 等保存点退出。环境中即使残留
+`OBJAVERSE2K_SLAT_RUN_UNTIL_STEP=800` 也会被忽略。
+
+如果 P4B dev16 正在运行，先等它结束；训练脚本与 dev16 通过同一训练锁互斥。
+后台启动并直接续训到 step2000：
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-train-8gpu-step2000-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_8gpu_step2000.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_8gpu_step2000.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_8GPU_GPUS=0,1,2,3,4,5,6,7 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_8gpu.sh
+
+用 tail 持续监视：
+
+tail -n 50 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_8gpu_step2000.service.log
+
+输出与旧四卡目录互不覆盖：
+
+```text
+/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/
+slat_objaverse2135_step2000_seed42_8gpu_bs8_v1/
+```
+
+每 200 步仍正常保存 checkpoint，但不再把保存点当作阶段终点。最终必须同时生成
+`checkpoints/step_002000.pt` 和 `report.json` 才算成功。脚本会拒绝与旧四卡训练、
+P4B dev16、任一 DINO worker 重叠，并要求 DINO marker 已达 `16/16`。
+
+
+P4. 八卡 matched dev64 测试每个曲线点
+-------------------------------------
+
+八张卡的固定分工：
+
+- GPU0-3: M8 dev64，每个 worker 16 objects
+- GPU4-7: Objaverse2K candidate dev64，每个 worker 16 objects
+
+每对象使用 frozen SS support seeds 42/43/44。汇总前要求两次 Stock mesh SHA256
+完全一致，因此不是只在统计层面声称 same noise。
+
+测试 step2000：
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-eval-dev64-step2000-8gpu-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev64_step2000_8gpu.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev64_step2000_8gpu.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+    OBJAVERSE2K_SLAT_EVAL_STEP=2000 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_eval_dev64_8gpu.sh
+
+持续查看每个 GPU 的对象进度：
+
+tail --retry -n 5 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev64_step002000_{m8,objaverse2k}_worker_{0,1,2,3}.log
+
+查看结果：
+
+cat /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/eval_dev64_step002000_stock_m8_objaverse2k_8gpu_v1/comparison/summary.txt
+
+测试 400/800/1200/1600 时替换 step 和 unit 名。不要重复运行已经有
+`comparison/report.json` 的点。
+
+主要读取三组 positive-is-left-better 指标：
+
+- `m8_vs_stock`
+- `objaverse2k_vs_stock`
+- `objaverse2k_vs_m8`
+
+优先级：Mesh chamfer-L1、F@0.02、normal consistency；同时检查 object win rate，
+不能用 train loss 或 latent MSE 代替。step2000 仍未稳定超过 M8/Stock 时，不盲目续训。
+
+
+P4B. 八卡 matched dev16 快速检查 step800
+--------------------------------------
+
+这是 dev64 冻结顺序的前 16 个对象，不是另行挑选的对象。GPU0-3 分摊 M8，
+GPU4-7 分摊 Objaverse2K 八卡 step800；每个 worker 4 个对象，每对象 frozen-SS
+seeds 42/43/44。该检查只用于决定是否值得继续到 dev64/step2000，样本量不足以代替
+P4 dev64。它比较 Full vs Stock 和新 checkpoint vs M8，不是 Correct-vs-Cyclic
+位姿消融。
+
+后台启动：
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-eval-dev16-step2000-8gpu-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev16_step2000_8gpu.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev16_step2000_8gpu.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_EVAL_GPUS=0,1,2,3,4,5,6,7 \
+    OBJAVERSE2K_SLAT_EVAL_STEP=2000 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_eval_dev16_8gpu.sh
+
+持续查看主服务日志：
+
+tail -n 50 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev16_step2000_8gpu.service.log
+
+每个 GPU 的实际对象进度写在独立日志；一起持续查看：
+
+tail -n 5 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev16_step000800_m8_worker_*.log \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_dev16_step000800_objaverse2k_worker_*.log
+
+完成后读取：
+
+cat /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/eval_dev16_step000800_stock_m8_objaverse2k_8gpu_v1/comparison/summary.txt
+
+
+P4C. 四卡 dev16 四路归因：posed-DINO 与 LoRA-only
+-------------------------------------------------
+
+该测试只加载一个 Objaverse2K checkpoint，四个分支为：
+
+- stock：关闭 LoRA 和 posed-DINO residual；
+- lora_only：保留训练后的 LoRA，但用 forward hook 将完整 every-block
+  condition 输出严格置零，包括 projection bias；
+- pose_cyclic1：保留 LoRA/posed-DINO，但相机 pose 循环错配一位；
+- correct：保留 LoRA/posed-DINO 和正确 image/pose binding。
+
+同一 object/support-seed 的四路共享 frozen Native-SS coordinates、initial noise、
+Stock image context、sampler 和 decoder，并在同一个进程内依次执行。不要把四个分支
+拆到四张卡，否则 sparse CUDA 的跨进程数值波动会混入分支差异。
+
+GPU0/3/4/5 各处理 frozen dev64 顺序中的前 16 个对象里的 4 个对象；每对象使用
+support seeds 42/43/44。因此共有 16 objects、48 matched quartets、192 branch rollouts。
+统计先对每个对象的 3 seeds 求均值，再在 16 个对象上算 win rate 和 bootstrap CI。
+
+启动 step2000：
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-fourway-dev16-step2000-4gpu-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_fourway_dev16_step2000_4gpu.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_fourway_dev16_step2000_4gpu.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_SLAT_FOURWAY_GPUS=0,3,4,5 \
+    OBJAVERSE2K_SLAT_FOURWAY_STEP=2000 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_fourway_dev16_4gpu.sh
+
+持续查看四个 worker 的实际对象进度（tail 会等待尚未创建的日志）：
+
+tail --retry -n 5 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_fourway_dev16_step002000_4gpu_worker_{0,1,2,3}.log
+
+另一个终端查看主服务与退出状态：
+
+tail --retry -n 20 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_fourway_dev16_step2000_4gpu.service.log \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_fourway_dev16_step002000_4gpu.state \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/eval_fourway_dev16_step002000_4gpu.exit_code
+
+完成后读取：
+
+cat /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/eval_fourway_dev16_step002000_4gpu_v1/aggregate/summary.txt
+
+完整逐对象、CI 和绝对指标在：
+
+/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/eval_fourway_dev16_step002000_4gpu_v1/aggregate/report.json
+
+报告中的 delta 全部是 positive-is-left-better：
+
+- posed_dino_increment = correct - lora_only：posed-DINO 的最终 Mesh 边际作用；
+- correct_pose_specificity = correct - pose_cyclic1：正确 pose binding 的特异性；
+- generic_lora_increment = lora_only - stock：通用 LoRA 适配作用；
+- total_trained_slat = correct - stock：整套训练的总作用。
+
+重点同时看 chamfer-L1、F@0.02、normal、object win rate 和 chamfer bootstrap
+95% CI。`Correct > Cyclic` 但 `Correct <= LoRA-only` 只说明模型识别 pose，不能说明
+posed-DINO 改善最终 Mesh。dev16 是 development mechanism diagnostic，仍然
+`formal=false`，不能代替 frozen Objaverse16 final diagnostic。
+
+若中途失败，检查 GPU 后原样重新执行同一个 systemd-run 命令。runner 会对已有输出
+加 `--resume`，逐 quartet 校验 identity 与 mesh SHA256 后继续，不会重算已完成记录。
+
+如需补测 step800，只把 unit 中 step2000 改为 step800，并设置：
+
+OBJAVERSE2K_SLAT_FOURWAY_STEP=800
+
+
+P5. 只在 dev64 选定一个 checkpoint 后运行一次 Objaverse16
+---------------------------------------------------------
+
+下面以选中 step800 为例。它复用已经冻结的 O0/O4/O5 target-free 输入，推理期间
+不读取 GT mesh 或指标。该结果仍为 `formal=false` 的最终诊断。
+
+systemd-run --user \
+  --unit=tracker-objaverse16-objaverse2k-step800-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/objaverse16_step800.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/objaverse16_step800.service.log \
+  /usr/bin/env \
+    OBJAVERSE16_OBJAVERSE2K_GPU=0 \
+    OBJAVERSE2K_SLAT_SELECTED_STEP=800 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse16_no_vggt_objaverse2k.sh
+
+最终报告示例：
+
+cat /data/zjr/objaverse16_no_vggt_mixed_20260810_v1/O9_objaverse2k_step000800_mesh_eval20k_v1/summary.txt
+
+
+停止命令
+--------
+
+systemctl --user stop tracker-objaverse2k-slat-prepare-v1.service
+systemctl --user stop tracker-objaverse2k-slat-auto-step400-v1.service
+systemctl --user stop tracker-objaverse2k-slat-train-step400-v1.service
+systemctl --user stop tracker-objaverse2k-slat-eval-step400-v1.service
+
+停止 DDP 训练时由 systemd 终止整个 cgroup；下次启动脚本会从
+`slat_objaverse2135_step2000_seed42_4gpu_v1/checkpoints/last.pt` 继续。

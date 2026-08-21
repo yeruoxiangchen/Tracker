@@ -1,0 +1,469 @@
+Native no-VGGT：真实Full迁移 + 合成868/真实376混合训练测试命令
+日期：2026-08-08 UTC
+==========================================================================
+
+目标
+----
+
+最终模型保留：
+  1. 多视图RGB及DINO patch特征；
+  2. 相机pose；
+  3. runtime-O点云、相机和frustum lifting；
+  4. Native SS v2和Native-SLat v2原有网络结构、LoRA及posed-DINO adapter。
+
+最终模型删除：
+  1. VGGT feature；
+  2. VGGT depth；
+  3. 训练和推理期间的VGGT模型加载/执行。
+
+数据固定为：
+  - 合成域：868个对象、1417条序列；
+  - 真实域：376个通过runtime-O和Mesh_O质量门的对象；
+  - 训练采样：全局轨迹严格synthetic:real=1:1，不按1417:376自然比例；
+  - 两域原cache保持不变，不复制大文件，mixed manifest只引用原路径和SHA256。
+
+初始化固定为：
+  - SS从真实域适配完成的v2 Full SS EMA初始化；
+  - SLat从真实域适配完成的v2 Full SLat EMA初始化；
+  - 只迁移EMA trainable weights；optimizer、scheduler、step、history、RNG、
+    原EMA轨迹全部重置；
+  - 这不是从头训练，也不是继续Full训练计步。
+
+重要边界
+--------
+
+  - 本文不修改任何旧Full或旧no-VGGT代码；全部使用新增入口。
+  - 旧F7合成no-VGGT SLat cache不属于本路线，完成与否不阻塞M1-M5；
+    新SLat cache必须使用本路线最终mixed SS重新生成。
+  - 当前真实Full S6是本路线SLat迁移父模型；M7必须等S6完整step1000和report。
+  - M9只使用可复用Benchmark32，不消费untouched Holdout64。
+  - M11只能在M9通过且M10冻结部署后运行一次；M11开始即视为Holdout64已消费。
+  - M3、M5、M7、M8、M9、M11都是脱离SSH的后台任务。
+
+
+M0. 新代码静态检查和单元测试（短任务）
+========================================
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" -m py_compile \
+    pose_point_depth_mv/mixed_no_vggt_data.py \
+    pose_point_depth_mv/real_full_no_vggt_migration.py \
+    pose_point_depth_mv/train_native_ss_genrecon_no_vggt_mixed.py \
+    pose_point_depth_mv/train_native_slat_genrecon_no_vggt_mixed.py \
+    pose_point_depth_mv/infer_omni_real_native_no_vggt_mixed.py \
+    pose_point_depth_mv/evaluate_omni_real_no_vggt_final.py \
+    pose_point_depth_mv/dataset_tools/build_mixed_no_vggt_manifest.py \
+    pose_point_depth_mv/dataset_tools/build_real_full_no_vggt_migration_contract.py \
+    pose_point_depth_mv/dataset_tools/freeze_mixed_no_vggt_deployment.py
+
+  "${PY}" -m unittest -v \
+    pose_point_depth_mv.test_mixed_no_vggt_migration \
+    pose_point_depth_mv.test_no_vggt_final_protocol
+
+  for SCRIPT in \
+    pose_point_depth_mv/background_jobs/prepare_mixed_no_vggt_ss_data.sh \
+    pose_point_depth_mv/background_jobs/run_mixed_no_vggt_ss.sh \
+    pose_point_depth_mv/background_jobs/run_mixed_no_vggt_ss_evaluation.sh \
+    pose_point_depth_mv/background_jobs/prepare_mixed_no_vggt_slat_data.sh \
+    pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat.sh \
+    pose_point_depth_mv/background_jobs/run_mixed_no_vggt_benchmark32.sh \
+    pose_point_depth_mv/background_jobs/run_mixed_no_vggt_holdout64.sh; do
+    bash -n "${SCRIPT}"
+  done
+
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits
+)
+M0_RC=$?
+echo "M0_RC=${M0_RC}; current terminal remains open"
+
+
+M1. 后台准备mixed SS数据和真实Full->no-VGGT SS迁移合同
+=======================================================
+
+本步不会重做真实runtime-O、Mesh对齐或GT target，只执行：
+  - 从真实Full 3072-D cache派生DINO-only 1024-D引用cache；
+  - 冻结合成868 + 真实376双manifest；
+  - 验证对象不重叠、特征合同一致和1:1采样；
+  - 绑定真实Full SS step1000 EMA父checkpoint。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m1-prepare-ss \
+  "${RUN}/logs/M1_prepare_ss_data.log" \
+  "${RUN}/logs/M1_prepare_ss_data.pid" \
+  bash pose_point_depth_mv/background_jobs/prepare_mixed_no_vggt_ss_data.sh
+M1_LAUNCH_RC=$?
+echo "M1_LAUNCH_RC=${M1_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 监视（Ctrl-C只退出tail）：
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M1_prepare_ss_data.log
+
+
+M2. 检查M1数据门
+===============
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+  test "$(cat "${RUN}/logs/M1_prepare_ss_data.exit_code")" = 0
+  "${PY}" - "${RUN}/manifests/mixed_ss_lifting_synth868_real376_v1.json" \
+                 "${RUN}/contracts/ss_real_full_ema_v1.json" <<'PY'
+import json, sys
+mixed=json.load(open(sys.argv[1], encoding="utf-8"))
+contract=json.load(open(sys.argv[2], encoding="utf-8"))
+domains={row["name"]: row for row in mixed["domains"]}
+assert domains["synthetic"]["object_count"] == 868
+assert domains["real"]["object_count"] == 376
+assert mixed["config"]["sampler"]["ratio"] == {"synthetic": 1, "real": 1}
+assert contract["passed"] is True and contract["stage"] == "ss"
+assert contract["parent"]["selected_weights"] == "ema"
+assert contract["policy"]["optimizer_inherited"] is False
+print({"passed": True, "domains": {k:v["object_count"] for k,v in domains.items()},
+       "parent": contract["parent"]["checkpoint"]})
+PY
+)
+M2_RC=$?
+echo "M2_RC=${M2_RC}; current terminal remains open"
+
+
+M3. GPU 6后台训练mixed no-VGGT SS到step2000
+=============================================
+
+可与仍占用GPU 4,5的真实Full S6并行。脚本自动判断：
+  - 新目录：从合同指定的真实Full SS EMA初始化；
+  - 已有last.pt：从mixed no-VGGT自己的last.pt恢复；
+  - 已有完整step2000/report：直接返回0。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m3-ss-train \
+  "${RUN}/logs/M3_ss_training.log" \
+  "${RUN}/logs/M3_ss_training.pid" \
+  env MIXED_NO_VGGT_SS_GPU=6 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_ss.sh
+M3_LAUNCH_RC=$?
+echo "M3_LAUNCH_RC=${M3_LAUNCH_RC}; 后台训练不依赖当前终端"
+echo "current terminal remains open"
+
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M3_ss_training.log
+
+
+M4. 检查或恢复M3
+===============
+
+set +e
+set +u
+set +o pipefail
+(
+  RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+  cat "${RUN}/logs/M3_ss_training.state" 2>/dev/null
+  cat "${RUN}/logs/M3_ss_training.exit_code" 2>/dev/null
+  tail -n 20 "${RUN}/logs/M3_ss_training.log" 2>/dev/null
+  ls -lh "${RUN}/ss_mixed_step2000_seed42_1gpu_v1/checkpoints/last.pt" 2>/dev/null
+  ls -lh "${RUN}/ss_mixed_step2000_seed42_1gpu_v1/checkpoints/step_002000.pt" 2>/dev/null
+)
+M4_RC=$?
+echo "M4_RC=${M4_RC}; current terminal remains open"
+
+# 如果SSH中断且pid已不存在，直接重新执行M3启动命令；脚本会从last.pt恢复。
+
+
+M5. GPU 6后台执行SS CFG16校准和独立synthetic dev32验证
+========================================================
+
+本步只在M3完成后运行。它使用已有合成DINO-only val64：
+  - manifest对象16-31：固定CFG3重新校准，不再由CFG1/3/5均值排序选择CFG5；
+  - manifest对象32-63：独立32对象、seed 42/43/44验证；
+  - count ratio上限使用版本化的1.25；旧1.20校准失败报告保留，不覆盖；
+  - 固定CFG3的依据是校准16上IoU对象胜率93.75%，高于CFG5的81.25%；
+  - 输出report供M7构建最终SLat cache，真实Holdout64仍未消费。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m5-ss-eval \
+  "${RUN}/logs/M5_ss_evaluation.log" \
+  "${RUN}/logs/M5_ss_evaluation.pid" \
+  env MIXED_NO_VGGT_SS_EVAL_GPU=6 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_ss_evaluation.sh
+M5_LAUNCH_RC=$?
+echo "M5_LAUNCH_RC=${M5_LAUNCH_RC}; 后台评测不依赖当前终端"
+echo "current terminal remains open"
+
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M5_ss_evaluation.log
+
+
+M6. 检查真实Full SLat父模型S6（只检查，不重启）
+================================================
+
+M1-M5不依赖真实Full SLat，可以先完成；M7必须等待下面所有断言通过。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+  CKPT=${ADAPT}/slat_v2_real_step1000_seed42_2gpu_v2/checkpoints/step_001000.pt
+  REPORT=${ADAPT}/slat_v2_real_step1000_seed42_2gpu_v2/report.json
+  test -s "${CKPT}"
+  test -s "${REPORT}"
+  "${PY}" - "${REPORT}" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["passed"] is True and p["completed"] is True and p["step"] == 1000
+assert p["evaluation_weights"] == "ema"
+print({"passed": True, "step": p["step"], "weights": p["evaluation_weights"]})
+PY
+)
+M6_RC=$?
+echo "M6_RC=${M6_RC}; M6非0时只继续等待原S6，不要启动M7"
+echo "current terminal remains open"
+
+
+M7. GPU 6后台构建最终SS条件下的双域SLat cache和SLat迁移合同
+================================================================
+
+前置条件：M5=0且M6=0。SLat cache依赖最终SS输出，因此不能在M3/M5前提前构建。
+本步会分别生成synthetic868和real376 SLat cache，再用meta manifest做1:1混合；
+还会完成32对象target decoder审计，并绑定真实Full SLat EMA父模型。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m7-prepare-slat \
+  "${RUN}/logs/M7_prepare_slat_data.log" \
+  "${RUN}/logs/M7_prepare_slat_data.pid" \
+  env MIXED_NO_VGGT_SLAT_CACHE_GPU=6 \
+  bash pose_point_depth_mv/background_jobs/prepare_mixed_no_vggt_slat_data.sh
+M7_LAUNCH_RC=$?
+echo "M7_LAUNCH_RC=${M7_LAUNCH_RC}; 后台cache任务不依赖当前终端"
+echo "current terminal remains open"
+
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M7_prepare_slat_data.log
+
+
+M8. GPU 4,5后台训练mixed no-VGGT SLat到step2000
+================================================
+
+前置条件：M7 exit_code=0。此时原真实Full S6已经结束，GPU 4,5才允许复用。
+恢复规则与M3相同，只允许从本路线last.pt恢复，不允许重新读Full optimizer状态。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+test "$(cat "${RUN}/logs/M7_prepare_slat_data.exit_code")" = 0
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m8-slat-train \
+  "${RUN}/logs/M8_slat_training.log" \
+  "${RUN}/logs/M8_slat_training.pid" \
+  env MIXED_NO_VGGT_SLAT_GPUS=4,5 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat.sh
+M8_LAUNCH_RC=$?
+echo "M8_LAUNCH_RC=${M8_LAUNCH_RC}; 后台训练不依赖当前终端"
+echo "current terminal remains open"
+
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M8_slat_training.log
+# SSH断开且pid消失时重新执行M8；存在last.pt会自动恢复。
+
+
+M9. GPU 6后台执行Benchmark32五路最终开发测试
+===============================================
+
+前置条件：M8完整step2000/report。五路固定为：
+  1. 最终mixed no-VGGT；
+  2. 真实376域适配后的v2 Full；
+  3. 合成868父v2 Full；
+  4. ReconViaGen original；
+  5. Pixal3D official单参考视图。
+
+同一对象、同一seed=42、同一runtime-O GT，禁止逐方法GT ICP/scale/translation/
+reflection。主判断先看最终no-VGGT相对真实Full的Chamfer-L1 mean、median和
+object-win，再看F-score@0.02和normal consistency。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m9-benchmark32 \
+  "${RUN}/logs/M9_benchmark32.log" \
+  "${RUN}/logs/M9_benchmark32.pid" \
+  env MIXED_NO_VGGT_BENCH_GPU=6 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_benchmark32.sh
+M9_LAUNCH_RC=$?
+echo "M9_LAUNCH_RC=${M9_LAUNCH_RC}; 后台测试不依赖当前终端"
+echo "current terminal remains open"
+
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M9_benchmark32.log
+
+
+M9G. 查看Benchmark32结果
+========================
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  REPORT=${ROOT}/M9_benchmark32_fiveway_no_vggt_mixed1244_seed42_v1/report.json
+  "${PY}" - "${REPORT}" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1], encoding="utf-8"))
+assert p["passed"] is True and p["formal"] is False
+assert p["holdout64_consumed"] is False
+print(json.dumps({"summary": p["summary"],
+                  "comparisons": p["paired_comparisons"],
+                  "decision": p["no_vggt_decision"]}, indent=2, ensure_ascii=False))
+assert p["no_vggt_decision"]["holdout_unlock_passed"] is True
+PY
+  sed -n '1,160p' "$(dirname "${REPORT}")/summary.txt"
+)
+M9G_RC=$?
+if [ "${M9G_RC}" -eq 0 ]; then
+  echo "M9G passed; 可以冻结最终部署，但仍未消费Holdout64"
+else
+  echo "M9G failed; 不运行M10/M11，先分析Benchmark32"
+fi
+echo "M9G_RC=${M9G_RC}; current terminal remains open"
+
+
+M10. 冻结最终no-VGGT部署（短任务，不读取Holdout64）
+====================================================
+
+本步把Benchmark32、SS/SLat checkpoint哈希、EMA迁移合同、SS校准和采样配置
+冻结为一个不可覆盖合同。M9G非0时禁止运行。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+  "${PY}" -u -m pose_point_depth_mv.dataset_tools.freeze_mixed_no_vggt_deployment \
+    --benchmark "${ROOT}/M9_benchmark32_fiveway_no_vggt_mixed1244_seed42_v1/report.json" \
+    --ss_checkpoint "${RUN}/ss_mixed_step2000_seed42_1gpu_v1/checkpoints/step_002000.pt" \
+    --slat_checkpoint "${RUN}/slat_mixed_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt" \
+    --ss_evidence "${RUN}/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json" \
+    --ss_migration_contract "${RUN}/contracts/ss_real_full_ema_v1.json" \
+    --slat_migration_contract "${RUN}/contracts/slat_real_full_ema_v1.json" \
+    --output "${RUN}/contracts/final_no_vggt_deployment_benchmark32_v1.json"
+)
+M10_RC=$?
+echo "M10_RC=${M10_RC}; current terminal remains open"
+
+
+M11. 最终一次后台Holdout64五路正式测试（现在不要提前运行）
+============================================================
+
+只在M10=0且确认不再选checkpoint/CFG/阈值后运行。命令一启动就创建不可逆的
+Holdout64消费标记；中断后可以原目录断点恢复，但不能根据中间/最终结果修改配置
+再把同一64对象称为首次formal测试。不要再运行旧Full-only S8。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-no-vggt-m11-holdout64 \
+  "${RUN}/logs/M11_holdout64.log" \
+  "${RUN}/logs/M11_holdout64.pid" \
+  env MIXED_NO_VGGT_HOLDOUT_GPU=6 \
+      M11_ALLOW_ALIGNMENT_QUALITY_WARNINGS=1 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_holdout64.sh
+M11_LAUNCH_RC=$?
+echo "M11_LAUNCH_RC=${M11_LAUNCH_RC}; Holdout64后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/M11_holdout64.log
+
+
+统一后台状态检查
+================
+
+set +e
+set +u
+set +o pipefail
+(
+  RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+  for STEP in M1_prepare_ss_data M3_ss_training M5_ss_evaluation \
+              M7_prepare_slat_data M8_slat_training M9_benchmark32 M11_holdout64; do
+    echo "===== ${STEP} ====="
+    cat "${RUN}/logs/${STEP}.state" 2>/dev/null
+    cat "${RUN}/logs/${STEP}.exit_code" 2>/dev/null
+  done
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits
+)
+STATUS_RC=$?
+echo "STATUS_RC=${STATUS_RC}; current terminal remains open"
+
+
+最终产物
+========
+
+SS：
+  /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/
+  ss_mixed_step2000_seed42_1gpu_v1/checkpoints/step_002000.pt
+
+SLat：
+  /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/
+  slat_mixed_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt
+
+Benchmark32：
+  /data/zjr/omni_real_video500_download_20260804_v2/
+  M9_benchmark32_fiveway_no_vggt_mixed1244_seed42_v1/report.json
+
+冻结部署合同：
+  /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/
+  contracts/final_no_vggt_deployment_benchmark32_v1.json
+
+Formal Holdout64：
+  /data/zjr/omni_real_video500_download_20260804_v2/
+  M11M_holdout64_fiveway_no_vggt_mixed1244_seed42_v1/report.json

@@ -1,0 +1,282 @@
+Mixed no-VGGT SLat：Stock cross-attention首视图/全视图 × posed-DINO关/开
+日期：2026-08-11 UTC
+================================================================================
+
+目的
+----
+
+检验当前所有视图都进入Stock SLat cross-attention，是否形成不依赖相机位姿的多视图
+信息旁路，从而压缩posed-DINO residual的边际收益。
+
+这是匹配训练，不是只在现有checkpoint推理时临时砍视图：
+
+  All训练臂：   现有M8；Stock cross-attention接收全部随机选中视图。
+  First训练臂： 新训练；Stock cross-attention只接收随机子集的第一视图。
+
+两臂都保持posed-DINO 3D条件接收全部随机选中视图；其余数据、real-Full EMA父模型、
+Native-SS support、seed42、总调度2000步、两卡、优化器、LR、CFG和decoder均相同。
+阶段筛选必须比较相同checkpoint步数：先All@400对First@400，必要时才比较800对800。
+
+最终2x2单元为：
+
+                    posed-DINO off        posed-DINO on
+  Stock all-view       all/lora_only          all/correct
+  Stock first-view     first/lora_only        first/correct
+
+报告永久为formal=false、training_overlap=true，只回答机制；不能替代未来5K holdout。
+
+
+T0. CPU编译、Shell语法和单元测试
+================================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/train_native_slat_genrecon.py \
+  pose_point_depth_mv/evaluate_mixed_no_vggt_slat_fourway.py \
+  pose_point_depth_mv/summarize_mixed_slat_stock_context_2x2.py \
+  pose_point_depth_mv/test_native_slat_genrecon.py \
+  pose_point_depth_mv/test_mixed_no_vggt_slat_fourway.py
+
+bash -n \
+  pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_stockfirst.sh \
+  pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_stockfirst_fourway.sh
+
+"${PY}" -m unittest -v \
+  pose_point_depth_mv.test_native_slat_genrecon \
+  pose_point_depth_mv.test_mixed_no_vggt_slat_fourway
+
+T0_RC=$?
+echo "T0_RC=${T0_RC}; current terminal remains open"
+
+
+T1-full. 两卡后台训练First臂到step2000（当前不要执行）
+=====================================================
+
+先用nvidia-smi选择两张可用卡。默认4,5；可以改成例如0,7：
+
+cd /home/zjr/Tracker
+GPUS=${GPUS:-4,5}
+ROOT=/data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-slat-stockfirst-train \
+  "${ROOT}/logs/stockfirst_training.log" \
+  "${ROOT}/logs/stockfirst_training.pid" \
+  env STOCK_CONTEXT_TRAIN_GPUS="${GPUS}" \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_stockfirst.sh
+
+T1_LAUNCH_RC=$?
+echo "T1_LAUNCH_RC=${T1_LAUNCH_RC}; 后台训练不依赖当前终端"
+echo "current terminal remains open"
+
+# 监视；Ctrl-C只退出tail：
+# tail -f /data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1/logs/stockfirst_training.log
+#
+# 状态：
+# cat /data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1/logs/stockfirst_training.state
+# cat /data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1/logs/stockfirst_training.exit_code
+#
+# 只有step400/800阶段裁决支持继续时才使用本完整预算入口。
+# SSH中断或任务中断后原样重跑；存在last.pt时只从本实验恢复。
+
+
+T1A. GPU 5,6先跑到step400并正常暂停（推荐先执行）
+====================================================
+
+`max_steps`仍固定为2000，所以学习率warmup、优化器和All-view step400完全同预算；
+`RUN_UNTIL_STEP=400`只控制本次进程的阶段终点。step400评测后若裁决需要复核，
+先改成800原样重跑；不能在未看400结果时直接续到2000。恢复会保留优化器、EMA、
+RNG和采样位置，不会从头训练。
+
+cd /home/zjr/Tracker
+ROOT=/data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-slat-stockfirst-train \
+  "${ROOT}/logs/stockfirst_training.log" \
+  "${ROOT}/logs/stockfirst_training.pid" \
+  env STOCK_CONTEXT_TRAIN_GPUS=5,6 \
+      STOCK_CONTEXT_RUN_UNTIL_STEP=400 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_stockfirst.sh
+
+T1A_LAUNCH_RC=$?
+echo "T1A_LAUNCH_RC=${T1A_LAUNCH_RC}; 后台训练不依赖当前终端"
+echo "current terminal remains open"
+
+# 监视：
+# tail -f "${ROOT}/logs/stockfirst_training.log"
+# cat "${ROOT}/logs/stockfirst_training.state"
+# 完成标志：
+# test -s "${ROOT}/stockfirst_train_step2000_seed42_2gpu_v1/checkpoints/step_000400.pt" && echo step400_complete
+# test -s "${ROOT}/stockfirst_train_step2000_seed42_2gpu_v1/stage_report_step_000400.json" && echo stage_report_complete
+
+
+T2. 核验匹配预算的All@400与First@400（CPU）
+================================================
+
+T1A完成后先停在400，不继续训练。下面的STEP默认400；将来若裁决为继续，可统一改成800。
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+STEP=${STEP:-800}
+STEP_PAD=$(printf '%06d' "${STEP}")
+ALL_CKPT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/slat_mixed_step2000_seed42_2gpu_v1/checkpoints/step_${STEP_PAD}.pt
+FIRST_CKPT=/data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1/stockfirst_train_step2000_seed42_2gpu_v1/checkpoints/step_${STEP_PAD}.pt
+
+"${PY}" - "${ALL_CKPT}" "${FIRST_CKPT}" "${STEP}" <<'PY'
+import json,sys,torch
+all_ckpt=torch.load(sys.argv[1], map_location="cpu")
+first_ckpt=torch.load(sys.argv[2], map_location="cpu")
+step=int(sys.argv[3])
+assert all_ckpt["step"] == first_ckpt["step"] == step
+assert all_ckpt["args"]["max_steps"] == first_ckpt["args"]["max_steps"] == 2000
+assert all_ckpt["args"].get("stock_context_views", "all") == "all"
+assert first_ckpt["args"]["stock_context_views"] == "first"
+a=dict(all_ckpt["args"]); b=dict(first_ckpt["args"])
+for row in (a,b):
+    row.pop("output_dir", None)
+    row.pop("stock_context_views", None)
+assert a == b, {key:(a.get(key),b.get(key)) for key in sorted(set(a)|set(b)) if a.get(key)!=b.get(key)}
+s=first_ckpt["model_summary"]["stock_cross_attention_context"]
+assert s["views"] == "first"
+assert s["posed_dino_3d_views"] == "all randomly selected views"
+print(json.dumps({
+    "matched_step": step,
+    "max_steps": 2000,
+    "only_controlled_arg": "stock_context_views: all vs first",
+    "first_stock_context": s,
+}, indent=2, ensure_ascii=False))
+PY
+
+T2_RC=$?
+echo "T2_RC=${T2_RC}; current terminal remains open"
+
+
+T3. 两张单卡并行运行All@400与First@400的16+16四路评测
+==========================================================
+
+cd /home/zjr/Tracker
+STEP=${STEP:-800}
+STEP_PAD=$(printf '%06d' "${STEP}")
+GPU_ALL=${GPU_ALL:-5}
+GPU_FIRST=${GPU_FIRST:-6}
+OBJECTS_PER_DOMAIN=${OBJECTS_PER_DOMAIN:-16}
+ALL_ROOT=/data/zjr/mixed_no_vggt_slat_fourway_20260811_v1
+FIRST_ROOT=/data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-slat-all-step${STEP_PAD}-${OBJECTS_PER_DOMAIN}x2 \
+  "${ALL_ROOT}/logs/fourway_step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}.log" \
+  "${ALL_ROOT}/logs/fourway_step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}.pid" \
+  env MIXED_SLAT_FOURWAY_GPU="${GPU_ALL}" \
+      MIXED_SLAT_FOURWAY_OBJECTS_PER_DOMAIN="${OBJECTS_PER_DOMAIN}" \
+      MIXED_SLAT_FOURWAY_TRAIN_STEP="${STEP}" \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_fourway.sh
+T3_ALL_RC=$?
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-slat-first-step${STEP_PAD}-${OBJECTS_PER_DOMAIN}x2 \
+  "${FIRST_ROOT}/logs/stockfirst_step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}.log" \
+  "${FIRST_ROOT}/logs/stockfirst_step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}.pid" \
+  env STOCK_CONTEXT_EVAL_GPU="${GPU_FIRST}" \
+      STOCK_CONTEXT_OBJECTS_PER_DOMAIN="${OBJECTS_PER_DOMAIN}" \
+      STOCK_CONTEXT_EVAL_TRAIN_STEP="${STEP}" \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_stockfirst_fourway.sh
+T3_FIRST_RC=$?
+
+echo "T3_ALL_RC=${T3_ALL_RC}; T3_FIRST_RC=${T3_FIRST_RC}; 两臂后台并行"
+echo "current terminal remains open"
+
+# 分别监视：
+# tail -f /data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/logs/fourway_step000800_synth16_real16.log
+# tail -f /data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1/logs/stockfirst_step000800_synth16_real16.log
+
+
+T4. 汇总同一步数的All与First，计算2x2交互项
+================================================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+STEP=${STEP:-800}
+STEP_PAD=$(printf '%06d' "${STEP}")
+OBJECTS_PER_DOMAIN=${OBJECTS_PER_DOMAIN:-16}
+ROOT=/data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1
+ALL=/data/zjr/mixed_no_vggt_slat_fourway_20260811_v1/step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}_seed42/report.json
+FIRST=${ROOT}/first_step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}_seed42/report.json
+OUT=${ROOT}/paired_2x2_step${STEP_PAD}_synth${OBJECTS_PER_DOMAIN}_real${OBJECTS_PER_DOMAIN}_seed42_v1
+
+if [ ! -s "${ALL}" ] || [ ! -s "${FIRST}" ]; then
+  echo "T4 blocked: 同一步数的All或First四路报告不完整"
+  T4_RC=96
+elif [ -e "${OUT}" ]; then
+  echo "T4 blocked: immutable汇总目录已存在，请先检查：${OUT}"
+  T4_RC=98
+else
+  "${PY}" -u -m pose_point_depth_mv.summarize_mixed_slat_stock_context_2x2 \
+    --all_report "${ALL}" \
+    --first_report "${FIRST}" \
+    --output_dir "${OUT}" \
+    --bootstrap_samples 10000
+  T4_RC=$?
+fi
+
+echo "T4_RC=${T4_RC}"
+test "${T4_RC}" -eq 0 && sed -n '1,220p' "${OUT}/summary.txt"
+echo "current terminal remains open"
+
+
+T5. step400阶段裁决与可选续训
+================================
+
+当前不运行续训。先按下面规则判读T4，再决定是否把First臂续到800；不从400直接跳到2000。
+
+判读规则
+--------
+
+所有差值都已经转成“正值表示名字左侧更好”：
+
+  posed_increment_all:
+    all/correct - all/lora_only
+
+  posed_increment_first:
+    first/correct - first/lora_only
+
+  interaction_first_minus_all:
+    posed_increment_first - posed_increment_all
+    正值说明去掉Stock多视图旁路后，posed-DINO边际收益变大。
+
+  full_first_minus_all:
+    first/correct - all/correct
+    正值说明First Full绝对质量也更好；这是模型选择的主指标。
+
+  lora_only_first_minus_all:
+    first/lora_only - all/lora_only
+    通常预期为负，因为First臂主动减少了非位姿多视图信息。
+
+科学裁决：
+
+1. interaction为正，只能说明All-view Stock存在旁路/竞争证据。
+2. 若interaction为正但full_first_minus_all为负，不升级First模型；它只是削弱基线、放大差距。
+3. step400若interaction与full_first_minus_all在synthetic、real和mixed_macro_1to1上方向一致，
+   才把First续到800并用All@800/First@800原样重复T2-T4。
+4. step400若interaction没有增大且First Full绝对质量更差，则停止First臂，不消耗后续预算。
+5. step400若结果混合或置信区间较宽，只能判为不确定；最多续到800复核，不能直接跑2000。
+6. 只有First Full在三个分组均不反向，并在Chamfer-L1、F-score@0.02与Normal形成一致改善，
+   才考虑把First设计带入5K。
+7. 本次使用M8训练cache，永远不能写成held-out或正式泛化结论。
+
+若T4裁决需要续到800，再运行：
+
+cd /home/zjr/Tracker
+ROOT=/data/zjr/mixed_no_vggt_slat_stock_context_2x2_20260811_v1
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  mixed-slat-stockfirst-train \
+  "${ROOT}/logs/stockfirst_training.log" \
+  "${ROOT}/logs/stockfirst_training.pid" \
+  env STOCK_CONTEXT_TRAIN_GPUS=5,6 \
+      STOCK_CONTEXT_RUN_UNTIL_STEP=800 \
+  bash pose_point_depth_mv/background_jobs/run_mixed_no_vggt_slat_stockfirst.sh
+
+# 800完成后使用STEP=800重跑T2、T3和T4。

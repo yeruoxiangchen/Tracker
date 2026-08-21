@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Native-SLAT v2: Native-SS-aligned GenReCon conditioning on frozen Stock SLAT.
+"""Native-SLAT v3: pose-aware learned per-view fusion on frozen Stock SLAT.
 
 The model keeps the pretrained ReconViaGen/TRELLIS-vggt SLAT Flow as the
 explicit Stock branch.  The trainable branch adds attention LoRA and a
 GenReCon-style posed multiview DINO condition at the actual active 32^3 sparse
-coordinates before every native SLAT transformer block.  Conditional and
-unconditional flow matching and standard sampler CFG intentionally match
-``native_ss_genrecon.py``.
+coordinates before every native SLAT transformer block.  In addition, every
+SLAT cross-attention block replaces the released code's fixed arithmetic view
+mean with a learned per-point weighting of the per-view cross-attention
+results.  A zero-initialized transition gate starts exactly at the frozen
+Stock mean and learns to combine paper-style cross-attention scores with posed
+DINO visibility evidence.  Conditional/unconditional flow matching and
+standard sampler CFG intentionally match ``native_ss_genrecon.py``.
 """
 
 from __future__ import annotations
@@ -34,11 +38,14 @@ from pose_point_depth_mv.native_ss_genrecon import (
 from reconvggt_ar_adapter_a.pointpose_ss_condition import lora_disabled
 
 
-NATIVE_SLAT_GENRECON_VERSION = "pose_point_depth_mv.native_slat_genrecon.v2"
+NATIVE_SLAT_GENRECON_VERSION = "pose_point_depth_mv.native_slat_genrecon.v3"
 NATIVE_SLAT_GENRECON_TRAINING = NATIVE_SS_GENRECON_TRAINING
 NATIVE_SLAT_GENRECON_CFG = NATIVE_SS_GENRECON_CFG
 NATIVE_SLAT_GENRECON_PROJECTION = (
-    "active32_frustum_only_dino_shared_geometry_every_block.v2"
+    "active32_frustum_only_dino_shared_geometry_every_block.v3"
+)
+NATIVE_SLAT_CONTEXT_FUSION = (
+    "per_block_cross_result_mlp_plus_pose_dino_zero_init_stock_mean.v1"
 )
 NATIVE_SLAT_STOCK_FREEZE_VERSION = (
     "pose_point_depth_mv.native_ss_stock_slat_freeze.v2"
@@ -132,8 +139,9 @@ def make_stock_slat_freeze(
         "slat_sampler_params": frozen_sampler_params,
         "slat_normalization": frozen_normalization,
         "freeze_policy": (
-            "Stock SLAT Flow and Mesh decoder are inference-only; Native-SLAT v2 "
-            "trains only attention LoRA, view aggregation, and every-block projections. "
+            "Stock SLAT Flow and Mesh decoder are inference-only; Native-SLAT v3 "
+            "trains attention LoRA, view aggregation, per-block learned view fusion, "
+            "and every-block projections. "
             "Sampler parameters and SLAT normalization are immutable deployment state."
         ),
     }
@@ -222,7 +230,7 @@ def project_sparse_frustum_dino(
     if coords.ndim != 2 or int(coords.shape[1]) != 4:
         raise ValueError("Native-SLAT active coords must be [N,4]")
     if coords.numel() and not bool((coords[:, 0] == 0).all().item()):
-        raise ValueError("Native-SLAT v2 requires sparse batch size one per rank")
+        raise ValueError("Native-SLAT v3 requires sparse batch size one per rank")
     visual = select_dino_features(sample["visual_patch_features"]).to(
         device=device, dtype=torch.float32
     )
@@ -241,7 +249,10 @@ def project_sparse_frustum_dino(
         raise ValueError(f"DINO patch count is not square: {patches}")
     if projection_mode == "pose_cyclic1" and views > 1:
         extrinsics = torch.roll(extrinsics, shifts=1, dims=0)
-    image_height, image_width = map(int, sample["predicted_depth"].shape[-2:])
+    if "image_size" in sample:
+        image_height, image_width = map(int, sample["image_size"])
+    else:
+        image_height, image_width = map(int, sample["predicted_depth"].shape[-2:])
     geometry = sparse_projection_geometry(
         coords=coords,
         resolution=32,
@@ -286,7 +297,11 @@ def _slat_flow_core(flow: nn.Module) -> nn.Module:
 def _straight_through_sparse(value: Any, reference: Any) -> Any:
     if not torch.equal(value.coords, reference.coords):
         raise ValueError("Native-SLAT straight-through coordinates differ")
-    feats = value.feats + (reference.feats - value.feats).detach()
+    # ``value + detach(reference - value)`` is mathematically identical but
+    # incurs a second rounded add and can miss bit-exact Stock by ~1e-10.
+    # Subtracting the tensor from its own detached view is exactly zero in the
+    # forward pass while retaining a unit gradient to the adapted branch.
+    feats = reference.feats.detach() + (value.feats - value.feats.detach())
     return value.replace(feats)
 
 
@@ -303,10 +318,135 @@ def _same_condition_identity(value: Any, reference: Any) -> bool:
     )
 
 
-class NativeSLatGenreconFlow(nn.Module):
-    """Frozen Stock SLAT plus LoRA and posed 32^3 every-block conditioning."""
+class NativeSLatCrossAttentionViewFusion(nn.Module):
+    """Per-block view weighting with an exact zero-gate Stock starting point.
 
-    def __init__(self, flow: nn.Module, *, condition_channels: int = 1024) -> None:
+    The released ReconViaGen block adds ``CrossAttn(view) / view_count`` for
+    every view.  Here each block predicts a pointwise score from its own
+    cross-attention result, adds the posed-DINO geometry logit, and normalizes
+    across views.  The effective weights interpolate from the exact uniform
+    Stock weights through a straight-through-clamped, zero-initialized gate.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        blocks: int,
+        *,
+        hidden_dim: int = 64,
+        geometry_logit_scale_init: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.block_count = int(blocks)
+        self.hidden_dim = int(hidden_dim)
+        if self.channels <= 0 or self.block_count <= 0 or self.hidden_dim <= 0:
+            raise ValueError("Native-SLAT view-fusion dimensions must be positive")
+        if not 0.0 <= float(geometry_logit_scale_init) <= 4.0:
+            raise ValueError("geometry_logit_scale_init must be in [0,4]")
+        self.cross_scorers = nn.ModuleList(
+            nn.Sequential(
+                nn.LayerNorm(self.channels, elementwise_affine=False),
+                nn.Linear(self.channels, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, 1),
+            )
+            for _ in range(self.block_count)
+        )
+        # Cross-result scores initially contribute zero.  The non-uniform
+        # posed-DINO logits provide the first useful direction for opening the
+        # transition gate; after it opens, these MLPs receive live gradients.
+        for scorer in self.cross_scorers:
+            nn.init.zeros_(scorer[-1].weight)
+            nn.init.zeros_(scorer[-1].bias)
+        self.transition_gate_raw = nn.Parameter(torch.zeros(self.block_count))
+        self.geometry_logit_scale_raw = nn.Parameter(
+            torch.full((self.block_count,), float(geometry_logit_scale_init))
+        )
+
+    @staticmethod
+    def _straight_through_clamp(
+        value: torch.Tensor, minimum: float, maximum: float
+    ) -> torch.Tensor:
+        clipped = value.clamp(float(minimum), float(maximum))
+        return value + (clipped - value).detach()
+
+    def transition_gate(self, index: int) -> torch.Tensor:
+        return self._straight_through_clamp(
+            self.transition_gate_raw[int(index)], 0.0, 1.0
+        )
+
+    def geometry_logit_scale(self, index: int) -> torch.Tensor:
+        return self._straight_through_clamp(
+            self.geometry_logit_scale_raw[int(index)], 0.0, 4.0
+        )
+
+    def score_cross_result(
+        self, index: int, cross_features: torch.Tensor
+    ) -> torch.Tensor:
+        if cross_features.ndim != 2 or int(cross_features.shape[1]) != self.channels:
+            raise ValueError(
+                "Native-SLAT cross result must be [points,model_channels]"
+            )
+        return self.cross_scorers[int(index)](cross_features.float())[:, 0]
+
+    def effective_weights(
+        self,
+        index: int,
+        cross_logits: torch.Tensor,
+        *,
+        geometry_logits: torch.Tensor | None,
+        valid: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if cross_logits.ndim != 2:
+            raise ValueError("Native-SLAT cross logits must be [views,points]")
+        views, points = map(int, cross_logits.shape)
+        if views <= 0 or points <= 0:
+            raise ValueError("Native-SLAT view fusion received an empty axis")
+        if geometry_logits is None:
+            geometry_logits = torch.zeros_like(cross_logits)
+        if valid is None:
+            valid = torch.ones_like(cross_logits, dtype=torch.bool)
+        if geometry_logits.shape != cross_logits.shape or valid.shape != cross_logits.shape:
+            raise ValueError("Native-SLAT cross/geometry view schemas differ")
+        valid = valid.bool()
+        geometry_logits = geometry_logits.to(
+            device=cross_logits.device, dtype=torch.float32
+        )
+        combined = cross_logits.float() + self.geometry_logit_scale(index) * geometry_logits
+        masked = combined.masked_fill(~valid, -1.0e4)
+        target = torch.softmax(masked, dim=0)
+        uniform = torch.full_like(target, 1.0 / float(views))
+        all_invalid = ~valid.any(dim=0, keepdim=True)
+        target = torch.where(all_invalid, uniform, target)
+        gate = self.transition_gate(index)
+        effective = uniform + gate * (target - uniform)
+        entropy = -(target.clamp_min(1.0e-8).log() * target).sum(dim=0)
+        stats = {
+            "fusion_gate": gate.float(),
+            "geometry_logit_scale": self.geometry_logit_scale(index).float(),
+            "target_view_weight_entropy": entropy.mean(),
+            "target_view_weight_deviation": (target - uniform).abs().mean(),
+            "effective_view_weight_deviation": (effective - uniform).abs().mean(),
+            "fusion_valid_fraction": valid.float().mean(),
+        }
+        return effective, stats
+
+    def exact_stock_mean(self) -> bool:
+        return int(torch.count_nonzero(self.transition_gate_raw.detach()).item()) == 0
+
+
+class NativeSLatGenreconFlow(nn.Module):
+    """Frozen Stock SLAT plus LoRA, posed 3D condition, and learned view fusion."""
+
+    def __init__(
+        self,
+        flow: nn.Module,
+        *,
+        condition_channels: int = 1024,
+        view_fusion_hidden_dim: int = 64,
+        geometry_logit_scale_init: float = 1.0,
+    ) -> None:
         super().__init__()
         self.flow = flow
         self.condition_channels = int(condition_channels)
@@ -322,6 +462,12 @@ class NativeSLatGenreconFlow(nn.Module):
         self.aggregator = GenreconViewAggregator(self.condition_channels)
         self.block_condition = EveryBlockConditionProjection(
             self.condition_channels, int(core.model_channels), len(core.blocks)
+        )
+        self.view_fusion = NativeSLatCrossAttentionViewFusion(
+            int(core.model_channels),
+            len(core.blocks),
+            hidden_dim=int(view_fusion_hidden_dim),
+            geometry_logit_scale_init=float(geometry_logit_scale_init),
         )
 
     @property
@@ -342,13 +488,193 @@ class NativeSLatGenreconFlow(nn.Module):
             int(torch.count_nonzero(value.detach()).item()) == 0 for value in values
         )
 
+    def _view_fused_block_body(
+        self,
+        block_index: int,
+        block: nn.Module,
+        x: Any,
+        mod: torch.Tensor,
+        contexts: list[torch.Tensor],
+        geometry_logits: torch.Tensor,
+        geometry_valid: torch.Tensor,
+    ) -> tuple[Any, dict[str, torch.Tensor]]:
+        if block.share_mod:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(
+                6, dim=1
+            )
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                block.adaLN_modulation(mod).chunk(6, dim=1)
+            )
+        h = x.replace(block.norm1(x.feats))
+        h = h * (1 + scale_msa) + shift_msa
+        h = block.self_attn(h)
+        h = h * gate_msa
+        x = x + h
+        cross_query = x.replace(block.norm2(x.feats))
+
+        # Fuse in one attention pass without materializing a [V,N,C] tensor.
+        # A streaming log-sum-exp keeps the learned softmax numerator and
+        # denominator, while a second accumulator preserves the uniform Stock
+        # mean.  The final transition is therefore exactly
+        # uniform + gate * (learned - uniform), but does not double the costly
+        # cross-attention compute or retain every view's full feature tensor.
+        views = len(contexts)
+        uniform_fused = torch.zeros_like(x.feats)
+        target_numerator = torch.zeros_like(x.feats)
+        target_denominator = x.feats.new_zeros(
+            (int(x.feats.shape[0]),), dtype=torch.float32
+        )
+        running_max = x.feats.new_full(
+            (int(x.feats.shape[0]),), -1.0e4, dtype=torch.float32
+        )
+        has_valid = torch.zeros_like(running_max, dtype=torch.bool)
+        cross_scores: list[torch.Tensor] = []
+        geometry_scale = self.view_fusion.geometry_logit_scale(block_index)
+        for view_index, context in enumerate(contexts):
+            output = block.cross_attn(cross_query, context)
+            if not torch.equal(output.coords, x.coords):
+                raise RuntimeError("Native-SLAT per-view cross-attention changed coords")
+            cross_score = self.view_fusion.score_cross_result(
+                block_index, output.feats
+            )
+            cross_scores.append(cross_score)
+            combined = (
+                cross_score.float()
+                + geometry_scale * geometry_logits[view_index].float()
+            )
+            valid = geometry_valid[view_index].bool()
+            new_max = torch.where(
+                valid,
+                torch.where(has_valid, torch.maximum(running_max, combined), combined),
+                running_max,
+            )
+            old_delta = torch.where(
+                has_valid, running_max - new_max, torch.zeros_like(new_max)
+            )
+            new_delta = torch.where(
+                valid, combined - new_max, torch.zeros_like(new_max)
+            )
+            old_factor = torch.exp(old_delta) * has_valid.to(torch.float32)
+            new_factor = torch.exp(new_delta) * valid.to(torch.float32)
+            target_numerator = (
+                target_numerator * old_factor[:, None].to(target_numerator.dtype)
+                + output.feats * new_factor[:, None].to(output.feats.dtype)
+            )
+            target_denominator = (
+                target_denominator * old_factor + new_factor
+            )
+            running_max = new_max
+            has_valid = has_valid | valid
+            uniform_fused = uniform_fused + output.feats / float(views)
+        cross_logits = torch.stack(cross_scores, dim=0)
+        _, fusion_stats = self.view_fusion.effective_weights(
+            block_index,
+            cross_logits,
+            geometry_logits=geometry_logits,
+            valid=geometry_valid,
+        )
+        target_fused = target_numerator / target_denominator.clamp_min(1.0e-8)[
+            :, None
+        ].to(target_numerator.dtype)
+        target_fused = torch.where(
+            has_valid[:, None], target_fused, uniform_fused
+        )
+        gate = self.view_fusion.transition_gate(block_index).to(uniform_fused.dtype)
+        fused = uniform_fused + gate * (target_fused - uniform_fused)
+        x = x.replace(x.feats + fused)
+        h = x.replace(block.norm3(x.feats))
+        h = h * (1 + scale_mlp) + shift_mlp
+        h = block.mlp(h)
+        h = h * gate_mlp
+        return x + h, fusion_stats
+
+    def _view_fused_block(
+        self,
+        block_index: int,
+        block: nn.Module,
+        x: Any,
+        mod: torch.Tensor,
+        condition: Any,
+        geometry_logits: torch.Tensor | None,
+        geometry_valid: torch.Tensor | None,
+    ) -> tuple[Any, dict[str, torch.Tensor] | None]:
+        if not isinstance(condition, list):
+            return block(x, mod, condition), None
+        if not condition:
+            raise ValueError("Native-SLAT view fusion received no contexts")
+        views = len(condition)
+        points = int(x.feats.shape[0])
+        if geometry_logits is None:
+            geometry_logits = x.feats.new_zeros(
+                (views, points), dtype=torch.float32
+            )
+        if geometry_valid is None:
+            geometry_valid = torch.ones(
+                (views, points), device=x.feats.device, dtype=torch.bool
+            )
+        if geometry_logits.shape != (views, points) or geometry_valid.shape != (
+            views,
+            points,
+        ):
+            raise ValueError(
+                "Native-SLAT context/posed-geometry view or point counts differ"
+            )
+
+        def run(
+            sparse_x: Any,
+            modulation: torch.Tensor,
+            logits: torch.Tensor,
+            valid: torch.Tensor,
+            *contexts: torch.Tensor,
+        ) -> tuple[Any, ...]:
+            result, stats = self._view_fused_block_body(
+                block_index,
+                block,
+                sparse_x,
+                modulation,
+                list(contexts),
+                logits,
+                valid,
+            )
+            return (
+                result,
+                stats["fusion_gate"],
+                stats["geometry_logit_scale"],
+                stats["target_view_weight_entropy"],
+                stats["target_view_weight_deviation"],
+                stats["effective_view_weight_deviation"],
+                stats["fusion_valid_fraction"],
+            )
+
+        call_args = (x, mod, geometry_logits, geometry_valid, *condition)
+        values = (
+            torch.utils.checkpoint.checkpoint(
+                run, *call_args, use_reentrant=False
+            )
+            if block.use_checkpoint and torch.is_grad_enabled()
+            else run(*call_args)
+        )
+        result = values[0]
+        names = (
+            "fusion_gate",
+            "geometry_logit_scale",
+            "target_view_weight_entropy",
+            "target_view_weight_deviation",
+            "effective_view_weight_deviation",
+            "fusion_valid_fraction",
+        )
+        return result, dict(zip(names, values[1:]))
+
     def _adapted_core_forward(
         self,
         x: Any,
         t: torch.Tensor,
         condition: Any,
         condition_3d: torch.Tensor,
-    ) -> Any:
+        geometry_logits: torch.Tensor | None,
+        geometry_valid: torch.Tensor | None,
+    ) -> tuple[Any, dict[str, torch.Tensor]]:
         core = self.flow_core
         h = core.input_layer(x).type(core.dtype)
         t_embedding = core.t_embedder(t)
@@ -367,16 +693,59 @@ class NativeSLatGenreconFlow(nn.Module):
             h = h + core.pos_embedder(h.coords[:, 1:]).type(core.dtype)
         if int(condition_3d.shape[0]) != int(h.feats.shape[0]):
             raise ValueError("Native-SLAT active condition/feature counts differ")
+        block_fusion_stats: list[dict[str, torch.Tensor]] = []
         for block_index, block in enumerate(core.blocks):
             residual = self.block_condition(block_index, condition_3d)
-            h = block(h.replace(h.feats + residual.to(h.dtype)), t_embedding, condition)
+            h, fusion_stats = self._view_fused_block(
+                block_index,
+                block,
+                h.replace(h.feats + residual.to(h.dtype)),
+                t_embedding,
+                condition,
+                geometry_logits,
+                geometry_valid,
+            )
+            if fusion_stats is not None:
+                block_fusion_stats.append(fusion_stats)
         for block, skip in zip(core.out_blocks, reversed(skips)):
             if core.use_skip_connection:
                 h = block(h.replace(torch.cat((h.feats, skip), dim=1)), t_embedding)
             else:
                 h = block(h, t_embedding)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        return core.out_layer(h.type(x.dtype))
+        output = core.out_layer(h.type(x.dtype))
+        zero = output.feats.new_zeros((), dtype=torch.float32)
+        if block_fusion_stats:
+            stacked = {
+                key: torch.stack([row[key].float() for row in block_fusion_stats])
+                for key in block_fusion_stats[0]
+            }
+            summary = {
+                "fusion_gate_mean": stacked["fusion_gate"].mean(),
+                "fusion_gate_max": stacked["fusion_gate"].amax(),
+                "geometry_logit_scale_mean": stacked["geometry_logit_scale"].mean(),
+                "target_view_weight_entropy": stacked[
+                    "target_view_weight_entropy"
+                ].mean(),
+                "target_view_weight_deviation": stacked[
+                    "target_view_weight_deviation"
+                ].mean(),
+                "effective_view_weight_deviation": stacked[
+                    "effective_view_weight_deviation"
+                ].mean(),
+                "fusion_valid_fraction": stacked["fusion_valid_fraction"].mean(),
+            }
+        else:
+            summary = {
+                "fusion_gate_mean": zero,
+                "fusion_gate_max": zero,
+                "geometry_logit_scale_mean": zero,
+                "target_view_weight_entropy": zero,
+                "target_view_weight_deviation": zero,
+                "effective_view_weight_deviation": zero,
+                "fusion_valid_fraction": zero,
+            }
+        return output, summary
 
     def adapted_prediction(
         self,
@@ -412,9 +781,13 @@ class NativeSLatGenreconFlow(nn.Module):
                 view_indices=view_indices,
                 projection_mode=projection_mode,
             )
-            aggregated, aggregation_stats = self.aggregator(projected, valid)
+            aggregated, aggregation_stats, aggregation_details = (
+                self.aggregator.aggregate_with_view_details(projected, valid)
+            )
             condition_3d = aggregated[0]
             stats = {**projection_stats, **aggregation_stats}
+            geometry_logits = aggregation_details["view_logits"]
+            geometry_valid = aggregation_details["valid"]
             condition_present = True
         else:
             # Infer the stem point count without retaining its graph. Learned
@@ -441,11 +814,25 @@ class NativeSLatGenreconFlow(nn.Module):
                 "aggregation_entropy": zero,
                 "condition_rms": zero,
             }
+            geometry_logits = None
+            geometry_valid = None
             condition_present = False
-        prediction = self._adapted_core_forward(x, t, condition, condition_3d)
+        prediction, fusion_stats = self._adapted_core_forward(
+            x,
+            t,
+            condition,
+            condition_3d,
+            geometry_logits,
+            geometry_valid,
+        )
+        stats.update(fusion_stats)
         if not torch.equal(prediction.coords, stock.coords):
             raise RuntimeError("Native-SLAT adaptation changed sparse coordinates")
-        if self.block_condition.exact_zero() and self._lora_outputs_exact_zero():
+        if (
+            self.block_condition.exact_zero()
+            and self._lora_outputs_exact_zero()
+            and self.view_fusion.exact_stock_mean()
+        ):
             prediction = _straight_through_sparse(prediction, stock)
         delta = prediction.feats.float() - stock.feats.float()
         stats.update(
@@ -536,7 +923,7 @@ def load_trainable_state_dict(
     }
     if set(state) != expected:
         raise ValueError(
-            "Native-SLAT v2 state mismatch: "
+            "Native-SLAT v3 state mismatch: "
             f"missing={sorted(expected - set(state))[:8]} "
             f"unexpected={sorted(set(state) - expected)[:8]}"
         )
@@ -545,7 +932,7 @@ def load_trainable_state_dict(
         for name, value in state.items():
             parameter = named[name]
             if parameter.shape != value.shape:
-                raise ValueError(f"Native-SLAT v2 checkpoint shape mismatch for {name}")
+                raise ValueError(f"Native-SLAT v3 checkpoint shape mismatch for {name}")
             parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
 
 
@@ -557,6 +944,8 @@ def build_native_slat_genrecon_components(
     lora_rank: int,
     lora_alpha: int,
     condition_channels: int,
+    view_fusion_hidden_dim: int,
+    geometry_logit_scale_init: float,
     gradient_checkpointing: bool,
     need_decoder: bool,
     device: torch.device,
@@ -603,7 +992,10 @@ def build_native_slat_genrecon_components(
         ),
     )
     model = NativeSLatGenreconFlow(
-        flow, condition_channels=int(condition_channels)
+        flow,
+        condition_channels=int(condition_channels),
+        view_fusion_hidden_dim=int(view_fusion_hidden_dim),
+        geometry_logit_scale_init=float(geometry_logit_scale_init),
     ).to(device)
     lora_modules = sorted(
         name
@@ -635,6 +1027,7 @@ def build_native_slat_genrecon_components(
         if "lora_" not in name
         and not name.startswith("aggregator.")
         and not name.startswith("block_condition.")
+        and not name.startswith("view_fusion.")
     ]
     if unexpected or not trainable_names:
         raise RuntimeError(f"Native-SLAT trainable whitelist failed: {unexpected}")
@@ -648,9 +1041,14 @@ def build_native_slat_genrecon_components(
         for name, parameter in model.named_parameters()
         if parameter.requires_grad and "lora_" not in name
     )
+    view_fusion_parameters = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and name.startswith("view_fusion.")
+    )
     summary = {
         "format": NATIVE_SLAT_GENRECON_VERSION,
-        "stage": "Native-SLAT v2 active-32^3 GenReCon Flow",
+        "stage": "Native-SLAT v3 pose-aware learned-view-fusion Flow",
         "pretrained": str(pretrained),
         "baseline": NATIVE_SLAT_BASELINE,
         "projection": NATIVE_SLAT_GENRECON_PROJECTION,
@@ -658,6 +1056,21 @@ def build_native_slat_genrecon_components(
         "condition_channels": int(condition_channels),
         "condition_injection": "zero-init independent projection before every SLAT block",
         "condition_scale_policy": "learned_projection_only",
+        "context_view_fusion": {
+            "version": NATIVE_SLAT_CONTEXT_FUSION,
+            "scope": "Full branch only; frozen Stock retains released uniform mean",
+            "score_source": "per-block per-view cross-attention result MLP",
+            "geometry_source": "active32 posed-DINO aggregator raw view logits and validity",
+            "transition": "pointwise weighted sum interpolated from exact uniform mean",
+            "implementation": "single-pass streaming log-sum-exp; no VxNxC materialization",
+            "gate_init": 0.0,
+            "hidden_dim": int(view_fusion_hidden_dim),
+            "geometry_logit_scale_init": float(geometry_logit_scale_init),
+            "invalid_view_policy": (
+                "learned target masks invalid; transition starts at Stock uniform; "
+                "all-invalid falls back to uniform"
+            ),
+        },
         "training_semantics": NATIVE_SLAT_GENRECON_TRAINING,
         "cfg_semantics": NATIVE_SLAT_GENRECON_CFG,
         "post_cfg_cap": False,
@@ -672,7 +1085,10 @@ def build_native_slat_genrecon_components(
             ),
             "parameter_count": int(lora_parameters),
         },
-        "new_condition_parameter_count": int(new_parameters),
+        "new_condition_parameter_count": int(
+            new_parameters - view_fusion_parameters
+        ),
+        "view_fusion_parameter_count": int(view_fusion_parameters),
         "trainable_parameter_count": int(lora_parameters + new_parameters),
         "stock_slat_freeze": {
             key: stock_slat_freeze[key]
@@ -683,6 +1099,7 @@ def build_native_slat_genrecon_components(
             "flow.*.lora_[AB].*",
             "aggregator.*",
             "block_condition.*",
+            "view_fusion.*",
         ],
         "frozen": [
             "Native SS deployment bound by upstream report",
@@ -740,7 +1157,10 @@ def validate_native_slat_genrecon_checkpoint(
         if summary.get(key) != expected
     }
     if mismatch:
-        raise ValueError(f"Native-SLAT v2 protocol mismatch={mismatch}")
+        raise ValueError(f"Native-SLAT v3 protocol mismatch={mismatch}")
+    fusion = summary.get("context_view_fusion")
+    if not isinstance(fusion, dict) or fusion.get("version") != NATIVE_SLAT_CONTEXT_FUSION:
+        raise ValueError("Native-SLAT v3 checkpoint lacks learned view-fusion binding")
     if summary.get("stock_slat_freeze", {}).get("freeze_sha256") != stock_slat_freeze.get(
         "freeze_sha256"
     ):
@@ -756,7 +1176,7 @@ def validate_native_slat_genrecon_checkpoint(
     }
     present = sorted(forbidden.intersection(args))
     if present:
-        raise ValueError(f"Native-SLAT v2 contains forbidden Direct-SLAT fields={present}")
+        raise ValueError(f"Native-SLAT v3 contains forbidden Direct-SLAT fields={present}")
     if not isinstance(checkpoint.get("model_trainable_state"), dict):
         raise ValueError("Native-SLAT checkpoint lacks trainable state")
     if not isinstance(checkpoint.get("ema_trainable_state"), dict):

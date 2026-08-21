@@ -1,0 +1,639 @@
+B阶段：Direct Flow frozen downstream Mesh 配对评估命令
+=====================================================
+
+当前裁决
+--------
+
+Stage-A 32-object / seeds 42,43,44 / 30-step SS rollout 已经 STRONG PASS，
+因此现在进入 B 阶段。
+
+Stage-A correct-stock：
+
+  IoU mean/median/win/CI =
+    +0.007598 / +0.001405 / 0.59375 / [+0.001782,+0.014827]
+
+  precision mean/win/CI =
+    +0.009324 / 0.625 / [+0.002225,+0.018367]
+
+  recall mean/win/CI =
+    +0.023622 / 0.65625 / [+0.008788,+0.039825]
+
+  largest-component mean/CI =
+    -0.019125 / [-0.038990,-0.003801]
+
+注意：实际 Stage-A 使用 --decision_profile report_only，所以不能用
+selected_passed=true 作为科学通过证据。下面的 protocol freezer 会从 report 和冻结的
+thresholds.json 重新计算 CORE/STRONG gate。
+
+B 阶段不再训练。固定：
+
+  checkpoint = step_000900.pt
+  objects = 原 Stage-A 全部 32 个冻结对象，2/4/8-view = 11/11/10
+  joint seeds = 42,43,44
+  SS = Stage-A 原协议，30 steps
+  SLAT = native Stable-X/trellis-vggt-v0-2，25 steps，CFG=5，
+         interval=[0.5,1.0]，rescale_t=3
+
+正式 B 共 96 个 paired trials、192 个 Mesh。前三个对象只用于工程 smoke，
+恰好分别为 2/4/8-view；smoke 结果不得混入正式统计。
+
+
+B0. CPU 静态检查与单测
+======================
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" -m py_compile \
+    pose_point_depth_mv/prepare_direct_flow_mesh_protocol.py \
+    pose_point_depth_mv/export_direct_flow_mesh_pairs.py \
+    pose_point_depth_mv/test_direct_flow_mesh.py \
+    pose_point_depth_mv/train_direct_flow.py
+  C0=$?
+
+  "${PY}" -m unittest pose_point_depth_mv.test_direct_flow_mesh -v
+  C1=$?
+
+  "${PY}" -c '
+import shutil, subprocess
+import pose_point_depth_mv.export_direct_flow_mesh_pairs
+p = shutil.which("ninja")
+assert p, "protocol-bound ninja wrapper is unavailable"
+print("ninja:", p, subprocess.check_output([p, "--version"], text=True).strip())
+'
+  C2=$?
+
+  if [ "${C0}" -ne 0 ] || [ "${C1}" -ne 0 ] || [ "${C2}" -ne 0 ]; then
+    echo "B0 FAIL: py_compile=${C0}, unittest=${C1}, ninja=${C2}"
+    exit 2
+  fi
+
+  echo "B0 PASS"
+)
+
+
+B1. 冻结正式 B protocol
+======================
+
+必须在代码最终确定后运行。protocol 会绑定实际工作树中的关键 Python 文件、
+ReconViaGen sampler/SLAT/mesh decoder、checkpoint、Stage-A report/threshold、32 个样本的
+cache/latent/GT/image/mask，以及 Trellis/VGGT/DINO/BiRefNet/DreamSim 实际权重的
+SHA-256；不能只依赖当前 dirty worktree 的 git commit。B1 需读取较大的本地权重
+文件，所以比普通配置写入慢是正常现象。
+
+该命令还会生成权限为 0600 的 blind_key.txt。只向评分者提供 blind_pairs/ 和
+blind_manifest.csv，不能提供 blind_key.txt、unblinding_key.json 或 report.json。
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  ROLLOUT=${RUN}/eval_val_rollout32obj_step000900_seed424344_steps30_v1
+  STAGE_A_PROTOCOL=${RUN}/protocols/val_rollout32obj_step000900_v1
+  PROTOCOL=${RUN}/protocols/mesh_val32obj_step000900_seed424344_v1
+
+  if [ -e "${PROTOCOL}" ]; then
+    echo "B protocol already exists; do not silently overwrite: ${PROTOCOL}"
+    exit 98
+  fi
+
+  "${PY}" -u -m pose_point_depth_mv.prepare_direct_flow_mesh_protocol \
+    --rollout_report "${ROLLOUT}/report.json" \
+    --rollout_protocol_dir "${STAGE_A_PROTOCOL}" \
+    --output_dir "${PROTOCOL}" \
+    --protocol_name direct_flow_mesh_val32obj_step000900_seed424344_v1 \
+    --joint_seeds 42,43,44 \
+    --max_objects 0 \
+    --slat_steps 25 \
+    --slat_cfg_strength 5.0 \
+    --slat_cfg_interval 0.5,1.0 \
+    --slat_rescale_t 3.0 \
+    --surface_samples 20000 \
+    --fscore_thresholds 0.01,0.02,0.05 \
+    --render_frames 36 \
+    --render_resolution 256 \
+    --bootstrap_samples 5000 \
+    --deterministic_repeat_slat_max_abs 0.1 \
+    --deterministic_repeat_mesh_vertex_chamfer_l1_max 0.0001 \
+    --amp_dtype bf16
+  CODE=$?
+
+  if [ "${CODE}" -ne 0 ]; then
+    echo "B1 protocol freeze failed: ${CODE}"
+    exit "${CODE}"
+  fi
+
+  test -s "${PROTOCOL}/protocol.json" || exit 98
+  test -s "${PROTOCOL}/blind_key.txt" || exit 98
+  echo "B1 PASS: ${PROTOCOL}"
+)
+
+
+B1a. 独立检查 protocol 身份和样例结构
+=====================================
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  PROTOCOL=${RUN}/protocols/mesh_val32obj_step000900_seed424344_v1
+
+  "${PY}" - "${PROTOCOL}/protocol.json" "${PROTOCOL}/blind_key.txt" <<'PY'
+import hashlib
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+from pose_point_depth_mv.export_direct_flow_mesh_pairs import validate_protocol
+
+protocol_path = Path(sys.argv[1])
+blind_key_path = Path(sys.argv[2])
+p = validate_protocol(protocol_path)
+key = bytes.fromhex(blind_key_path.read_text().strip())
+
+rows = p["selection"]["rows"]
+objects = {row["object_uid"] for row in rows}
+views = Counter(int(row["views"]) for row in rows)
+
+assert p["source_rollout_gate"]["passed"] is True
+assert len(rows) == 32
+assert len(objects) == 32
+assert views == Counter({2: 11, 4: 11, 8: 10})
+assert p["sampling"]["joint_seeds"] == [42, 43, 44]
+assert hashlib.sha256(key).hexdigest() == p["blinding"]["blind_key_sha256_commitment"]
+
+print("protocol SHA-256:", p["protocol_sha256"])
+print("objects:", len(objects))
+print("view counts:", dict(sorted(views.items())))
+print("joint seeds:", p["sampling"]["joint_seeds"])
+print("expected paired trials:", len(rows) * len(p["sampling"]["joint_seeds"]))
+print("B1a PASS")
+PY
+)
+
+
+B2. GPU 工程 smoke：前三对象 × seed42
+=====================================
+
+该 smoke 会完整检查：
+
+  1. SS rollout 重放结果与 Stage-A report 逐指标一致；
+  2. stock/correct 共用完全相同 SS noise；
+  3. native image/SLAT condition 可重放；
+  4. 公共 canonical coords 的 SLAT noise bit-exact；
+  5. 相同 coords/noise 的重复运行在冻结数值门内：SLAT max-abs<=0.1、
+     canonical Mesh 全顶点 repeat Chamfer-L1<=1e-4；spconv 原子累加不保证逐 bit 重现；
+  6. OBJ/GLB 回读非空、GT surface metrics finite、固定 turntable 可渲染。
+
+若进程中断，保留输出目录并重新执行同一命令；脚本会使用 --resume，不能删除已经
+完成的失败 pair 后选择性补跑。
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  PROTOCOL=${RUN}/protocols/mesh_val32obj_step000900_seed424344_v1
+  OUT=${RUN}/mesh_smoke3obj_step000900_jointseed42_v1
+  LOG=${OUT}.log
+  GPU=${GPU:-4}
+  MIN_FREE_MIB=16000
+
+  FREE_MIB=$(nvidia-smi --id="${GPU}" --query-gpu=memory.free \
+    --format=csv,noheader,nounits | tr -d '[:space:]')
+  if ! [[ "${FREE_MIB}" =~ ^[0-9]+$ ]] || [ "${FREE_MIB}" -lt "${MIN_FREE_MIB}" ]; then
+    echo "GPU ${GPU} free memory ${FREE_MIB:-unknown} MiB; require >= ${MIN_FREE_MIB} MiB"
+    echo "choose a free card and rerun with: GPU=<index> bash ..."
+    exit 97
+  fi
+  echo "using physical GPU ${GPU}, free memory ${FREE_MIB} MiB"
+
+  if [ ! -s "${PROTOCOL}/protocol.json" ] || [ ! -s "${PROTOCOL}/blind_key.txt" ]; then
+    echo "missing frozen B protocol/key: ${PROTOCOL}"
+    exit 98
+  fi
+
+  if [ -s "${OUT}/completion_manifest.json" ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python - "${OUT}" <<'PY'
+import sys
+from pose_point_depth_mv.export_direct_flow_mesh_pairs import validate_completion_manifest
+
+c = validate_completion_manifest(sys.argv[1], expected_formal=False)
+assert c["runtime_exit_code"] == 0, c
+assert c["all_records_passed"] is True, c
+print("validated completed smoke:", c["file_count"], "files")
+PY
+    VALID=$?
+    if [ "${VALID}" -ne 0 ]; then
+      echo "existing smoke completion manifest is invalid"
+      exit "${VALID}"
+    fi
+    CODE=0
+  else
+    RESUME_ARGS=()
+    if [ -d "${OUT}" ]; then
+      RESUME_ARGS=(--resume)
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      -m pose_point_depth_mv.export_direct_flow_mesh_pairs \
+      --protocol "${PROTOCOL}/protocol.json" \
+      --blind_key_file "${PROTOCOL}/blind_key.txt" \
+      --output_dir "${OUT}" \
+      --device cuda \
+      --amp_dtype bf16 \
+      --smoke_objects 3 \
+      --smoke_seeds 42 \
+      "${RESUME_ARGS[@]}" \
+      2>&1 | tee -a "${LOG}"
+    CODE=${PIPESTATUS[0]}
+  fi
+
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "B2 smoke runtime code=${CODE}"
+  exit "${CODE}"
+)
+
+
+B2a. Smoke 硬检查
+================
+
+注意：smoke 的 decision.passed 固定为 false，因为它不是正式科学运行；这里检查的是
+所有 6 个 Mesh、determinism audit 和 Stage-A replay 是否完整通过。
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  OUT=${RUN}/mesh_smoke3obj_step000900_jointseed42_v1
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python - "${OUT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from pose_point_depth_mv.export_direct_flow_mesh_pairs import validate_completion_manifest
+
+root = Path(sys.argv[1])
+completion = validate_completion_manifest(root, expected_formal=False)
+assert completion["runtime_exit_code"] == 0, completion
+r = json.loads((root / "report.json").read_text())
+slat = json.loads((root / "determinism_slat_audit.json").read_text())
+mesh = json.loads((root / "determinism_mesh_audit.json").read_text())
+
+assert r["formal"] is False
+assert r["record_count"] == 6, r["record_count"]
+assert all(row["passed"] for row in r["records"])
+assert r["blinding_audit"]["passed"] is True, r["blinding_audit"]
+assert slat["passed"] is True, slat
+assert mesh["passed"] is True, mesh
+
+coord_audits = [json.loads(path.read_text()) for path in sorted((root / "ss_coords").glob("*.json"))]
+noise_audits = [json.loads(path.read_text()) for path in sorted((root / "slat").glob("*/noise_audit.json"))]
+cond_audits = [json.loads(path.read_text()) for path in sorted((root / "slat_conditions").glob("*.json"))]
+
+assert len(coord_audits) == 3
+assert len(noise_audits) == 3
+assert len(cond_audits) == 3
+assert all(row["passed"] for row in coord_audits)
+assert all(row["passed"] and row["common_coord_noise_max_abs"] == 0.0 for row in noise_audits)
+assert all(row["passed"] for row in cond_audits)
+
+print("smoke records:", r["record_count"])
+print("SS replay audits:", len(coord_audits))
+print("shared SLAT noise audits:", len(noise_audits))
+print("condition audits:", len(cond_audits))
+print("B2a PASS")
+PY
+)
+
+
+B3. 正式 B：全部 32 对象 × seeds42/43/44
+==========================================
+
+只有 B2/B2a 通过后运行。正式输出包含：
+
+  blind_pairs/<pair_id>/{A,B}/mesh_canonical.obj
+  blind_pairs/<pair_id>/{A,B}/mesh_view.glb
+  blind_pairs/<pair_id>/{A,B}/normal_turntable.mp4
+  blind_pairs/<pair_id>/{A,B}/normal_contact_sheet.png
+  report.json / report.md / completion_manifest.json
+
+正式科学 FAIL 返回 2，但报告和所有冻结失败样例仍会保留。进程异常中断时重新执行，
+自动追加 --resume；已经完成的 pair 不会重新采 best-of-N。
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  PROTOCOL=${RUN}/protocols/mesh_val32obj_step000900_seed424344_v1
+  OUT=${RUN}/mesh_val32obj_step000900_jointseed424344_v1
+  LOG=${OUT}.log
+
+  if [ ! -s "${PROTOCOL}/protocol.json" ] || [ ! -s "${PROTOCOL}/blind_key.txt" ]; then
+    echo "missing frozen B protocol/key: ${PROTOCOL}"
+    exit 98
+  fi
+
+  if [ -s "${OUT}/completion_manifest.json" ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python - "${OUT}" <<'PY'
+import sys
+from pose_point_depth_mv.export_direct_flow_mesh_pairs import validate_completion_manifest
+
+c = validate_completion_manifest(sys.argv[1], expected_formal=True)
+assert c["runtime_exit_code"] in (0, 2, 3), c
+print("validated completed formal run:", c["file_count"], "files")
+PY
+    VALID=$?
+    if [ "${VALID}" -ne 0 ]; then
+      echo "existing formal completion manifest is invalid"
+      exit "${VALID}"
+    fi
+    CODE=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["runtime_exit_code"])
+' "${OUT}/completion_manifest.json")
+  else
+    RESUME_ARGS=()
+    if [ -d "${OUT}" ]; then
+      RESUME_ARGS=(--resume)
+    fi
+
+    GPU=${GPU:-4}
+    MIN_FREE_MIB=16000
+    FREE_MIB=$(nvidia-smi --id="${GPU}" --query-gpu=memory.free \
+      --format=csv,noheader,nounits | tr -d '[:space:]')
+    if ! [[ "${FREE_MIB}" =~ ^[0-9]+$ ]] || [ "${FREE_MIB}" -lt "${MIN_FREE_MIB}" ]; then
+      echo "GPU ${GPU} free memory ${FREE_MIB:-unknown} MiB; require >= ${MIN_FREE_MIB} MiB"
+      exit 97
+    fi
+    echo "using physical GPU ${GPU}, free memory ${FREE_MIB} MiB"
+
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      -m pose_point_depth_mv.export_direct_flow_mesh_pairs \
+      --protocol "${PROTOCOL}/protocol.json" \
+      --blind_key_file "${PROTOCOL}/blind_key.txt" \
+      --output_dir "${OUT}" \
+      --device cuda \
+      --amp_dtype bf16 \
+      "${RESUME_ARGS[@]}" \
+      2>&1 | tee -a "${LOG}"
+    CODE=${PIPESTATUS[0]}
+  fi
+
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "B3 formal runtime/science code=${CODE}"
+  true
+)
+
+
+B3e. 非正式 exploratory 续跑：直接 SLAT 采样并生成 Mesh
+=======================================================
+
+这一段仅用于快速观察 Mesh，不修改、不覆盖上面的 frozen B3 输出。
+它复用 B3 已完成的 SS coords 和 native SLAT conditions，跳过已触发的
+SLAT repeat max-abs formal gate，直接完成 stock/correct 的 SLAT 采样、Mesh 解码
+和预览导出。输出必须视为 non-formal exploratory evidence，不能用于声称
+frozen B3 PASS。PREVIEW_PAIRS 可调，默认先导出 12 个盲配对供快速观察。
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  PROTOCOL=${RUN}/protocols/mesh_val32obj_step000900_seed424344_v1
+  SOURCE_OUT=${RUN}/mesh_val32obj_step000900_jointseed424344_v1
+  OUT=${RUN}/mesh_val32obj_step000900_jointseed424344_exploratory_v1
+  LOG=${OUT}.log
+  GPU=${GPU:-4}
+  MIN_FREE_MIB=16000
+  PREVIEW_PAIRS=${PREVIEW_PAIRS:-12}
+
+  if [ ! -s "${PROTOCOL}/protocol.json" ] || [ ! -s "${PROTOCOL}/blind_key.txt" ]; then
+    echo "missing frozen B protocol/key: ${PROTOCOL}"
+    exit 98
+  fi
+
+  if [ ! -d "${SOURCE_OUT}/ss_coords" ] || [ ! -d "${SOURCE_OUT}/slat_conditions" ]; then
+    echo "missing reusable B3 SS/condition artifacts: ${SOURCE_OUT}"
+    exit 98
+  fi
+
+  FREE_MIB=$(nvidia-smi --id="${GPU}" --query-gpu=memory.free \
+    --format=csv,noheader,nounits | tr -d '[:space:]')
+  if ! [[ "${FREE_MIB}" =~ ^[0-9]+$ ]] || [ "${FREE_MIB}" -lt "${MIN_FREE_MIB}" ]; then
+    echo "GPU ${GPU} free memory ${FREE_MIB:-unknown} MiB; require >= ${MIN_FREE_MIB} MiB"
+    echo "choose another card with: GPU=<index> PREVIEW_PAIRS=<count> bash ..."
+    exit 97
+  fi
+  echo "using physical GPU ${GPU}, free memory ${FREE_MIB} MiB"
+
+  RESUME_ARGS=()
+  if [ -d "${OUT}" ]; then
+    RESUME_ARGS=(--resume)
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.export_direct_flow_mesh_exploratory \
+    --protocol "${PROTOCOL}/protocol.json" \
+    --blind_key_file "${PROTOCOL}/blind_key.txt" \
+    --source_output "${SOURCE_OUT}" \
+    --output_dir "${OUT}" \
+    --device cuda \
+    --amp_dtype bf16 \
+    --preview_pairs "${PREVIEW_PAIRS}" \
+    "${RESUME_ARGS[@]}" \
+    2>&1 | tee -a "${LOG}"
+  CODE=${PIPESTATUS[0]}
+
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "B3 exploratory non-formal runtime code=${CODE}"
+  exit "${CODE}"
+)
+
+
+B3a. 正式结果汇总
+=================
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  OUT=${RUN}/mesh_val32obj_step000900_jointseed424344_v1
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python - "${OUT}" <<'PY'
+import json
+import sys
+
+from pose_point_depth_mv.export_direct_flow_mesh_pairs import validate_completion_manifest
+
+root = sys.argv[1]
+completion = validate_completion_manifest(root, expected_formal=True)
+r = json.load(open(f"{root}/report.json"))
+d = r["decision"]
+
+print("complete:", completion["complete"])
+print("runtime/science code:", completion["runtime_exit_code"])
+print("formal:", r["formal"])
+print("passed:", d["passed"])
+print("completed / expected pairs:", d["completed_pair_count"], "/", d["expected_pair_count"])
+print("valid pairs:", d["valid_pair_count"])
+print("checks:")
+for key, value in d["checks"].items():
+    print(" ", key, "=", value)
+
+print("primary chamfer stock-correct improvement:")
+print(json.dumps(d["summary"]["chamfer_l1_improvement"], indent=2))
+print("F-score@0.02 correct-stock:")
+print(json.dumps(d["summary"]["fscore_0p02_delta"], indent=2))
+print("largest-component correct-stock:")
+print(json.dumps(d["summary"]["largest_component_ratio_delta"], indent=2))
+print("per-seed direction:")
+for seed, row in d["seed_summary"].items():
+    print(seed, row["chamfer_l1_improvement"])
+PY
+)
+
+
+B4. CPU cleanup diagnostic
+==========================
+
+这一段仅对 B3e 已导出的 stock/correct Mesh 做完全对称的 CPU 后处理诊断：
+两个分支都使用相同的连通分量规则，对比 raw、仅保留最大连通分量、删除顶点数
+小于 100 的组件三种策略，然后从各策略 Mesh 重算 Chamfer/F-score/normal/
+mesh-structure 指标。不重新运行 SS/SLAT，不需要 GPU，不覆盖原始 OBJ；结果必须
+视为 non-formal diagnostic evidence。
+
+CPU_THREADS 可按机器负载调整，默认 8。如 OUT 已存在，命令会自动加入 --resume。
+返回码 0 表示 192 条 raw/cleanup 记录、96 个配对、raw 口径复核和清理后盲化审计
+均完整有效；返回码 2 表示诊断跑完但上述有效性检查至少一项未通过，不能静默当作成功。
+
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 98
+
+  RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+  SOURCE_OUT=${RUN}/mesh_val32obj_step000900_jointseed424344_exploratory_v1
+  OUT=${RUN}/mesh_val32obj_step000900_jointseed424344_exploratory_cleanup100_v1
+  LOG=${OUT}.log
+  CPU_THREADS=${CPU_THREADS:-8}
+
+  if [ ! -s "${SOURCE_OUT}/report.json" ]; then
+    echo "missing exploratory source report: ${SOURCE_OUT}/report.json"
+    exit 98
+  fi
+
+  RESUME_ARGS=()
+  if [ -d "${OUT}" ]; then
+    RESUME_ARGS=(--resume)
+  fi
+
+  OMP_NUM_THREADS="${CPU_THREADS}" \
+  MKL_NUM_THREADS="${CPU_THREADS}" \
+  OPENBLAS_NUM_THREADS="${CPU_THREADS}" \
+  NUMEXPR_NUM_THREADS="${CPU_THREADS}" \
+  VECLIB_MAXIMUM_THREADS="${CPU_THREADS}" \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    -m pose_point_depth_mv.eval_mesh_cleanup_diagnostic \
+    --source_output "${SOURCE_OUT}" \
+    --output_dir "${OUT}" \
+    --min_component_vertices 100 \
+    --surface_samples 20000 \
+    --bootstrap_samples 5000 \
+    --workers "${CPU_THREADS}" \
+    --export_cleaned_meshes \
+    "${RESUME_ARGS[@]}" \
+    2>&1 | tee -a "${LOG}"
+  CODE=${PIPESTATUS[0]}
+
+  echo "${CODE}" > "${OUT}.exit_code"
+  echo "B4 CPU cleanup diagnostic code=${CODE}"
+  exit "${CODE}"
+)
+
+
+B5. 盲评包与人工评分
+===================
+
+评分者只能收到：
+
+  ${OUT}/blind_pairs/
+  ${OUT}/blind_manifest.csv
+
+`blind_pairs/` 内只包含 A/B artifacts，不包含 branch 名称、metrics 或 pair mapping。
+
+禁止向评分者提供：
+
+  protocol 的 blind_key.txt
+  output 的 unblinding_key.json
+  report.json、private_records/、completion_manifest.json
+
+评分前冻结至少以下列：
+
+  pair_id,rater_id,preference
+
+其中 preference 只能为 A、B、tie、invalid。建议至少三名独立评分者；所有 96 个 pair
+都必须展示，不能只挑改善样例。先固定 ratings.csv 的 SHA-256，再由非评分人员读取
+unblinding_key.json 做解盲统计。
+
+
+B阶段裁决
+=========
+
+Formal PASS 要求：
+
+  1. 96/96 paired trials 完整，无 empty/nonfinite/export-failed pair；
+  2. primary canonical Chamfer improvement（stock-correct）mean>0、median>0、
+     object win>=0.55，object-bootstrap 95% CI lower>0；
+  3. F-score@0.02 mean delta >= 0；
+  4. Mesh success rate 不下降；
+  5. largest-component ratio mean delta >= -0.02；
+  6. 至少 2/3 joint seeds 的 object-mean Chamfer improvement 非负。
+
+如果 B PASS：可以声称“该训练配置在 frozen validation 上相对 stock/base 改善最终
+Mesh”，然后冻结全部协议并只运行一次 untouched holdout。
+
+如果 B FAIL：保留全部产物并按 SS replay、SLAT、GT surface、碎片/连通性分层定位；
+不得换 seed、删失败对象或按观感重选 step 1000。
+
+即使 B PASS，由于 pose/depth corruption controls 与 correct 几乎相同，目前仍不能声称
+收益来自正确 pose/depth correspondence。要做机制结论，必须另行预注册 controls 的完整
+Mesh 导出并要求 correct 显著优于 controls。

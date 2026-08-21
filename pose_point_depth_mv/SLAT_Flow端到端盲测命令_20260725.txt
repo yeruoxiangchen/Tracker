@@ -1,0 +1,1580 @@
+# Direct SLAT Flow: frozen full step800 vs native stock end-to-end blind holdout
+# 2026-07-25
+#
+# Scientific order:
+#   1. Freeze the current candidate: Direct-SS step900 + Direct-SLAT step800,
+#      support_scale=1.0. Do not retrain and do not run LoRA/adapter ablations.
+#   2. Diagnose decoder-only, same-process SLAT, and independent-process SLAT
+#      repeatability across N0-N3. This is seen-object engineering calibration.
+#   3. Freeze the first passing runtime and a multi-repeat p95 policy as v2_fix2,
+#      then rerun the three-object preflight before any unseen-data stage.
+#   4. Build a new object/source-GLB-disjoint candidate pool. Data-only quality
+#      gates may determine eligibility, then a precommitted hash order freezes
+#      exactly 32 objects before any stock/full output is generated.
+#   5. Export anonymous A/B pairs:
+#        stock = native stock SS coordinates + native stock SLAT
+#        full  = corrected SS coordinates + full Direct-SLAT step800
+#   6. Freeze three independent rating CSVs and bind them to the public bundle
+#      SHA, then unblind exactly once.
+#
+# All earlier blind protocol/report v1 artifacts are invalid after the v2
+# safety fixes. Do not reuse or upgrade them in place.
+# This file intentionally contains no global `set -e` and no `exit`. Every
+# executable stage is a subshell ending in `true`, so a failure does not close
+# the current interactive shell. Run one numbered section at a time.
+# Formal GPU experiments are commands for the user; code preparation does not
+# execute them automatically.
+
+
+###############################################################################
+# B0. Shared frozen paths and safe logging helper
+###############################################################################
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+
+SS_RUN=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+SS_CKPT=${SS_RUN}/checkpoints/step_000900.pt
+SLAT_RUN=pose_point_depth_mv/outputs/direct_slat_step900support_trainall_s1000_seed42_2gpu_bf16_v3
+SLAT_CKPT=${SLAT_RUN}/checkpoints/step_000800.pt
+
+TRAIN_CACHE=/data/ar_slat_direct_train_all_step000900_seed424344_lhslatv2_20260723
+VAL_CACHE=/data/ar_slat_direct_val_all_step000900_seed424344_lhslatv2_20260723
+VAL_TARGET_AUDIT=${VAL_CACHE}/target_decoder_audit32_v2/report.json
+
+CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+
+ENCODER_DIR=/data/models/microsoft_TRELLIS-image-large
+ENCODER_PREFIX=${ENCODER_DIR}/ckpts/slat_enc_swin8_B_64l8_fp16
+DINOV2_REPO=/home/zjr/.cache/torch/hub/facebookresearch_dinov2_main
+DINOV2_CKPT=/home/zjr/.cache/torch/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth
+MESH_DECODER_WEIGHTS=/home/zjr/.cache/huggingface/hub/models--Stable-X--trellis-vggt-v0-2/snapshots/647659a5ad5fbf67e22793e7b5e2cee4b30c5d13/ckpts/slat_dec_mesh_swin8_B_64l8m256c_fp16.safetensors
+
+# The earlier ..._v2 B3 stopped before generation with a missing runtime-index
+# lookup. Preserve that failed directory; v2_fix1 freezes the corrected code SHA.
+SOURCE_PREFLIGHT_PROTOCOL_DIR=pose_point_depth_mv/outputs/direct_slat_blind_preflight3_step800_20260725_v2_fix1
+SOURCE_PREFLIGHT_OUT=/data/direct_slat_blind_preflight3_step800_20260725_v2_fix1
+
+# The preserved v1 D0-D3 matrix established that implicit_gemm terminates in
+# spconv/cumm with SIGFPE (exit 136). Do not delete or resume those directories.
+# v2 changes only the technically unavailable runtime candidates; all frozen
+# repeatability thresholds remain byte-for-byte identical to v1.
+FAILED_RUNTIME_DIAG_ROOT=/data/direct_slat_runtime_repeat_step800_20260725_v1
+IMPLICIT_GEMM_SMOKE=/data/direct_slat_implicit_gemm_smoke_step800_20260725_v1
+RUNTIME_DIAG_ROOT=/data/direct_slat_runtime_repeat_step800_20260725_v2_native_matrix
+RUNTIME_AGG_DIR=pose_point_depth_mv/outputs/direct_slat_runtime_repeat_step800_20260725_v2_native_matrix
+RUNTIME_AGG_REPORT=${RUNTIME_AGG_DIR}/report.json
+
+PREFLIGHT_PROTOCOL_DIR=pose_point_depth_mv/outputs/direct_slat_blind_preflight3_step800_20260725_v2_fix2
+PREFLIGHT_OUT=/data/direct_slat_blind_preflight3_step800_20260725_v2_fix2
+
+HOLDOUT_ROOT=/data/direct_slat_blind_holdout32_20260725_v2_fix2
+RAW_OBJAVERSE=/data/Objaverse/manifest_0_5000.json
+CANDIDATE_MANIFEST=${HOLDOUT_ROOT}/frozen_candidates512.json
+CANDIDATE_AUDIT=${HOLDOUT_ROOT}/frozen_candidates512.audit.json
+CAND_RENDER=${HOLDOUT_ROOT}/render_candidates512
+CAND_PRIOR=${HOLDOUT_ROOT}/prior_candidates
+CAND_POINTPOSE=${HOLDOUT_ROOT}/pointpose_candidates
+CAND_LIFT=${HOLDOUT_ROOT}/lifting_candidates
+CAND_SLAT=${HOLDOUT_ROOT}/lh_slats_candidates_v2
+
+HOLD_RENDER_MANIFEST=${HOLDOUT_ROOT}/holdout32_render.json
+HOLD_SELECTION_AUDIT=${HOLDOUT_ROOT}/holdout32_render.audit.json
+HOLD_PRIOR=${HOLDOUT_ROOT}/prior_holdout32
+HOLD_POINTPOSE=${HOLDOUT_ROOT}/pointpose_holdout32
+HOLD_LIFT=${HOLDOUT_ROOT}/lifting_holdout32
+HOLD_CACHE=${HOLDOUT_ROOT}/direct_slat_cache_holdout32
+HOLD_TARGET_AUDIT=${HOLD_CACHE}/target_decoder_audit32
+HOLD_INVALID_MARKER=${HOLDOUT_ROOT}/INVALID_DATA_PROTOCOL.json
+HOLD_INTEGRITY_AUDIT=${HOLDOUT_ROOT}/holdout32_integrity_v2.json
+
+FORMAL_PROTOCOL_DIR=pose_point_depth_mv/outputs/direct_slat_blind_holdout32_step800_20260725_v2_fix2
+FORMAL_OUT=${HOLDOUT_ROOT}/blind_export
+PUBLIC_RELEASE=${HOLDOUT_ROOT}/public_blind_bundle
+PUBLIC_ARCHIVE=${HOLDOUT_ROOT}/public_blind_bundle.tar
+PUBLIC_ARCHIVE_MANIFEST=${HOLDOUT_ROOT}/public_blind_bundle.tar.manifest.json
+RATINGS_ROOT=${HOLDOUT_ROOT}/ratings_frozen
+RATINGS_MANIFEST=${RATINGS_ROOT}/freeze_ratings_manifest.json
+FINAL_OUT=pose_point_depth_mv/outputs/direct_slat_blind_holdout32_step800_final_20260725_v2_fix2
+
+run_logged() (
+  local log_path=$1
+  local exit_path=${log_path}.exit_code
+  shift
+  set +e
+  "$@" 2>&1 | tee "${log_path}"
+  local pipe_status=("${PIPESTATUS[@]}")
+  local command_rc=${pipe_status[0]}
+  local tee_rc=${pipe_status[1]}
+  {
+    echo "command exit code: ${command_rc}"
+    echo "tee exit code: ${tee_rc}"
+  } | tee -a "${log_path}"
+  printf '%s\n' "${command_rc}" > "${exit_path}"
+  if [ "${command_rc}" -ne 0 ]; then
+    return "${command_rc}"
+  fi
+  return "${tee_rc}"
+)
+
+run_runtime_repeat_process() (
+  local runtime_id=$1
+  local attention_backend=$2
+  local spconv_algo=$3
+  local amp_dtype=$4
+  local process_index=$5
+  local decoder_repeats=$6
+  local slat_repeats=$7
+  local output_dir=${RUNTIME_DIAG_ROOT}/${runtime_id}/process_${process_index}
+  if [ -s "${output_dir}/report.json" ]; then
+    echo "reuse immutable runtime report: ${output_dir}/report.json"
+    "${PY}" -c \
+      'import json,sys; r=json.load(open(sys.argv[1])); raise SystemExit(0 if r.get("complete") is True else 3)' \
+      "${output_dir}/report.json"
+    return $?
+  fi
+  if [ -e "${output_dir}" ]; then
+    echo "partial runtime output exists; preserve and inspect: ${output_dir}"
+    return 98
+  fi
+  mkdir -p "$(dirname "${output_dir}")"
+  run_logged "${output_dir}.log" \
+    env \
+      CUDA_VISIBLE_DEVICES=4 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND="${attention_backend}" \
+      SPARSE_ATTN_BACKEND="${attention_backend}" \
+      SPCONV_ALGO="${spconv_algo}" \
+      CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      PYTHONFAULTHANDLER=1 \
+    "${PY}" -u -m pose_point_depth_mv.diagnose_direct_slat_runtime_repeat \
+      --protocol "${SOURCE_PREFLIGHT_PROTOCOL_DIR}/protocol.json" \
+      --blind_key_file "${SOURCE_PREFLIGHT_PROTOCOL_DIR}/blind_key.txt" \
+      --source_preflight_output "${SOURCE_PREFLIGHT_OUT}" \
+      --output_dir "${output_dir}" \
+      --runtime_id "${runtime_id}" \
+      --process_index "${process_index}" \
+      --object_uids 04d712a0dae0421cae9083484f4332ee \
+      --joint_seeds 43,44 \
+      --branches stock,full \
+      --decoder_repeats "${decoder_repeats}" \
+      --slat_repeats "${slat_repeats}" \
+      --surface_samples 20000 \
+      --attention_backend "${attention_backend}" \
+      --spconv_algo "${spconv_algo}" \
+      --amp_dtype "${amp_dtype}" \
+      --deterministic_algorithms off \
+      --allow_tf32 false \
+      --device cuda
+)
+
+
+###############################################################################
+# B1. Static checks and unit tests
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    "${PY}" -m py_compile \
+      pose_point_depth_mv/direct_slat_flow.py \
+      pose_point_depth_mv/direct_slat_blind.py \
+      pose_point_depth_mv/export_direct_flow_mesh_pairs.py \
+      pose_point_depth_mv/prepare_direct_slat_holdout_manifest.py \
+      pose_point_depth_mv/prepare_direct_slat_blind_protocol.py \
+      pose_point_depth_mv/export_direct_slat_blind_holdout.py \
+      pose_point_depth_mv/direct_slat_runtime_repeat.py \
+      pose_point_depth_mv/diagnose_direct_slat_runtime_repeat.py \
+      pose_point_depth_mv/aggregate_direct_slat_runtime_repeat.py \
+      pose_point_depth_mv/launch_direct_slat_blind_runtime.py \
+      pose_point_depth_mv/freeze_direct_slat_holdout_integrity.py \
+      pose_point_depth_mv/package_direct_slat_public_bundle.py \
+      pose_point_depth_mv/freeze_direct_slat_ratings.py \
+      pose_point_depth_mv/finalize_direct_slat_blind_holdout.py
+    COMPILE_RC=$?
+
+    "${PY}" -m unittest -v \
+      pose_point_depth_mv.test_prepare_direct_slat_holdout_manifest \
+      pose_point_depth_mv.test_direct_slat_blind \
+      pose_point_depth_mv.test_direct_slat_runtime_repeat \
+      pose_point_depth_mv.test_direct_slat_release \
+      pose_point_depth_mv.test_direct_flow_mesh \
+      pose_point_depth_mv.test_direct_slat_flow \
+      pose_point_depth_mv.test_direct_slat_data
+    TEST_RC=$?
+
+    if [ "${COMPILE_RC}" -eq 0 ] && [ "${TEST_RC}" -eq 0 ]; then
+      CODE=0
+    else
+      CODE=2
+    fi
+  fi
+  echo "B1_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B2. Verify the preserved v2_fix1 source protocol (do not regenerate it)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${SOURCE_PREFLIGHT_PROTOCOL_DIR}/protocol.json" ] &&
+     [ -s "${SOURCE_PREFLIGHT_PROTOCOL_DIR}/blind_key.txt" ]; then
+    echo "preserved source protocol is present: ${SOURCE_PREFLIGHT_PROTOCOL_DIR}"
+    CODE=0
+  else
+    echo "B2 blocked: v2_fix1 source is missing; do not recreate it under old name"
+    CODE=96
+  fi
+  echo "B2_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3. Verify the preserved v2_fix1 failure used only as diagnostic input
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${SOURCE_PREFLIGHT_PROTOCOL_DIR}/protocol.json" ] &&
+     [ -s "${SOURCE_PREFLIGHT_PROTOCOL_DIR}/blind_key.txt" ] &&
+     [ -s "${SOURCE_PREFLIGHT_OUT}/completion_manifest.json" ] &&
+     [ -s "${SOURCE_PREFLIGHT_OUT}/repeat_report.json" ]; then
+    "${PY}" - "${SOURCE_PREFLIGHT_OUT}/repeat_report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["complete"] is True
+assert r["all_records_passed"] is True
+assert r["repeat_calibration"]["passed"] is False
+print("preserved v2_fix1 repeat failure:", r["repeat_calibration"])
+PY
+    CODE=$?
+  else
+    echo "B3 blocked: preserved v2_fix1 protocol/output is incomplete"
+    CODE=96
+  fi
+  echo "B3_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N0. Baseline: native + bf16 + flash attention
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker; then
+    for SPEC in 0:5:5 1:1:1 2:1:1; do
+      IFS=: read -r PROCESS_INDEX DECODER_REPEATS SLAT_REPEATS <<<"${SPEC}"
+      if run_runtime_repeat_process \
+        N0 flash_attn native bf16 \
+        "${PROCESS_INDEX}" "${DECODER_REPEATS}" "${SLAT_REPEATS}"; then
+        true
+      else
+        CODE=$?
+        break
+      fi
+    done
+  else
+    CODE=96
+  fi
+  echo "B3N0_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N1. Change only precision: native + FP32 + flash attention
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker; then
+    for SPEC in 0:5:5 1:1:1 2:1:1; do
+      IFS=: read -r PROCESS_INDEX DECODER_REPEATS SLAT_REPEATS <<<"${SPEC}"
+      if run_runtime_repeat_process \
+        N1 flash_attn native none \
+        "${PROCESS_INDEX}" "${DECODER_REPEATS}" "${SLAT_REPEATS}"; then
+        true
+      else
+        CODE=$?
+        break
+      fi
+    done
+  else
+    CODE=96
+  fi
+  echo "B3N1_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N2. Change only attention: native + bf16 + xformers
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker; then
+    for SPEC in 0:5:5 1:1:1 2:1:1; do
+      IFS=: read -r PROCESS_INDEX DECODER_REPEATS SLAT_REPEATS <<<"${SPEC}"
+      if run_runtime_repeat_process \
+        N2 xformers native bf16 \
+        "${PROCESS_INDEX}" "${DECODER_REPEATS}" "${SLAT_REPEATS}"; then
+        true
+      else
+        CODE=$?
+        break
+      fi
+    done
+  else
+    CODE=96
+  fi
+  echo "B3N2_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N3. Change precision and attention: native + FP32 + xformers
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker; then
+    for SPEC in 0:5:5 1:1:1 2:1:1; do
+      IFS=: read -r PROCESS_INDEX DECODER_REPEATS SLAT_REPEATS <<<"${SPEC}"
+      if run_runtime_repeat_process \
+        N3 xformers native none \
+        "${PROCESS_INDEX}" "${DECODER_REPEATS}" "${SLAT_REPEATS}"; then
+        true
+      else
+        CODE=$?
+        break
+      fi
+    done
+  else
+    CODE=96
+  fi
+  echo "B3N3_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N4. Aggregate N0-N3 and freeze the first passing runtime (CPU)
+###############################################################################
+
+# Regular p95 is evaluated on the five-run same-process distribution and its
+# surface limits are below half of the exploratory S6 mean gain. The three
+# independent processes are too few for a stable p95, so they enter the max and
+# topology-flip gates. Max limits are not substitutes for the regular p95 gate.
+# All limits below are frozen before v2_fix2 B3; do not edit them after seeing B3.
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    if [ -s "${RUNTIME_AGG_REPORT}" ]; then
+      echo "reuse immutable runtime aggregate: ${RUNTIME_AGG_REPORT}"
+      "${PY}" -c \
+        'import json,sys; r=json.load(open(sys.argv[1])); raise SystemExit(0 if r.get("passed") is True and r.get("selected_runtime") else 3)' \
+        "${RUNTIME_AGG_REPORT}"
+      CODE=$?
+    elif [ -e "${RUNTIME_AGG_DIR}" ]; then
+      echo "partial aggregate exists; preserve and inspect it"
+      CODE=98
+    else
+      if run_logged "${RUNTIME_AGG_DIR}.log" \
+        "${PY}" -u -m pose_point_depth_mv.aggregate_direct_slat_runtime_repeat \
+          --input_root "${RUNTIME_DIAG_ROOT}" \
+          --output_dir "${RUNTIME_AGG_DIR}" \
+          --runtime_order N0,N1,N2,N3 \
+          --expected_processes 3 \
+          --same_process_repeats 5 \
+          --max_latent_rms_p95 0.005 \
+          --max_latent_max_abs_p95 0.15 \
+          --max_chamfer_p95 0.0005 \
+          --max_fscore_p95 0.003 \
+          --max_lcr_p95 0.0005 \
+          --max_boundary_count_p95 40 \
+          --max_boundary_length_p95 0.10 \
+          --max_nonmanifold_count_p95 2 \
+          --max_component_count_p95 4 \
+          --catastrophic_latent_rms_max 0.02 \
+          --catastrophic_latent_max_abs 0.40 \
+          --catastrophic_chamfer_max 0.0012 \
+          --catastrophic_fscore_max 0.0065 \
+          --catastrophic_lcr_max 0.001 \
+          --catastrophic_boundary_count_max 100 \
+          --catastrophic_boundary_length_max 0.30 \
+          --catastrophic_nonmanifold_count_max 2 \
+          --catastrophic_component_count_max 10 \
+          --max_watertight_flip_rate 0.05 \
+          --max_zero_boundary_flip_rate 0.05 \
+          --max_nonmanifold_free_flip_rate 0.05
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  fi
+  echo "B3N4_RC=${CODE}"
+  echo "RC=3 means no N0-N3 runtime passed; stop step800 before B4."
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N5. Freeze the v2_fix2 preflight protocol with selected runtime/p95 policy
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${RUNTIME_AGG_REPORT}" ] &&
+     "${PY}" -c \
+       'import json,sys; r=json.load(open(sys.argv[1])); raise SystemExit(0 if r.get("passed") is True and r.get("selected_runtime") else 2)' \
+       "${RUNTIME_AGG_REPORT}"; then
+    if [ -s "${PREFLIGHT_PROTOCOL_DIR}/protocol.json" ] &&
+       [ -s "${PREFLIGHT_PROTOCOL_DIR}/blind_key.txt" ]; then
+      echo "reuse immutable v2_fix2 preflight protocol"
+      CODE=0
+    elif [ -e "${PREFLIGHT_PROTOCOL_DIR}" ]; then
+      echo "partial v2_fix2 protocol exists; preserve and inspect it"
+      CODE=98
+    else
+      if run_logged "${PREFLIGHT_PROTOCOL_DIR}.prepare.log" \
+        "${PY}" -u -m pose_point_depth_mv.prepare_direct_slat_blind_protocol \
+          --mode preflight \
+          --cache_manifest "${VAL_CACHE}/manifest.json" \
+          --checkpoint "${SLAT_CKPT}" \
+          --target_decoder_audit "${VAL_TARGET_AUDIT}" \
+          --runtime_calibration_report "${RUNTIME_AGG_REPORT}" \
+          --output_dir "${PREFLIGHT_PROTOCOL_DIR}" \
+          --protocol_name direct_slat_seen_preflight3_step800_20260725_v2_fix2 \
+          --pretrained "${PRETRAINED}" \
+          --joint_seeds 42,43,44 \
+          --preflight_objects 3 \
+          --slat_steps 25 \
+          --slat_cfg_strength 5.0 \
+          --slat_cfg_interval 0.5,1.0 \
+          --slat_rescale_t 3.0 \
+          --surface_samples 20000 \
+          --render_frames 36 \
+          --render_resolution 256 \
+          --bootstrap_samples 5000
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B3N5 blocked: runtime aggregate has no passing selected runtime"
+    CODE=96
+  fi
+  echo "B3N5_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B3N6. Run v2_fix2 five-repeat preflight with its frozen runtime (GPU)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${PREFLIGHT_PROTOCOL_DIR}/protocol.json" ] &&
+     [ -s "${RUNTIME_AGG_REPORT}" ] &&
+     [ -s "${PREFLIGHT_PROTOCOL_DIR}/blind_key.txt" ]; then
+    RESUME=()
+    if [ -d "${PREFLIGHT_OUT}" ]; then RESUME=(--resume); fi
+    if run_logged "${PREFLIGHT_OUT}.log" \
+      env \
+        CUDA_VISIBLE_DEVICES=4 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.launch_direct_slat_blind_runtime \
+        --protocol "${PREFLIGHT_PROTOCOL_DIR}/protocol.json" \
+        --blind_key_file "${PREFLIGHT_PROTOCOL_DIR}/blind_key.txt" \
+        --output_dir "${PREFLIGHT_OUT}" \
+        --device cuda \
+        --skip_renders \
+        "${RESUME[@]}"
+    then
+      "${PY}" - "${PREFLIGHT_OUT}/repeat_report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["complete"] is True
+assert r["all_records_passed"] is True
+assert r["repeat_calibration"]["policy_mode"] == "multi_repeat_p95"
+assert r["repeat_calibration"]["passed"] is True
+print("v2_fix2 preflight PASS:", r["repeat_calibration"])
+PY
+      CODE=$?
+    else
+      CODE=$?
+    fi
+  else
+    echo "B3N6 blocked: v2_fix2 protocol/key missing"
+    CODE=96
+  fi
+  echo "B3N6_RC=${CODE}"
+  echo "Only B3N6 PASS permits B4."
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B4. Freeze 512 raw unseen source candidates (CPU/data only)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${PREFLIGHT_OUT}/repeat_report.json" ] &&
+     [ -s "${TRAIN_CACHE}/manifest.json" ] &&
+     [ -s "${VAL_CACHE}/manifest.json" ] &&
+     [ -s "${RAW_OBJAVERSE}" ] &&
+     "${PY}" -c \
+       'import json,sys; r=json.load(open(sys.argv[1])); raise SystemExit(0 if r.get("repeat_calibration",{}).get("passed") is True else 2)' \
+       "${PREFLIGHT_OUT}/repeat_report.json"; then
+    if [ -s "${CANDIDATE_MANIFEST}" ] && [ -s "${CANDIDATE_AUDIT}" ]; then
+      echo "reuse immutable raw candidate freeze"
+      CODE=0
+    elif [ -e "${CANDIDATE_MANIFEST}" ] || [ -e "${CANDIDATE_AUDIT}" ]; then
+      echo "incomplete candidate freeze exists; inspect it, do not overwrite"
+      CODE=98
+    else
+      mkdir -p "${HOLDOUT_ROOT}"
+      if run_logged "${HOLDOUT_ROOT}/freeze_candidates.log" \
+        "${PY}" -u -m pose_point_depth_mv.prepare_direct_slat_holdout_manifest \
+          --mode candidates \
+          --source_manifest "${RAW_OBJAVERSE}" \
+          --seen_manifests "${TRAIN_CACHE}/manifest.json,${VAL_CACHE}/manifest.json" \
+          --output_manifest "${CANDIDATE_MANIFEST}" \
+          --audit_output "${CANDIDATE_AUDIT}" \
+          --candidate_objects 512 \
+          --selection_seed 20260725
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B4 blocked: passed preflight, raw manifest, or seen manifests missing"
+    CODE=96
+  fi
+  echo "B4_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B5. Render the frozen unseen candidate pool with the existing v9 quality gates
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  BLENDER=/tmp/blender-3.0.1-linux-x64/blender
+  PREVIEW=pose_point_depth_mv/outputs/direct_slat_blind_holdout_candidates512_preview_20260725_v2
+  if cd /home/zjr/Tracker &&
+     [ -s "${CANDIDATE_MANIFEST}" ] &&
+     [ -x "${BLENDER}" ]; then
+    if [ -s "${CAND_RENDER}/manifest.json" ]; then
+      echo "reuse completed candidate render: ${CAND_RENDER}"
+      CODE=0
+    elif [ -e "${CAND_RENDER}" ]; then
+      echo "partial render directory exists and renderer has no safe resume"
+      echo "preserve it and create a new protocol/versioned HOLDOUT_ROOT"
+      CODE=98
+    else
+      if run_logged "${CAND_RENDER}.log" \
+        env \
+          CUDA_VISIBLE_DEVICES=4 \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          PYOPENGL_PLATFORM=egl \
+          ATTN_BACKEND=flash_attn \
+          MPLCONFIGDIR=/tmp/matplotlib \
+          NUMBA_CACHE_DIR=/tmp/numba_cache \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u \
+          pose_point_depth_mv/dataset_tools/build_objaverse_multiview_sparse_data.py \
+            --objaverse_manifest "${CANDIDATE_MANIFEST}" \
+            --output_dir "${CAND_RENDER}" \
+            --code_output_dir "${PREVIEW}" \
+            --max_objects 512 \
+            --start_index 0 \
+            --seed 20260725 \
+            --sequences_per_object 1 \
+            --val_count 0 \
+            --vis_count 32 \
+            --renderer blender \
+            --blender_path "${BLENDER}" \
+            --blender_engine CYCLES \
+            --blender_samples 48 \
+            --blender_quiet \
+            --candidate_views 24 \
+            --selected_views 8 \
+            --frame_selection_policy mask_pose_diverse \
+            --min_good_candidate_views 8 \
+            --image_size 512 \
+            --trajectory_mode ar_random \
+            --surface_points 160000 \
+            --voxel_resolution 64 \
+            --min_voxels 1500 \
+            --trajectory_resample_attempts 24 \
+            --camera_framing_margin_px 12 \
+            --min_complete_view_fraction 0.45 \
+            --min_usable_view_fraction 0.70 \
+            --max_clipped_view_fraction 0.55 \
+            --min_complete_in_frame_ratio 0.95 \
+            --min_usable_in_frame_ratio 0.45 \
+            --min_fg_pixels 12000 \
+            --min_fg_pixels_per_view 512 \
+            --min_fg_area_ratio 0.004 \
+            --max_fg_area_ratio 0.88 \
+            --min_bbox_margin_px 12 \
+            --max_border_touch_views 2 \
+            --max_bbox_area_ratio 0.95 \
+            --selection_min_fg_pixels_per_view 512 \
+            --selection_min_fg_area_ratio 0.004 \
+            --selection_min_bbox_margin_px 12 \
+            --selection_max_bbox_area_ratio 0.95 \
+            --enforce_projection_support \
+            --projection_support_frames 8 \
+            --min_projection_visible_points_ratio 0.8 \
+            --min_projection_support_ratio_mean 0.5 \
+            --max_projection_zero_support_ratio 0.25 \
+            --max_low_texture_ratio 0.22
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B5 blocked: candidate manifest or Blender binary is missing"
+    CODE=96
+  fi
+  echo "B5_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B6. Candidate data path: point prior -> pointpose cache -> pose lifting
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker && [ -s "${CAND_RENDER}/manifest.json" ]; then
+    if [ ! -s "${CAND_PRIOR}/manifest.json" ]; then
+      if [ -e "${CAND_PRIOR}" ]; then
+        echo "partial candidate prior exists: ${CAND_PRIOR}"
+        CODE=98
+      elif run_logged "${CAND_PRIOR}.log" \
+        "${PY}" -u trellis_point_prior_mv/build_point_prior_dataset.py \
+          --source_manifest "${CAND_RENDER}/manifest.json" \
+          --output_dir "${CAND_PRIOR}" \
+          --indices all \
+          --max_frames 8 \
+          --seed 42 \
+          --grid_transform pixal3d_rotation \
+          --num_prior_views_choices 2,4,8 \
+          --point_count_choices 50,100,300,800,1500 \
+          --min_support 1 \
+          --min_support_ratio 0.45 \
+          --dropout_min 0.0 \
+          --dropout_max 0.65 \
+          --coord_jitter 1 \
+          --outlier_ratio 0.03 \
+          --front_depth_epsilon 0.02; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ] && [ ! -s "${CAND_POINTPOSE}/manifest.json" ]; then
+      if [ -e "${CAND_POINTPOSE}" ]; then
+        echo "partial candidate pointpose cache exists: ${CAND_POINTPOSE}"
+        CODE=98
+      elif run_logged "${CAND_POINTPOSE}.log" \
+        "${PY}" -u reconvggt_ar_adapter_a/build_pointpose_ss_cache.py \
+          --source_manifest "${CAND_RENDER}/manifest.json" \
+          --prior_manifest "${CAND_PRIOR}/manifest.json" \
+          --output_dir "${CAND_POINTPOSE}" \
+          --indices all \
+          --log_every 25; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ] && [ ! -s "${CAND_LIFT}/manifest.json" ]; then
+      if [ -e "${CAND_LIFT}" ]; then
+        echo "partial candidate lifting cache exists: ${CAND_LIFT}"
+        CODE=98
+      elif run_logged "${CAND_LIFT}.log" \
+        env \
+          CUDA_VISIBLE_DEVICES=4 \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+          MPLCONFIGDIR=/tmp/matplotlib \
+          NUMBA_CACHE_DIR=/tmp/numba_cache \
+          TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u ar_ss_flow/build_pose_lifting_cache.py \
+          --source_cache_manifest "${CAND_POINTPOSE}/manifest.json" \
+          --output_dir "${CAND_LIFT}" \
+          --pretrained "${PRETRAINED}" \
+          --vggt_pretrained Stable-X/vggt-object-v0-1 \
+          --indices all \
+          --max_samples 0 \
+          --device cuda \
+          --save_correct_geometry \
+          --allow_failures \
+          --log_every 1; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B6 blocked: candidate render manifest missing"
+    CODE=96
+  fi
+  echo "B6_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B7. Build local lh-slats for candidate successes (data-only eligibility gate)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  LOCAL_RC=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${CAND_RENDER}/manifest.json" ] &&
+     [ -s "${CAND_LIFT}/manifest.json" ]; then
+    RESUME=()
+    if [ -d "${CAND_SLAT}" ]; then RESUME=(--resume); fi
+    run_logged "${CAND_SLAT}.log" \
+      env \
+        CUDA_VISIBLE_DEVICES=4 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.build_local_lh_slats \
+        --render_manifests "${CAND_RENDER}/manifest.json" \
+        --lifting_manifests "${CAND_LIFT}/manifest.json" \
+        --output_dir "${CAND_SLAT}" \
+        --encoder_prefix "${ENCODER_PREFIX}" \
+        --mesh_decoder_weights "${MESH_DECODER_WEIGHTS}" \
+        --dinov2_repo "${DINOV2_REPO}" \
+        --dinov2_checkpoint "${DINOV2_CKPT}" \
+        --dinov2_model dinov2_vitl14_reg \
+        --device cuda \
+        --image_size 518 \
+        --view_batch_size 2 \
+        --min_views 8 \
+        --max_views 16 \
+        --min_visible_view_fraction_mean 0.25 \
+        --min_mask_support_view_fraction_mean 0.10 \
+        --min_mask_support_ge2_ratio 0.50 \
+        --min_mask_support_ge4_ratio 0.20 \
+        --max_zero_mask_support_ratio 0.25 \
+        --min_camera_corruption_mask_support_drop_mean 0.05 \
+        --min_camera_corruption_mask_support_drop_median 0.02 \
+        --min_camera_corruption_positive_object_rate 0.70 \
+        "${RESUME[@]}"
+    LOCAL_RC=$?
+
+    "${PY}" - "${CAND_SLAT}/rank_000_report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["success_count"] >= 32, r
+assert not r["projection_camera_corruption_gate_failures"], r
+assert len(r["records"]) == r["success_count"], r
+print({
+    "successful_eligible_objects": r["success_count"],
+    "failed_objects": r["failure_count"],
+    "corruption_summary": r["projection_camera_corruption_summary"],
+})
+PY
+    CODE=$?
+  else
+    echo "B7 blocked: candidate render/lifting inputs missing"
+    CODE=96
+  fi
+  echo "B7 raw builder RC=${LOCAL_RC}"
+  echo "B7 eligibility RC=${CODE}"
+  echo "A raw RC=2 is acceptable only when the frozen report above still passes."
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B8. Freeze exactly 32 eligible unseen objects (CPU/data only, immutable)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${CANDIDATE_AUDIT}" ] &&
+     [ -s "${CAND_RENDER}/manifest.json" ] &&
+     [ -s "${CAND_SLAT}/rank_000_report.json" ]; then
+    if [ -s "${HOLD_RENDER_MANIFEST}" ] &&
+       [ -s "${HOLD_SELECTION_AUDIT}" ]; then
+      echo "reuse immutable holdout32 selection"
+      CODE=0
+    elif [ -e "${HOLD_RENDER_MANIFEST}" ] ||
+         [ -e "${HOLD_SELECTION_AUDIT}" ]; then
+      echo "incomplete holdout selection exists; inspect it, do not overwrite"
+      CODE=98
+    else
+      if run_logged "${HOLDOUT_ROOT}/freeze_holdout32.log" \
+        "${PY}" -u -m pose_point_depth_mv.prepare_direct_slat_holdout_manifest \
+          --mode freeze_rendered \
+          --render_manifests "${CAND_RENDER}/manifest.json" \
+          --candidate_audit "${CANDIDATE_AUDIT}" \
+          --eligibility_report "${CAND_SLAT}/rank_000_report.json" \
+          --seen_manifests "${TRAIN_CACHE}/manifest.json,${VAL_CACHE}/manifest.json" \
+          --output_manifest "${HOLD_RENDER_MANIFEST}" \
+          --audit_output "${HOLD_SELECTION_AUDIT}" \
+          --holdout_objects 32 \
+          --selection_seed 20260725
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B8 blocked: candidate data-quality report missing"
+    CODE=96
+  fi
+  echo "B8_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B9. Rebuild exact holdout32 prior/pointpose/lifting caches
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker && [ -s "${HOLD_RENDER_MANIFEST}" ]; then
+    if [ ! -s "${HOLD_PRIOR}/manifest.json" ]; then
+      if [ -e "${HOLD_PRIOR}" ]; then
+        echo "partial holdout prior exists: ${HOLD_PRIOR}"
+        CODE=98
+      elif run_logged "${HOLD_PRIOR}.log" \
+        "${PY}" -u trellis_point_prior_mv/build_point_prior_dataset.py \
+          --source_manifest "${HOLD_RENDER_MANIFEST}" \
+          --output_dir "${HOLD_PRIOR}" \
+          --indices all \
+          --max_frames 8 \
+          --seed 42 \
+          --grid_transform pixal3d_rotation \
+          --num_prior_views_choices 2,4,8 \
+          --point_count_choices 50,100,300,800,1500 \
+          --min_support 1 \
+          --min_support_ratio 0.45 \
+          --dropout_min 0.0 \
+          --dropout_max 0.65 \
+          --coord_jitter 1 \
+          --outlier_ratio 0.03 \
+          --front_depth_epsilon 0.02; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ] && [ ! -s "${HOLD_POINTPOSE}/manifest.json" ]; then
+      if [ -e "${HOLD_POINTPOSE}" ]; then
+        echo "partial holdout pointpose cache exists: ${HOLD_POINTPOSE}"
+        CODE=98
+      elif run_logged "${HOLD_POINTPOSE}.log" \
+        "${PY}" -u reconvggt_ar_adapter_a/build_pointpose_ss_cache.py \
+          --source_manifest "${HOLD_RENDER_MANIFEST}" \
+          --prior_manifest "${HOLD_PRIOR}/manifest.json" \
+          --output_dir "${HOLD_POINTPOSE}" \
+          --indices all \
+          --log_every 10; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ] && [ ! -s "${HOLD_LIFT}/manifest.json" ]; then
+      if [ -e "${HOLD_LIFT}" ]; then
+        echo "partial holdout lifting cache exists: ${HOLD_LIFT}"
+        CODE=98
+      elif run_logged "${HOLD_LIFT}.log" \
+        env \
+          CUDA_VISIBLE_DEVICES=4 \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+          MPLCONFIGDIR=/tmp/matplotlib \
+          NUMBA_CACHE_DIR=/tmp/numba_cache \
+          TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u ar_ss_flow/build_pose_lifting_cache.py \
+          --source_cache_manifest "${HOLD_POINTPOSE}/manifest.json" \
+          --output_dir "${HOLD_LIFT}" \
+          --pretrained "${PRETRAINED}" \
+          --vggt_pretrained Stable-X/vggt-object-v0-1 \
+          --indices all \
+          --max_samples 0 \
+          --device cuda \
+          --save_correct_geometry \
+          --log_every 1; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ]; then
+      "${PY}" - "${HOLD_LIFT}/manifest.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+assert m["sample_count"] == 32, m
+assert m["object_count"] == 32, m
+assert len({r["object_uid"] for r in m["samples"]}) == 32, m
+print("exact holdout lifting cache PASS: 32 objects")
+PY
+      CODE=$?
+    fi
+  else
+    echo "B9 blocked: exact holdout render manifest missing"
+    CODE=96
+  fi
+  echo "B9_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B10. Independent lifting and exact native-stock replay audits
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  LIFT_AUDIT=${HOLD_LIFT}/independent_audit_v2
+  STOCK_AUDIT=${HOLD_LIFT}/stock_condition_audit_2_4_8
+  if cd /home/zjr/Tracker && [ -s "${HOLD_LIFT}/manifest.json" ]; then
+    if [ ! -s "${LIFT_AUDIT}/report.json" ]; then
+      if [ -e "${LIFT_AUDIT}" ]; then
+        echo "partial lifting audit exists: ${LIFT_AUDIT}"
+        CODE=98
+      elif run_logged "${LIFT_AUDIT}.log" \
+        env CUDA_VISIBLE_DEVICES=4 \
+        "${PY}" -u ar_ss_flow/audit_pose_lifting_cache.py \
+          --cache_manifest "${HOLD_LIFT}/manifest.json" \
+          --output_dir "${LIFT_AUDIT}" \
+          --indices all \
+          --max_samples 0 \
+          --device cuda \
+          --min_depth_enabled_ratio 0.80 \
+          --max_cached_geometry_diff 1e-5 \
+          --max_roundtrip_error 1e-4 \
+          --fail_on_error; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ] &&
+       [ ! -s "${STOCK_AUDIT}/report.json" ]; then
+      if [ -e "${STOCK_AUDIT}" ]; then
+        echo "partial stock audit exists: ${STOCK_AUDIT}"
+        CODE=98
+      elif run_logged "${STOCK_AUDIT}.log" \
+        env \
+          CUDA_VISIBLE_DEVICES=4 \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+        "${PY}" -u ar_ss_flow/audit_cached_stock_condition.py \
+          --cache_manifest "${HOLD_LIFT}/manifest.json" \
+          --output_dir "${STOCK_AUDIT}" \
+          --pretrained "${PRETRAINED}" \
+          --indices auto_2_4_8 \
+          --device cuda \
+          --max_abs_tolerance 0 \
+          --rms_tolerance 0 \
+          --min_cosine 1 \
+          --require_fp16_equal \
+          --fail_on_error; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ]; then
+      "${PY}" - "${LIFT_AUDIT}/report.json" "${STOCK_AUDIT}/report.json" <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    r = json.load(open(path))
+    assert r["passed"] is True, (path, r)
+print("holdout lifting/native-stock audits PASS")
+PY
+      CODE=$?
+    fi
+  else
+    echo "B10 blocked: holdout lifting cache missing"
+    CODE=96
+  fi
+  echo "B10_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B11. Build exact 32-object Direct-SLAT cache and native target audit
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=0
+  if cd /home/zjr/Tracker &&
+     [ -s "${HOLD_LIFT}/manifest.json" ] &&
+     [ -s "${CAND_SLAT}/run_config.json" ]; then
+    TARGET_RESUME=()
+    if [ -d "${HOLD_CACHE}" ]; then TARGET_RESUME=(--resume); fi
+    if [ ! -s "${HOLD_CACHE}/target_coverage.json" ]; then
+      if run_logged "${HOLD_CACHE}.target_only.log" \
+        "${PY}" -u -m pose_point_depth_mv.build_direct_slat_cache \
+          --lifting_manifest "${HOLD_LIFT}/manifest.json" \
+          --slat_root "${CAND_SLAT}" \
+          --flow_checkpoint "${SS_CKPT}" \
+          --correspondence_checkpoint "${CORR_CKPT}" \
+          --n3_report "${N3_REPORT}" \
+          --output_dir "${HOLD_CACHE}" \
+          --pretrained "${PRETRAINED}" \
+          --ss_seeds 42,43,44 \
+          --ss_steps 30 \
+          --cfg_strength 7.5 \
+          --guidance_rescale 0.5 \
+          --rescale_t 3.0 \
+          --expected_ss_step 900 \
+          --min_frame_iou 0.90 \
+          --amp_dtype bf16 \
+          --require_all_objects \
+          --target_only \
+          "${TARGET_RESUME[@]}"; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ] &&
+       [ ! -s "${HOLD_TARGET_AUDIT}/report.json" ]; then
+      AUDIT_RESUME=()
+      if [ -d "${HOLD_TARGET_AUDIT}" ]; then AUDIT_RESUME=(--resume); fi
+      if run_logged "${HOLD_TARGET_AUDIT}.log" \
+        env \
+          CUDA_VISIBLE_DEVICES=4 \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u -m pose_point_depth_mv.audit_direct_slat_targets \
+          --cache_manifest "${HOLD_CACHE}/manifest.json" \
+          --output_dir "${HOLD_TARGET_AUDIT}" \
+          --pretrained "${PRETRAINED}" \
+          --max_objects 32 \
+          --surface_samples 20000 \
+          --min_mesh_success_rate 1.0 \
+          --max_chamfer_l1 0.10 \
+          --decision_profile strict \
+          "${AUDIT_RESUME[@]}"; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ]; then
+      if run_logged "${HOLD_CACHE}.materialize.log" \
+        env \
+          CUDA_VISIBLE_DEVICES=4 \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+          MPLCONFIGDIR=/tmp/matplotlib \
+          NUMBA_CACHE_DIR=/tmp/numba_cache \
+          TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        "${PY}" -u -m pose_point_depth_mv.build_direct_slat_cache \
+          --lifting_manifest "${HOLD_LIFT}/manifest.json" \
+          --slat_root "${CAND_SLAT}" \
+          --flow_checkpoint "${SS_CKPT}" \
+          --correspondence_checkpoint "${CORR_CKPT}" \
+          --n3_report "${N3_REPORT}" \
+          --output_dir "${HOLD_CACHE}" \
+          --pretrained "${PRETRAINED}" \
+          --ss_seeds 42,43,44 \
+          --ss_steps 30 \
+          --cfg_strength 7.5 \
+          --guidance_rescale 0.5 \
+          --rescale_t 3.0 \
+          --expected_ss_step 900 \
+          --min_frame_iou 0.90 \
+          --amp_dtype bf16 \
+          --require_all_objects \
+          --resume; then
+        :
+      else
+        CODE=$?
+      fi
+    fi
+
+    if [ "${CODE}" -eq 0 ]; then
+      "${PY}" - "${HOLD_CACHE}/manifest.json" "${HOLD_TARGET_AUDIT}/report.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+a = json.load(open(sys.argv[2]))
+assert m["materialized"] is True, m
+assert m["object_count"] == 32, m
+assert m["sequence_count"] == 32, m
+assert m["sample_count"] == 96, m
+assert a["passed"] is True, a["checks"]
+print("exact holdout Direct-SLAT cache/target audit PASS")
+PY
+      CODE=$?
+    fi
+  else
+    echo "B11 blocked: exact lifting cache or eligible local SLAT root missing"
+    CODE=96
+  fi
+  echo "B11_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B11.5. Freeze exact post-B8 integrity; failed objects invalidate this version
+###############################################################################
+
+# Operational interruption may resume only the same frozen objects. If a
+# completed B9/B10/B11 quality audit fails for any object, create
+# INVALID_DATA_PROTOCOL.json with `--mode invalidate`; never replace that object
+# from the candidate pool. The next attempt must use a new HOLDOUT_ROOT/version.
+
+(
+  set -uo pipefail
+  CODE=97
+  LIFT_AUDIT=${HOLD_LIFT}/independent_audit_v2
+  STOCK_AUDIT=${HOLD_LIFT}/stock_condition_audit_2_4_8
+  if cd /home/zjr/Tracker &&
+     [ ! -e "${HOLD_INVALID_MARKER}" ] &&
+     [ -s "${HOLD_SELECTION_AUDIT}" ] &&
+     [ -s "${HOLD_LIFT}/manifest.json" ] &&
+     [ -s "${LIFT_AUDIT}/report.json" ] &&
+     [ -s "${STOCK_AUDIT}/report.json" ] &&
+     [ -s "${HOLD_CACHE}/manifest.json" ] &&
+     [ -s "${HOLD_TARGET_AUDIT}/report.json" ]; then
+    if [ -s "${HOLD_INTEGRITY_AUDIT}" ]; then
+      echo "reuse immutable post-selection integrity audit"
+      CODE=0
+    elif [ -e "${HOLD_INTEGRITY_AUDIT}" ]; then
+      echo "partial integrity audit exists; current version requires review"
+      CODE=98
+    else
+      run_logged "${HOLD_INTEGRITY_AUDIT}.log" \
+        "${PY}" -u -m pose_point_depth_mv.freeze_direct_slat_holdout_integrity \
+          --mode freeze \
+          --invalid_marker "${HOLD_INVALID_MARKER}" \
+          --selection_audit "${HOLD_SELECTION_AUDIT}" \
+          --lifting_manifest "${HOLD_LIFT}/manifest.json" \
+          --lifting_audit "${LIFT_AUDIT}/report.json" \
+          --stock_replay_audit "${STOCK_AUDIT}/report.json" \
+          --cache_manifest "${HOLD_CACHE}/manifest.json" \
+          --target_decoder_audit "${HOLD_TARGET_AUDIT}/report.json" \
+          --expected_objects 32 \
+          --output "${HOLD_INTEGRITY_AUDIT}"
+      CODE=$?
+      if [ "${CODE}" -ne 0 ] && [ ! -e "${HOLD_INVALID_MARKER}" ]; then
+        "${PY}" -u -m pose_point_depth_mv.freeze_direct_slat_holdout_integrity \
+          --mode invalidate \
+          --invalid_marker "${HOLD_INVALID_MARKER}" \
+          --stage B11.5 \
+          --reason "post-selection B9/B10/B11 integrity check failed"
+        MARK_RC=$?
+        echo "invalid marker RC=${MARK_RC}"
+      fi
+    fi
+  elif [ -e "${HOLD_INVALID_MARKER}" ]; then
+    echo "holdout version is already INVALID_DATA_PROTOCOL; create a new version"
+    CODE=99
+  else
+    echo "B11.5 blocked: B9/B10/B11 evidence is incomplete"
+    echo "Do not substitute another object. Resume only identical frozen objects."
+    CODE=96
+  fi
+  echo "B11_5_RC=${CODE}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B12. Freeze the confirmatory protocol before generating A/B outputs (CPU)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${PREFLIGHT_OUT}/repeat_report.json" ] &&
+     [ -s "${PREFLIGHT_PROTOCOL_DIR}/protocol.json" ] &&
+     [ -s "${RUNTIME_AGG_REPORT}" ] &&
+     [ -s "${HOLD_SELECTION_AUDIT}" ] &&
+     [ -s "${HOLD_INTEGRITY_AUDIT}" ] &&
+     [ ! -e "${HOLD_INVALID_MARKER}" ] &&
+     [ -s "${HOLD_CACHE}/manifest.json" ] &&
+     [ -s "${HOLD_TARGET_AUDIT}/report.json" ]; then
+    if [ -s "${FORMAL_PROTOCOL_DIR}/protocol.json" ] &&
+       [ -s "${FORMAL_PROTOCOL_DIR}/blind_key.txt" ]; then
+      echo "reuse immutable confirmatory protocol"
+      CODE=0
+    elif [ -e "${FORMAL_PROTOCOL_DIR}" ]; then
+      echo "incomplete formal protocol exists; inspect it, do not overwrite"
+      CODE=98
+    else
+      if run_logged "${FORMAL_PROTOCOL_DIR}.prepare.log" \
+        "${PY}" -u -m pose_point_depth_mv.prepare_direct_slat_blind_protocol \
+          --mode confirmatory \
+          --cache_manifest "${HOLD_CACHE}/manifest.json" \
+          --seen_cache_manifests "${TRAIN_CACHE}/manifest.json,${VAL_CACHE}/manifest.json" \
+          --checkpoint "${SLAT_CKPT}" \
+          --target_decoder_audit "${HOLD_TARGET_AUDIT}/report.json" \
+          --holdout_selection_audit "${HOLD_SELECTION_AUDIT}" \
+          --preflight_report "${PREFLIGHT_OUT}/repeat_report.json" \
+          --preflight_protocol "${PREFLIGHT_PROTOCOL_DIR}/protocol.json" \
+          --runtime_calibration_report "${RUNTIME_AGG_REPORT}" \
+          --holdout_integrity_audit "${HOLD_INTEGRITY_AUDIT}" \
+          --output_dir "${FORMAL_PROTOCOL_DIR}" \
+          --protocol_name direct_slat_unseen_holdout32_step800_20260725_v2_fix2 \
+          --pretrained "${PRETRAINED}" \
+          --joint_seeds 42,43,44 \
+          --expected_objects 32 \
+          --slat_steps 25 \
+          --slat_cfg_strength 5.0 \
+          --slat_cfg_interval 0.5,1.0 \
+          --slat_rescale_t 3.0 \
+          --surface_samples 20000 \
+          --render_frames 36 \
+          --render_resolution 256 \
+          --bootstrap_samples 5000
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B12 blocked: v2 preflight/integrity/cache audit missing or holdout invalid"
+    CODE=96
+  fi
+  echo "B12_RC=${CODE}"
+  echo "Do not distribute blind_key.txt or the protocol directory to raters."
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B13. Formal anonymous stock/full export (GPU, 32 objects x 3 seeds)
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ ! -e "${HOLD_INVALID_MARKER}" ] &&
+     [ -s "${FORMAL_PROTOCOL_DIR}/protocol.json" ] &&
+     [ -s "${FORMAL_PROTOCOL_DIR}/blind_key.txt" ]; then
+    RESUME=()
+    if [ -d "${FORMAL_OUT}" ]; then RESUME=(--resume); fi
+    if run_logged "${FORMAL_OUT}.log" \
+      env \
+        CUDA_VISIBLE_DEVICES=4 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.launch_direct_slat_blind_runtime \
+        --protocol "${FORMAL_PROTOCOL_DIR}/protocol.json" \
+        --blind_key_file "${FORMAL_PROTOCOL_DIR}/blind_key.txt" \
+        --output_dir "${FORMAL_OUT}" \
+        --device cuda \
+        "${RESUME[@]}"
+    then
+      CODE=0
+    else
+      CODE=$?
+    fi
+  else
+    echo "B13 blocked: frozen formal protocol/key missing or holdout invalid"
+    CODE=96
+  fi
+  echo "B13_RC=${CODE}"
+  echo "RC=3 is a retained generation failure, not permission to drop a pair."
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B14. Create a portable hashed public bundle and deterministic read-only tar
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${FORMAL_OUT}/completion_manifest.json" ] &&
+     [ -s "${FORMAL_OUT}/blind_manifest.csv" ]; then
+    if [ -e "${PUBLIC_RELEASE}" ] ||
+       [ -e "${PUBLIC_ARCHIVE}" ] ||
+       [ -e "${PUBLIC_ARCHIVE_MANIFEST}" ]; then
+      echo "public release artifact already exists; do not merge or overwrite"
+      CODE=98
+    else
+      if run_logged "${PUBLIC_RELEASE}.package.log" \
+        "${PY}" -u -m pose_point_depth_mv.package_direct_slat_public_bundle \
+          --protocol "${FORMAL_PROTOCOL_DIR}/protocol.json" \
+          --blind_output_dir "${FORMAL_OUT}" \
+          --output_dir "${PUBLIC_RELEASE}" \
+          --archive "${PUBLIC_ARCHIVE}" \
+          --archive_manifest "${PUBLIC_ARCHIVE_MANIFEST}"
+      then
+        CODE=0
+      else
+        CODE=$?
+      fi
+    fi
+  else
+    echo "B14 blocked: formal export is incomplete"
+    CODE=96
+  fi
+  echo "B14_RC=${CODE}"
+  echo "Distribute only the read-only tar and its archive manifest:"
+  echo "  ${PUBLIC_ARCHIVE}"
+  echo "  ${PUBLIC_ARCHIVE_MANIFEST}"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B15. Prepare three independent score files outside the sealed output
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if [ -s "${PUBLIC_RELEASE}/score_templates/scores_R1.csv" ] &&
+     [ -s "${PUBLIC_RELEASE}/score_templates/scores_R2.csv" ] &&
+     [ -s "${PUBLIC_RELEASE}/score_templates/scores_R3.csv" ]; then
+    mkdir -p "${RATINGS_ROOT}"
+    cp -n "${PUBLIC_RELEASE}/score_templates/scores_R1.csv" \
+      "${RATINGS_ROOT}/scores_R1.csv"
+    RC1=$?
+    cp -n "${PUBLIC_RELEASE}/score_templates/scores_R2.csv" \
+      "${RATINGS_ROOT}/scores_R2.csv"
+    RC2=$?
+    cp -n "${PUBLIC_RELEASE}/score_templates/scores_R3.csv" \
+      "${RATINGS_ROOT}/scores_R3.csv"
+    RC3=$?
+    if [ "${RC1}" -eq 0 ] && [ "${RC2}" -eq 0 ] && [ "${RC3}" -eq 0 ]; then
+      CODE=0
+    else
+      CODE=98
+    fi
+  else
+    echo "B15 blocked: public score templates missing"
+    CODE=96
+  fi
+  echo "B15_RC=${CODE}"
+  echo "Benefit scores are 1..5; defect severities are 0..3; preference is A/B/tie."
+  echo "Do not show raters sealed/, protocol/, blind_key.txt, or other ratings."
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B15.5. Freeze rating SHA/public bundle SHA before any process reads blind key
+###############################################################################
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${PUBLIC_RELEASE}/public_bundle_manifest.json" ] &&
+     [ -s "${PUBLIC_ARCHIVE_MANIFEST}" ] &&
+     [ -s "${RATINGS_ROOT}/scores_R1.csv" ] &&
+     [ -s "${RATINGS_ROOT}/scores_R2.csv" ] &&
+     [ -s "${RATINGS_ROOT}/scores_R3.csv" ]; then
+    if [ -s "${RATINGS_MANIFEST}" ]; then
+      echo "reuse immutable ratings freeze manifest"
+      CODE=0
+    elif [ -e "${RATINGS_MANIFEST}" ]; then
+      echo "partial ratings freeze exists; inspect it, do not overwrite"
+      CODE=98
+    elif run_logged "${RATINGS_MANIFEST}.log" \
+      "${PY}" -u -m pose_point_depth_mv.freeze_direct_slat_ratings \
+        --public_bundle_manifest "${PUBLIC_RELEASE}/public_bundle_manifest.json" \
+        --public_archive_manifest "${PUBLIC_ARCHIVE_MANIFEST}" \
+        --rater_scores "${RATINGS_ROOT}/scores_R1.csv,${RATINGS_ROOT}/scores_R2.csv,${RATINGS_ROOT}/scores_R3.csv" \
+        --output "${RATINGS_MANIFEST}"; then
+      CODE=0
+    else
+      CODE=$?
+    fi
+  else
+    echo "B15.5 blocked: public release or complete ratings are missing"
+    CODE=96
+  fi
+  echo "B15_5_RC=${CODE}"
+  echo "blind_key.txt has not been read by this stage"
+  echo "current terminal remains open"
+  true
+)
+
+
+###############################################################################
+# B16. One-time finalization after the ratings manifest is frozen
+###############################################################################
+
+# Do not run this section until R1/R2/R3 have independently completed every row.
+# A scientific FAIL returns code 2 and is the final result for this holdout.
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker &&
+     [ -s "${RATINGS_ROOT}/scores_R1.csv" ] &&
+     [ -s "${RATINGS_ROOT}/scores_R2.csv" ] &&
+     [ -s "${RATINGS_ROOT}/scores_R3.csv" ] &&
+     [ -s "${RATINGS_MANIFEST}" ]; then
+    if [ -s "${FINAL_OUT}/final_report.json" ]; then
+      echo "protocol already finalized; never run a second unblinding"
+      "${PY}" - "${FINAL_OUT}/final_report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+print({
+    "passed": r["passed"],
+    "automatic_passed": r["automatic"]["automatic_passed"],
+    "blind_ratings_passed": r["blind_ratings"]["passed"],
+})
+PY
+      CODE=0
+    elif [ -e "${FINAL_OUT}" ]; then
+      echo "partial finalizer output exists; stop and audit, do not rerun"
+      CODE=98
+    else
+      run_logged "${FINAL_OUT}.log" \
+        "${PY}" -u -m pose_point_depth_mv.finalize_direct_slat_blind_holdout \
+          --protocol "${FORMAL_PROTOCOL_DIR}/protocol.json" \
+          --blind_key_file "${FORMAL_PROTOCOL_DIR}/blind_key.txt" \
+          --blind_output_dir "${FORMAL_OUT}" \
+          --ratings_manifest "${RATINGS_MANIFEST}" \
+          --output_dir "${FINAL_OUT}"
+      CODE=$?
+    fi
+  else
+    echo "B16 blocked: ratings freeze manifest is not present"
+    CODE=96
+  fi
+  echo "B16_RC=${CODE}"
+  echo "RC=0 means PASS; RC=2 means a valid confirmatory FAIL."
+  echo "No object, seed, failed pair, or rater may be removed after this point."
+  echo "current terminal remains open"
+  true
+)

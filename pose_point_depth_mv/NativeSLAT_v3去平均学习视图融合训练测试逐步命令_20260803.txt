@@ -1,0 +1,600 @@
+Native-SLAT v3：去固定平均、学习式逐层多视图融合训练测试逐步命令（2026-08-03）
+================================================================================
+
+使用说明
+--------
+
+1. 本文件不是一键脚本。每一节单独复制到终端执行，确认上一节通过后再运行下一节。
+2. 不修改、不覆盖已经冻结的 Native SS、Stock-SLAT、v2 训练结果或 cache。
+3. 默认训练使用 GPU 4,5，评估使用 GPU 5；运行前必须按 nvidia-smi 改为空闲卡。
+4. 本项目同时占用的 GPU 总数不得超过 4。
+5. 长训和完整 Mesh 评估使用 user-systemd，关闭当前终端不会终止任务。
+
+固定比较口径
+------------
+
+  Stock = Native SS step2000 EMA
+          -> ReconViaGen 发布版 Stock-SLAT（保留原代码逐视图算术平均）
+          -> 冻结 Mesh decoder
+
+  Full  = 与 Stock 相同的 Native SS 坐标、原生 SLat condition、初始噪声、采样器和 decoder
+          -> Native-SLAT v3：
+             * attention LoRA
+             * active 32^3 posed-DINO every-block condition
+             * 每个 SLat transformer block 对每个视图分别做 cross-attention
+             * 用 cross-attention result MLP + posed-DINO 可见性 logit 学习逐点视图权重
+             * 学习目标对无效投影视图显式 mask；过渡门从 Stock 均值连续打开
+             * 全部视图均无效时回退均匀权重
+
+关键安全边界：没有删除 ReconViaGen/Stock 的平均。学习式融合只存在于 Full 分支。
+每层 transition gate 从精确 0 初始化，因此初始 Full 前向严格等于 Stock；训练只让 Full
+连续地从均匀权重转向非均匀权重。Stock 权重、Stock 平均、Native SS 和 decoder 均冻结。
+
+本版本继续复用 v2 的 immutable 数据契约和冻结文件：
+
+  /data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+  /data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/cache_train868_seed42_v1
+  /data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/cache_val64_seed424344_v1
+  /data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/target_decoder_audit32_v1
+
+新训练产物统一写到：
+
+  /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1
+
+
+V0. 静态检查与 CPU 单元测试
+===========================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+${PY} -m py_compile \
+  pose_point_depth_mv/native_ss_genrecon.py \
+  pose_point_depth_mv/native_slat_genrecon.py \
+  pose_point_depth_mv/train_native_slat_genrecon.py \
+  pose_point_depth_mv/evaluate_native_slat_genrecon_mesh.py \
+  pose_point_depth_mv/test_native_slat_genrecon.py
+
+${PY} -m unittest -v \
+  pose_point_depth_mv.test_native_slat_genrecon \
+  pose_point_depth_mv.test_direct_slat_data
+
+echo "current terminal remains open"
+
+
+V1. 验证冻结输入、v3 协议和 Stock 未被修改
+===========================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+BASE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1
+STOCK_FREEZE=${BASE}/stock_slat_freeze_v2.json
+TRAIN_CACHE=${BASE}/cache_train868_seed42_v1/manifest.json
+VAL_CACHE=${BASE}/cache_val64_seed424344_v1/manifest.json
+TARGET_AUDIT=${BASE}/target_decoder_audit32_v1/report.json
+TRAIN_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/train868_manifest.json
+VAL_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+SS_REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+
+${PY} -c '
+import json,sys
+from pathlib import Path
+from pose_point_depth_mv.native_slat_genrecon import (
+    NATIVE_SLAT_CONTEXT_FUSION,
+    NATIVE_SLAT_GENRECON_VERSION,
+    load_stock_slat_freeze,
+)
+stock,train,val,audit,train_lift,val_lift,ss=sys.argv[1:]
+for path in (stock,train,val,audit,train_lift,val_lift,ss):
+    assert Path(path).is_file(), path
+freeze=load_stock_slat_freeze(stock)
+t=json.load(open(train)); v=json.load(open(val)); a=json.load(open(audit))
+assert NATIVE_SLAT_GENRECON_VERSION=="pose_point_depth_mv.native_slat_genrecon.v3"
+assert NATIVE_SLAT_CONTEXT_FUSION=="per_block_cross_result_mlp_plus_pose_dino_zero_init_stock_mean.v1"
+assert t["object_count"]==868 and t["config"]["condition_arch"]=="native_ss_genrecon_v2"
+assert t["config"]["ss_seeds"]==[42]
+assert v["config"]["ss_seeds"]==[42,43,44]
+assert a["passed"] is True and a["summary"]["object_count"]>=32
+print(json.dumps({"passed":True,"v3":NATIVE_SLAT_GENRECON_VERSION,
+ "fusion":NATIVE_SLAT_CONTEXT_FUSION,"stock_freeze_sha256":freeze["freeze_sha256"],
+ "train_objects":t["object_count"],"val_objects":v["object_count"]},indent=2))
+' "${STOCK_FREEZE}" "${TRAIN_CACHE}" "${VAL_CACHE}" "${TARGET_AUDIT}" \
+  "${TRAIN_LIFT}" "${VAL_LIFT}" "${SS_REPORT}"
+
+rg -n 'x = x + self.cross_attn\(h, ctx\) / len\(context\)' \
+  ReconViaGen/trellis/modules/sparse/transformer/modulated.py
+
+echo "上面 rg 必须仍能看到发布版 Stock 的算术平均；v3 没有修改该文件。"
+echo "current terminal remains open"
+
+
+V2. 两对象 / 两卡 / 单步真实 DDP smoke
+========================================
+
+目的只是在正式长训前验证：24 层 Stock 精确等价、去平均分支前向/反向、DDP、EMA、
+checkpoint 和 report。它不用于判断科学收益。输出与正式长训隔离。
+
+cd /home/zjr/Tracker
+
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+SMOKE_GPUS=${SMOKE_GPUS:-4,5}
+BASE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1
+RUN=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1
+TRAIN_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/train868_manifest.json
+SS_REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+SMOKE_OUT=${RUN}/smoke2obj_step1_seed42_2gpu_v1
+
+if [ "$(awk -F, '{print NF}' <<<"${SMOKE_GPUS}")" -ne 2 ]; then
+  echo "V2 blocked: SMOKE_GPUS must contain exactly two GPU ids"
+elif [ -s "${SMOKE_OUT}/report.json" ] && [ -s "${SMOKE_OUT}/checkpoints/step_000001.pt" ]; then
+  echo "reuse complete v3 smoke: ${SMOKE_OUT}"
+elif [ -e "${SMOKE_OUT}" ]; then
+  echo "V2 blocked: partial immutable smoke exists; preserve and inspect: ${SMOKE_OUT}"
+else
+  mkdir -p "${RUN}"
+  CUDA_VISIBLE_DEVICES="${SMOKE_GPUS}" \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  ${TORCHRUN} --standalone --nproc_per_node=2 \
+    -m pose_point_depth_mv.train_native_slat_genrecon \
+    --cache_manifest "${BASE}/cache_train868_seed42_v1/manifest.json" \
+    --lifting_cache_manifest "${TRAIN_LIFT}" \
+    --target_decoder_audit "${BASE}/target_decoder_audit32_v1/report.json" \
+    --native_ss_report "${SS_REPORT}" \
+    --stock_slat_freeze "${BASE}/stock_slat_freeze_v2.json" \
+    --output_dir "${SMOKE_OUT}" \
+    --indices 0,3 \
+    --max_steps 1 \
+    --save_every 1 \
+    --log_every 1 \
+    --grad_accum 1 \
+    --seed 42 \
+    --lora_rank 8 \
+    --lora_alpha 16 \
+    --new_lr 1e-4 \
+    --lora_lr 3e-5 \
+    --new_weight_decay 0.01 \
+    --grad_clip 1.0 \
+    --warmup_steps 0 \
+    --ema_decay 0.9995 \
+    --p_uncond 0 \
+    --t_logit_mean 1.0 \
+    --t_logit_std 1.0 \
+    --min_condition_views 2 \
+    --max_condition_views 2 \
+    --view_fusion_hidden_dim 64 \
+    --geometry_logit_scale_init 1.0 \
+    --amp_dtype bf16 \
+    --gradient_checkpointing
+fi
+
+echo "current terminal remains open"
+
+
+V2A. 审计 smoke：初始严格等价 Stock，融合参数获得真实梯度
+=============================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SMOKE_OUT=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/smoke2obj_step1_seed42_2gpu_v1
+
+${PY} -c '
+import json,math,sys,torch
+root=sys.argv[1]
+r=json.load(open(root+"/report.json"))
+c=torch.load(root+"/checkpoints/last.pt",map_location="cpu")
+a=r["initial_stock_audit"]; h=r["history"][-1]
+gates=[v for k,v in c["model_trainable_state"].items() if k.endswith("view_fusion.transition_gate_raw")]
+assert r["format"]=="pose_point_depth_mv.native_slat_genrecon.v3"
+assert r["completed"] is True and r["passed"] is True and r["step"]==1
+assert r["model_summary"]["optimization"]["world_size"]==2
+assert a["passed"] is True and a["conditional_max_abs"]==0.0 and a["unconditional_max_abs"]==0.0
+assert a["conditional_blocks"]==24 and a["view_fusion_blocks"]==24
+assert a["view_fusion_gate_max_abs"]==0.0
+assert len(gates)==1 and int(torch.count_nonzero(gates[0]).item())>0
+assert math.isfinite(float(h["gradient_norms"]["view_fusion"]))
+assert float(h["gradient_norms"]["view_fusion"])>0.0
+print(json.dumps({"passed":True,"initial_stock_audit":a,
+ "view_fusion_grad_norm":h["gradient_norms"]["view_fusion"],
+ "updated_gate_elements":int(torch.count_nonzero(gates[0]).item()),
+ "gate_abs_max":float(gates[0].abs().max())},indent=2))
+' "${SMOKE_OUT}"
+
+echo "current terminal remains open"
+
+
+V3. 启动 train868 / 2000-step Native-SLAT v3 长训（后台，推荐）
+=================================================================
+
+本节启动后会立即返回 shell；关闭终端不会停止训练。不要再运行另一个前台训练。
+默认只占两张 GPU。若输出目录已部分存在，使用 V3R，不要覆盖或删除。
+
+cd /home/zjr/Tracker
+
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+TRAIN_GPUS=${TRAIN_GPUS:-4,5}
+BASE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1
+RUN=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1
+TRAIN_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/train868_manifest.json
+SS_REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+TRAIN_OUT=${RUN}/train868_step2000_seed42_2gpu_v1
+UNIT=tracker-native-slat-v3-viewfusion-train2000-v1
+LOG=${RUN}/V3_train868_step2000_seed42_2gpu.log
+
+if [ "$(awk -F, '{print NF}' <<<"${TRAIN_GPUS}")" -ne 2 ]; then
+  echo "V3 blocked: TRAIN_GPUS must contain exactly two GPU ids"
+elif [ -s "${TRAIN_OUT}/report.json" ] && [ -s "${TRAIN_OUT}/checkpoints/step_002000.pt" ]; then
+  echo "reuse complete v3 training: ${TRAIN_OUT}"
+elif systemctl --user is-active --quiet "${UNIT}.service"; then
+  echo "already active: ${UNIT}.service"
+elif [ -e "${TRAIN_OUT}" ]; then
+  echo "V3 blocked: partial training exists; use V3R: ${TRAIN_OUT}"
+else
+  mkdir -p "${RUN}"
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property="StandardOutput=append:${LOG}" \
+    --property="StandardError=append:${LOG}" \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${TORCHRUN}" --standalone --nproc_per_node=2 \
+        -m pose_point_depth_mv.train_native_slat_genrecon \
+        --cache_manifest "${BASE}/cache_train868_seed42_v1/manifest.json" \
+        --lifting_cache_manifest "${TRAIN_LIFT}" \
+        --target_decoder_audit "${BASE}/target_decoder_audit32_v1/report.json" \
+        --native_ss_report "${SS_REPORT}" \
+        --stock_slat_freeze "${BASE}/stock_slat_freeze_v2.json" \
+        --output_dir "${TRAIN_OUT}" \
+        --max_steps 2000 \
+        --save_every 200 \
+        --log_every 10 \
+        --grad_accum 4 \
+        --seed 42 \
+        --lora_rank 8 \
+        --lora_alpha 16 \
+        --new_lr 1e-4 \
+        --lora_lr 3e-5 \
+        --new_weight_decay 0.01 \
+        --grad_clip 1.0 \
+        --warmup_ratio 0.02 \
+        --ema_decay 0.9995 \
+        --p_uncond 0.1 \
+        --t_logit_mean 1.0 \
+        --t_logit_std 1.0 \
+        --min_condition_views 1 \
+        --max_condition_views 16 \
+        --view_fusion_hidden_dim 64 \
+        --geometry_logit_scale_init 1.0 \
+        --amp_dtype bf16 \
+        --gradient_checkpointing
+fi
+
+echo "current terminal remains open"
+
+
+V3M. 监视长训进度
+=================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native-slat-v3-viewfusion-train2000-v1.service || true; printf "latest checkpoint: "; find /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/train868_step2000_seed42_2gpu_v1/checkpoints -maxdepth 1 -name "step_*.pt" -printf "%f\n" 2>/dev/null | sort | tail -n 1; tail -n 5 /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/V3_train868_step2000_seed42_2gpu.log 2>/dev/null || true'
+
+
+V3R. 长训被外部中断后从 last.pt 继续（不要从头重训）
+========================================================
+
+只有 TRAIN_OUT 已存在、report.json 不完整、last.pt 存在时运行本节。恢复时所有训练参数，
+包括 max_steps=2000 和两卡 world size，必须与 V3 完全一致。
+
+cd /home/zjr/Tracker
+
+TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+TRAIN_GPUS=${TRAIN_GPUS:-4,5}
+BASE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1
+RUN=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1
+TRAIN_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/train868_manifest.json
+SS_REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+TRAIN_OUT=${RUN}/train868_step2000_seed42_2gpu_v1
+RESUME=${TRAIN_OUT}/checkpoints/last.pt
+UNIT=tracker-native-slat-v3-viewfusion-train2000-resume-v1
+LOG=${RUN}/V3R_train868_step2000_seed42_2gpu_resume.log
+
+if [ "$(awk -F, '{print NF}' <<<"${TRAIN_GPUS}")" -ne 2 ]; then
+  echo "V3R blocked: TRAIN_GPUS must contain exactly two GPU ids"
+elif [ -s "${TRAIN_OUT}/report.json" ] && [ -s "${TRAIN_OUT}/checkpoints/step_002000.pt" ]; then
+  echo "training already complete: ${TRAIN_OUT}"
+elif [ ! -s "${RESUME}" ]; then
+  echo "V3R blocked: resume checkpoint missing: ${RESUME}"
+elif systemctl --user is-active --quiet "${UNIT}.service"; then
+  echo "already active: ${UNIT}.service"
+else
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property="StandardOutput=append:${LOG}" \
+    --property="StandardError=append:${LOG}" \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${TORCHRUN}" --standalone --nproc_per_node=2 \
+        -m pose_point_depth_mv.train_native_slat_genrecon \
+        --cache_manifest "${BASE}/cache_train868_seed42_v1/manifest.json" \
+        --lifting_cache_manifest "${TRAIN_LIFT}" \
+        --target_decoder_audit "${BASE}/target_decoder_audit32_v1/report.json" \
+        --native_ss_report "${SS_REPORT}" \
+        --stock_slat_freeze "${BASE}/stock_slat_freeze_v2.json" \
+        --output_dir "${TRAIN_OUT}" \
+        --resume "${RESUME}" \
+        --max_steps 2000 \
+        --save_every 200 \
+        --log_every 10 \
+        --grad_accum 4 \
+        --seed 42 \
+        --lora_rank 8 \
+        --lora_alpha 16 \
+        --new_lr 1e-4 \
+        --lora_lr 3e-5 \
+        --new_weight_decay 0.01 \
+        --grad_clip 1.0 \
+        --warmup_ratio 0.02 \
+        --ema_decay 0.9995 \
+        --p_uncond 0.1 \
+        --t_logit_mean 1.0 \
+        --t_logit_std 1.0 \
+        --min_condition_views 1 \
+        --max_condition_views 16 \
+        --view_fusion_hidden_dim 64 \
+        --geometry_logit_scale_init 1.0 \
+        --amp_dtype bf16 \
+        --gradient_checkpointing
+fi
+
+echo "current terminal remains open"
+
+
+V4. 审计 2000-step checkpoint 与训练机制
+=========================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+TRAIN_OUT=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/train868_step2000_seed42_2gpu_v1
+
+${PY} -c '
+import json,math,sys,torch
+root=sys.argv[1]
+r=json.load(open(root+"/report.json"))
+c=torch.load(root+"/checkpoints/step_002000.pt",map_location="cpu")
+a=r["initial_stock_audit"]; fusion=r["model_summary"]["context_view_fusion"]
+gates=[v for k,v in c["ema_trainable_state"].items() if k.endswith("view_fusion.transition_gate_raw")]
+assert r["format"]=="pose_point_depth_mv.native_slat_genrecon.v3"
+assert r["completed"] is True and r["passed"] is True and r["step"]==2000
+assert c["step"]==2000 and c["format"]==r["format"]
+assert r["model_summary"]["optimization"]["world_size"]==2
+assert fusion["version"]=="per_block_cross_result_mlp_plus_pose_dino_zero_init_stock_mean.v1"
+assert fusion["scope"]=="Full branch only; frozen Stock retains released uniform mean"
+assert a["passed"] is True and a["conditional_max_abs"]==0.0 and a["unconditional_max_abs"]==0.0
+assert len(gates)==1 and bool(torch.isfinite(gates[0]).all())
+for row in r["history"]:
+    for key in ("flow_loss","stock_loss","gain","gradient_norm_before_clip"):
+        assert math.isfinite(float(row[key]))
+assert max(float(x["gradient_norms"]["view_fusion"]) for x in r["history"])>0.0
+print(json.dumps({"passed":True,"step":r["step"],"initial_stock_audit":a,
+ "fusion":fusion,"ema_gate_min":float(gates[0].min()),"ema_gate_max":float(gates[0].max()),
+ "last_history":r["history"][-1]},indent=2))
+' "${TRAIN_OUT}"
+
+echo "current terminal remains open"
+
+
+V5. 先跑 6-object / seed42 同坐标同噪声 Mesh 开发评估（后台）
+================================================================
+
+这是快速方向检查，不是正式科学门。Full 与 Stock 使用相同 Native SS 坐标、相同初始
+噪声、相同 sampler 和相同 frozen decoder；唯一差异是 Native-SLAT v3 Full。
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-5}
+BASE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1
+RUN=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1
+TRAIN_OUT=${RUN}/train868_step2000_seed42_2gpu_v1
+VAL_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+SS_REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+EVAL=${RUN}/val6_seed42_step2000_ema_v1
+UNIT=tracker-native-slat-v3-viewfusion-mesh6-v1
+LOG=${RUN}/V5_val6_seed42_step2000_ema.log
+
+if [ -s "${EVAL}/report.json" ]; then
+  echo "reuse complete Mesh6: ${EVAL}/report.json"
+elif systemctl --user is-active --quiet "${UNIT}.service"; then
+  echo "already active: ${UNIT}.service"
+elif [ -e "${EVAL}" ]; then
+  echo "V5 blocked: partial evaluation exists; preserve it and change EVAL to a new v2 directory"
+else
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property="StandardOutput=append:${LOG}" \
+    --property="StandardError=append:${LOG}" \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.evaluate_native_slat_genrecon_mesh \
+        --cache_manifest "${BASE}/cache_val64_seed424344_v1/manifest.json" \
+        --lifting_cache_manifest "${VAL_LIFT}" \
+        --checkpoint "${TRAIN_OUT}/checkpoints/step_002000.pt" \
+        --native_ss_report "${SS_REPORT}" \
+        --stock_slat_freeze "${BASE}/stock_slat_freeze_v2.json" \
+        --output_dir "${EVAL}" \
+        --weights ema \
+        --joint_seeds 42 \
+        --max_objects 6 \
+        --surface_samples 20000 \
+        --bootstrap_samples 5000 \
+        --require_complete_matrix
+fi
+
+echo "current terminal remains open"
+
+
+V5M. 监视 Mesh6 进度
+====================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native-slat-v3-viewfusion-mesh6-v1.service || true; printf "Mesh pairs: "; find /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/val6_seed42_step2000_ema_v1/mesh_pairs -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l; tail -n 5 /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/V5_val6_seed42_step2000_ema.log 2>/dev/null || true'
+
+
+V6. 查看 Mesh6 结果；只决定是否值得跑完整 32x3
+===================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+REPORT=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/val6_seed42_step2000_ema_v1/report.json
+
+${PY} -c '
+import json,sys
+r=json.load(open(sys.argv[1])); s=r["summary"]
+assert r["format"]=="pose_point_depth_mv.native_slat_genrecon_mesh.v3"
+assert r["passed"] is True and r["object_count"]==6 and r["record_count"]==6
+print(json.dumps({"passed":True,"formal":r["formal"],"baseline":r["run_config"]["baseline"],
+ "objects":r["object_count"],"records":r["record_count"],"summary":s,
+ "scope_guard":r["scope_guard"]},indent=2,ensure_ascii=False))
+' "${REPORT}"
+
+echo "判读：优先看 chamfer mean/median/win；6 例只作开发诊断，不能形成科学结论。"
+echo "current terminal remains open"
+
+
+V7. Mesh6 有正向信号后，跑 val32 / seeds 42,43,44 完整开发评估（后台）
+============================================================================
+
+如果 Mesh6 明显全面退化，先不要运行本节；先分析 v3 checkpoint。完整评估共 96 对。
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-5}
+BASE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1
+RUN=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1
+TRAIN_OUT=${RUN}/train868_step2000_seed42_2gpu_v1
+VAL_LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+SS_REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+EVAL=${RUN}/val32_seed424344_step2000_ema_v1
+UNIT=tracker-native-slat-v3-viewfusion-mesh32x3-v1
+LOG=${RUN}/V7_val32_seed424344_step2000_ema.log
+
+if [ -s "${EVAL}/report.json" ]; then
+  echo "reuse complete Mesh32x3: ${EVAL}/report.json"
+elif systemctl --user is-active --quiet "${UNIT}.service"; then
+  echo "already active: ${UNIT}.service"
+elif [ -e "${EVAL}" ]; then
+  echo "V7 blocked: partial evaluation exists; preserve it and change EVAL to a new v2 directory"
+else
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property="StandardOutput=append:${LOG}" \
+    --property="StandardError=append:${LOG}" \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.evaluate_native_slat_genrecon_mesh \
+        --cache_manifest "${BASE}/cache_val64_seed424344_v1/manifest.json" \
+        --lifting_cache_manifest "${VAL_LIFT}" \
+        --checkpoint "${TRAIN_OUT}/checkpoints/step_002000.pt" \
+        --native_ss_report "${SS_REPORT}" \
+        --stock_slat_freeze "${BASE}/stock_slat_freeze_v2.json" \
+        --output_dir "${EVAL}" \
+        --weights ema \
+        --joint_seeds 42,43,44 \
+        --max_objects 32 \
+        --surface_samples 20000 \
+        --bootstrap_samples 5000 \
+        --require_complete_matrix
+fi
+
+echo "current terminal remains open"
+
+
+V7M. 监视 32x3 Mesh 进度
+========================
+
+watch -n 20 'date -u; systemctl --user is-active tracker-native-slat-v3-viewfusion-mesh32x3-v1.service || true; printf "Mesh pairs: "; find /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/val32_seed424344_step2000_ema_v1/mesh_pairs -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l; tail -n 5 /data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/V7_val32_seed424344_step2000_ema.log 2>/dev/null || true'
+
+
+V8. 输出完整 32x3 Full-vs-Stock 量化结果
+=========================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+REPORT=/data/zjr/native_slat_viewfusion_v3_mixed1k_20260803_v1/val32_seed424344_step2000_ema_v1/report.json
+
+${PY} -c '
+import json,sys
+r=json.load(open(sys.argv[1])); s=r["summary"]
+assert r["format"]=="pose_point_depth_mv.native_slat_genrecon_mesh.v3"
+assert r["passed"] is True and r["formal"] is False
+assert r["object_count"]==32 and r["record_count"]==96
+assert r["run_config"]["same_native_ss_coordinates"] is True
+assert r["run_config"]["same_initial_noise"] is True
+primary=s["chamfer_l1_improvement"]
+diagnosis={
+ "mean_positive":float(primary["mean"])>0,
+ "median_positive":float(primary["median"])>0,
+ "win_rate_ge_half":float(primary["positive_rate"])>=0.5,
+ "bootstrap_lower_positive":float(primary["bootstrap_mean_95_ci"][0])>0,
+}
+print(json.dumps({"passed":True,"formal":False,
+ "baseline":r["run_config"]["baseline"],"objects":32,"records":96,
+ "summary":s,"development_diagnosis":diagnosis,"scope_guard":r["scope_guard"]},
+ indent=2,ensure_ascii=False))
+' "${REPORT}"
+
+echo "注意：V8 是架构开发评估，不是 untouched holdout 正式结论。"
+echo "若均值/中位数/win 均正且 CI 下界仍跨 0，可称正向趋势但不能称显著。"
+echo "只有先完成架构与 checkpoint 选择，才冻结新的 untouched protocol。"
+echo "current terminal remains open"

@@ -1,0 +1,1109 @@
+ProObjaverse official Train2000 with-VGGT Native-SS
+构建、2K fresh训练与Dev64评测命令（2026-08-17）
+======================================================================
+
+最简执行入口
+------------
+
+P0、P2、P4已通过。旧P5是与当前8卡SLat共享GPU导致的受污染失败，
+不删除、不resume。下面的单一后台入口可以在SLat仍训练时立即启动：
+它只每60秒检查一次，不抢GPU；SLat完全退出且8张卡均空闲后，自动依次执行：
+
+  独占P5重测
+  -> P6 Train2000+Dev64 cache
+  -> P7合同守卫
+  -> P8 fresh 8卡step2000
+  -> P10/P11 VSS CFG校准与held-out Dev48
+  -> P13 Dev64 with-VGGT SLat sidecar
+  -> P15 step10000、step15000的Train64+Dev48 predicted-support端点评测
+
+任一阶段失败都会硬停，不会跳过失败门继续训练。
+
+  cd /home/zjr/Tracker
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  mkdir -p "${RUN}/logs"
+  test -z "$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^vggtsspipeline$' || true)"
+  tmux new-session -d -s vggtsspipeline \
+    "bash -lc 'cd /home/zjr/Tracker && exec bash official_ss_with_vggt_perf_v1/run_source_p5retry_p6_p7_p8_pipeline.sh >> /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P5retry_P6_P17_pipeline_v2.log 2>&1'"
+
+  echo "P5-retry/P6--P17 training+evaluation pipeline launched"
+
+这是推荐的唯一主入口；下方P6--P17的单独命令仍保留作审计与失败恢复说明。
+
+
+一、这条路线到底训练什么
+======================================================================
+
+定义：
+
+VSS0 = ReconViaGen原生VGGT+DINOv2的 sparse_structure_vggt_cond
+       + frozen Stock SS Flow
+
+VSS  = VSS0
+       + 当前Native-SS v2的known-pose posed-DINO 16^3条件
+       + 每个SS Flow block前的zero-init projection
+       + attention LoRA rank8/alpha16
+
+本次只改变 Stock SS cross-attention 的输入context：
+
+  no-VGGT旧路线 stock_condition
+    -> native ReconViaGen get_ss_cond()产生的 ss_vggt_cond
+
+严格保持不变：
+
+- official Train2000/Dev64对象和顺序；
+- 每对象冻结的相同8个view_ids；
+- official SS target；
+- posed-DINO visual features；
+- official known K/T；
+- VGGT预测camera/depth不进入训练；
+- Native-SS v2 flow architecture、loss、LoRA、LR、EMA、随机1--8 views；
+- per-rank batch=1，8卡grad_accum=1，global effective batch=8。
+
+重要：SS与SLat的原生VGGT context不是同一种张量。
+
+- SS必须使用 `get_ss_cond()` / `sparse_structure_vggt_cond`，形状固定为
+  `[1,4096,1024]`；
+- SLat使用 `get_slat_cond()` / `slat_vggt_cond`，不能拿来代替SS sidecar。
+
+训练必须fresh Stock-equivalent初始化：
+
+- 禁止resume旧no-VGGT Native-SS；
+- 禁止使用旧mixed checkpoint作`--init_checkpoint`；
+- 新optimizer、EMA、step和RNG轨迹全部从零开始；
+- step0的数值基线必须是VSS0，而不是no-VGGT Stock floor。
+
+`2000 steps`是基于前一条official SS经验冻结的首轮预算，不是预先保证的最优点。
+最终仍以Dev16校准 + Dev48 held-out结果决定是否需要继续。
+
+
+二、代码和不可变输入
+======================================================================
+
+新增隔离包（没有覆盖旧SS/SLat代码）：
+
+  official_ss_with_vggt_perf_v1/
+    build_cache.py
+    cache.py
+    model.py
+    train.py
+    evaluate.py
+    aggregate.py
+    test_contract.py
+    run_build_cache_8gpu.sh
+    run_train_8gpu.sh
+    run_eval_dev48_6gpu.sh
+    run_source_build_full_caches_after_slat.sh
+    run_source_train2000_after_slat.sh
+
+既有不可变输入：
+
+  Train split:
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+    protocol2128_train2000_v1/train.json
+  SHA256 7fbd29775086af7f46c17bb60a7e78e5f9907e3587a177df16c4fcc467ddf6b7
+
+  Dev split:
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+    protocol2128_train2000_v1/dev.json
+  SHA256 21d390e0a578f4adbd9920238a15f8d0d85457a835076331928afb1dcf4be065
+
+  official SS Train2000 base manifest:
+  /data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/
+    cache_train2000_official_ss_v1/lifting_manifest.json
+  SHA256 e9bd192fa71bfe9687450746193c7a861723650ef2fd22a5576be9e01e1e823b
+
+  official SS Dev64 base manifest:
+  /data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/
+    cache_dev64_official_ss_v1/lifting_manifest.json
+  SHA256 0c8b33bfb65d8f2084de72a8d00ca3430147fb06a39ad73321ce51b098aa980d
+
+新sidecar只增加native SS VGGT context，不复制/改写上面base cache。
+
+
+P0. CPU/static快速回归（现在也可执行；不占GPU）
+======================================================================
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  source /home/zjr/anaconda3/etc/profile.d/conda.sh
+  conda activate reconviagen
+  export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" -m unittest -v official_ss_with_vggt_perf_v1.test_contract
+
+  "${PY}" -m py_compile \
+    official_ss_with_vggt_perf_v1/__init__.py \
+    official_ss_with_vggt_perf_v1/cache.py \
+    official_ss_with_vggt_perf_v1/model.py \
+    official_ss_with_vggt_perf_v1/train.py \
+    official_ss_with_vggt_perf_v1/evaluate.py \
+    official_ss_with_vggt_perf_v1/aggregate.py \
+    official_ss_with_vggt_perf_v1/build_cache.py \
+    official_ss_with_vggt_perf_v1/test_contract.py
+
+  for F in official_ss_with_vggt_perf_v1/run_*.sh; do
+    bash -n "${F}"
+  done
+)
+P0_RC=$?
+echo "P0_RC=${P0_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P1. 当前SLat结束后的资源守卫
+======================================================================
+
+cd /home/zjr/Tracker
+
+echo "===== trainer processes ====="
+pgrep -af 'official_slat_with_vggt_perf_v1|official_ss_with_vggt_perf_v1|torchrun' || true
+
+echo "===== GPU state ====="
+nvidia-smi \
+  --query-gpu=index,name,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+
+只有确认当前SLat已经正常写完report/checkpoint、相关torchrun已退出、计划使用的GPU空闲，
+才继续。不要为了本路线中止仍在正常运行的SLat训练。
+
+
+P2. 单卡构建8对象真实sidecar smoke
+======================================================================
+
+注意：旧输出 `cache_train8_official_ss_with_vggt_sidecar_smoke_v1`
+是轻量手工pipeline loader的失败证据（P2_RC=91，DINO replay mismatch）；
+`cache_train8_official_ss_with_vggt_sidecar_historical_v2_fix1_v1`则已经证明
+历史Native-SS v2 loader与DINO replay通过，但在第一条sidecar落盘后因退役
+内联实现的旧`del` 变量名触发`UnboundLocalError`。两个失败目录都不得
+删除、resume或作为新smoke输入。下面fix2仍直接复用第91/93章
+Native-SS v2已验证的 `build_native_stock_pipeline()` 和
+`extract_stock_condition()` 生产路径，只修复物化函数末尾的局部引用清理；
+official新代码只适配split/tar/view/pair identity。
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  OUT=${RUN}/cache_train8_official_ss_with_vggt_sidecar_historical_v2_fix2_v1
+  test ! -e "${OUT}"
+  mkdir -p "${RUN}/logs"
+
+  SPLIT_MANIFEST=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/protocol2128_train2000_v1/train.json \
+  BASE_MANIFEST=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/cache_train2000_official_ss_v1/lifting_manifest.json \
+  OUTPUT_DIR="${OUT}" \
+  BUILD_GPUS=0 \
+  MAX_OBJECTS=8 \
+  PROJECT_ROOT=/home/zjr/Tracker \
+    bash official_ss_with_vggt_perf_v1/run_build_cache_8gpu.sh \
+    2>&1 | tee "${RUN}/logs/cache_train8_historical_v2_fix2_v1.log"
+)
+P2_RC=$?
+echo "P2_RC=${P2_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P3. 检查8对象cache合同
+======================================================================
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REPORT=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/cache_train8_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/report.json
+  test -s "${REPORT}"
+  "${PY}" - "${REPORT}" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+assert r["passed"] is True and r["complete"] is True
+assert r["object_count"] == 8
+assert r["vggt_forward_call_count"] == 8
+assert r["vggt_model_executed"] is True
+assert r["vggt_camera_consumed"] is False
+assert r["known_K_T_replaced"] is False
+assert r["official_ss_target_changed"] is False
+assert r["base_cache_rewritten"] is False
+assert r["sidecar_contract"]["context_semantics"]["output_layout"] == "[1,4096,1024]"
+assert "get_ss_cond" in r["sidecar_contract"]["context_semantics"]["producer"]
+print(json.dumps({
+    "passed": True,
+    "objects": r["object_count"],
+    "pair_identity": r["pair_identity"],
+    "sidecar_bytes": r["sidecar_bytes"],
+    "manifest": r["manifest"],
+}, indent=2, ensure_ascii=False))
+PY
+)
+P3_RC=$?
+echo "P3_RC=${P3_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P4. 1 GPU / 2 optimizer-step CUDA smoke
+======================================================================
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  source /home/zjr/anaconda3/etc/profile.d/conda.sh
+  conda activate reconviagen
+  export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+  export ATTN_BACKEND=flash_attn SPCONV_ALGO=native
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  CACHE=${RUN}/cache_train8_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/with_vggt_ss_manifest.json
+  # 旧smoke_v1保留为sidecar count-mismatch证据；旧
+  # smoke_subset_fix1_v1保留为历史straight-through浮点1-ULP证据。
+  # 二者都不删除、不resume。
+  OUT=${RUN}/VSS_train8_step2_seed42_1gpu_smoke_step0exact_v2_v1
+  test -s "${CACHE}"
+  test ! -e "${OUT}"
+
+  CUDA_VISIBLE_DEVICES=0 "${PY}" -u -m official_ss_with_vggt_perf_v1.train \
+    --allow_short_smoke \
+    --cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --max_steps 2 \
+    --save_every 1 \
+    --log_every 1 \
+    --grad_accum 8 \
+    --num_workers 0
+
+  test -s "${OUT}/checkpoints/step_000002.pt"
+  test -s "${OUT}/report.json"
+)
+P4_RC=$?
+echo "P4_RC=${P4_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P5. 2 GPU DDP / 2 optimizer-step CUDA smoke
+======================================================================
+
+目的：真实验证 DDP(device_ids=None)、CPU lifting payload、梯度all-reduce、
+global effective batch=2 GPUs x grad_accum4=8 和新checkpoint identity。
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  source /home/zjr/anaconda3/etc/profile.d/conda.sh
+  conda activate reconviagen
+  export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+  export ATTN_BACKEND=flash_attn SPCONV_ALGO=native
+
+  TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  CACHE=${RUN}/cache_train8_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/with_vggt_ss_manifest.json
+  OUT=${RUN}/VSS_train8_step2_seed42_2gpu_ddp_smoke_step0exact_v2_v1
+  test -s "${CACHE}"
+  test ! -e "${OUT}"
+
+  CUDA_VISIBLE_DEVICES=0,1 "${TORCHRUN}" --standalone --nproc_per_node=2 \
+    -m official_ss_with_vggt_perf_v1.train \
+    --allow_short_smoke \
+    --cache_manifest "${CACHE}" \
+    --output_dir "${OUT}" \
+    --max_steps 2 \
+    --save_every 1 \
+    --log_every 1 \
+    --grad_accum 4 \
+    --num_workers 0
+
+  test -s "${OUT}/checkpoints/step_000002.pt"
+  test -s "${OUT}/report.json"
+)
+P5_RC=$?
+echo "P5_RC=${P5_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P6--P17. 一条后台训练+评测流水线（含独占P5重测）
+======================================================================
+
+cd /home/zjr/Tracker
+
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+mkdir -p "${RUN}/logs"
+
+tmux new-session -d -s vggtsspipeline \
+  "bash -lc 'cd /home/zjr/Tracker && exec bash official_ss_with_vggt_perf_v1/run_source_p5retry_p6_p7_p8_pipeline.sh >> ${RUN}/logs/P5retry_P6_P17_pipeline_v2.log 2>&1'"
+
+echo "full pipeline launched"
+
+当前旧P5输出：
+
+  VSS_train8_step2_seed42_2gpu_ddp_smoke_step0exact_v2_v1
+
+永久保留为共享GPU时`CUBLAS_STATUS_EXECUTION_FAILED`证据。流水线改用新目录：
+
+  VSS_train8_step2_seed42_2gpu_ddp_smoke_step0exact_v2_exclusive_v1
+
+它严格检查P4 report，等待所有SLat/SS trainer退出且GPU0--7每卡显存
+不高于1024 MiB，再用GPU0,1做2-step P5。P5未PASS时P6绝不启动。
+
+独占P5通过后：
+
+1. P6用8卡顺序构建Train2000和Dev64 sidecar；
+2. P7硬检查2000/64对象、VGGT call count、known K/T、pair identity和不可变base；
+3. cache worker退出后再等GPU释放；
+4. P8从Stock-equivalent fresh初始化训练step0->2000，保存500/1000/1500/2000；
+5. 训练退出后自动做原P9的report/checkpoint完整性守卫；
+6. P10在Dev[0:16]冻结CFG，P11在不重叠Dev[16:64]做VSS直接评测；
+7. P13构建冻结Dev64 with-VGGT SLat sidecar；
+8. P15默认先跑V step10000，再跑step15000；每个step先Train64后Dev48；
+9. 两个SLat step都只用VSS0/VSS predicted support，official GT只作为量化target。
+
+整个P6--P17不需要人工在cache、SS训练或任一评测结束后再输入第二条命令。
+科学门`passed=false`会保留为负结果并继续；只有程序、identity、record matrix或
+Stock-equivalence完整性失败才会中止流水线。
+
+
+P6--P17M. 监视
+======================================================================
+
+总日志（等待、P5、cache、训练均在同一文件）：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P5retry_P6_P17_pipeline_v2.log
+
+当前阶段：
+
+  watch -n 20 'date -u; cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P5retry_P6_P17_pipeline_v2.status 2>/dev/null || true; echo; cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_v1.status 2>/dev/null || true'
+
+cache worker：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/cache_train2000_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/logs/worker_*_gpu*.log
+
+P8训练日志：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1.log
+
+综合监视：
+
+  watch -n 20 'date -u
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  OUT=${RUN}/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1
+  printf "latest checkpoint: "
+  find "${OUT}/checkpoints" -maxdepth 1 -name "step_*.pt" -printf "%f\n" 2>/dev/null | sort | tail -n 1
+  tail -n 4 "${RUN}/logs/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1.log" 2>/dev/null || true
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits'
+
+查看整条流水线tmux：
+
+  tmux attach -t vggtsspipeline
+
+正常等待SLat或长时间训练时不要按Ctrl-C。终态查看：
+
+  cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P5retry_P6_P17_pipeline_v2.exit_code
+
+评测子流水线终态和汇总：
+
+  cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P10_P17_posttrain_eval_v1.exit_code
+  cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/P10_P17_posttrain_eval_v1_summary.json
+
+
+P6-R. worker3初始化期异常退出后的定向恢复（2026-08-17）
+======================================================================
+
+已确认的失败现场：
+
+- Train2000中worker0/1/2/4/5/6/7均已完成250/250；
+- 现有1750个完整record/sidecar；
+- logical worker3在VGGT/DINO/TRELLIS初始化期异常退出，尚未进入第一个对象；
+- 旧失败日志必须保留，不删除partial cache，不重建已完成的1750个对象。
+
+重要：分片归属由`--worker_index 3 --worker_count 8`决定，
+与实际使用哪张物理GPU无关。`REPAIR_GPU`可改为任意空闲卡，
+但logical worker index必须保持3/8。
+
+
+P6-R1. 只补logical worker3的250个对象
+----------------------------------------------------------------------
+
+先检查GPU：
+
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits
+
+默认使用物理GPU3；如GPU3已被占用，只修改`REPAIR_GPU`，
+不要修改`worker_index=3`/`worker_count=8`：
+
+cd /home/zjr/Tracker
+set +e
+
+(
+set -euo pipefail
+
+source /home/zjr/anaconda3/etc/profile.d/conda.sh
+conda activate reconviagen
+
+export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+export ATTN_BACKEND=flash_attn
+export SPCONV_ALGO=native
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+SLAT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+BASE_SS=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+
+SPLIT=${SLAT}/protocol2128_train2000_v1/train.json
+BASE=${BASE_SS}/cache_train2000_official_ss_v1/lifting_manifest.json
+OUT=${RUN}/cache_train2000_official_ss_with_vggt_sidecar_historical_v2_fix2_v1
+
+REPAIR_GPU=3
+LOG=${OUT}/logs/worker_03_gpu${REPAIR_GPU}_retry1.log
+SHARD=${OUT}/shards/worker_03_of_08.json
+
+test -d "${OUT}"
+test ! -e "${LOG}"
+
+CUDA_VISIBLE_DEVICES="${REPAIR_GPU}" \
+"${PY}" -u -m official_ss_with_vggt_perf_v1.build_cache \
+  --mode materialize \
+  --split_manifest "${SPLIT}" \
+  --base_manifest "${BASE}" \
+  --output_dir "${OUT}" \
+  --expected_selected_views 8 \
+  --max_objects 0 \
+  --worker_index 3 \
+  --worker_count 8 \
+  --device cuda:0 \
+  2>&1 | tee "${LOG}"
+
+"${PY}" - "${SHARD}" <<'PY'
+import json
+import sys
+
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+assert r["passed"] is True
+assert r["worker_index"] == 3
+assert r["worker_count"] == 8
+assert r["assigned_object_count"] == 250
+assert r["materialized_object_count"] + r["reused_object_count"] == 250
+assert len(r["records"]) == 250
+print({
+    "passed": True,
+    "worker": "3/8",
+    "objects": len(r["records"]),
+    "materialized": r["materialized_object_count"],
+    "reused": r["reused_object_count"],
+})
+PY
+)
+
+W3_RC=$?
+echo "W3_RC=${W3_RC} (0=PASS)"
+echo "current terminal remains open"
+
+如`retry1.log`已经存在且需要第二次重试，改为`retry2.log`，
+不要覆盖第一次retry证据。
+
+
+P6-R1M. worker3进度监视
+----------------------------------------------------------------------
+
+  OUT=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/cache_train2000_official_ss_with_vggt_sidecar_historical_v2_fix2_v1
+
+  watch -n 20 "
+  date -u
+  printf 'completed records: '
+  find '${OUT}/records' -type f -name '*.json' | wc -l
+  tail -n 3 '${OUT}/logs/worker_03_gpu3_retry1.log'
+  "
+
+record数应从1750逐步增长到2000。worker3成功时`W3_RC=0`，
+且生成：
+
+  ${OUT}/shards/worker_03_of_08.json
+
+
+P6-R2. finalize Train2000 immutable manifest
+----------------------------------------------------------------------
+
+只有P6-R1返回`W3_RC=0`后才执行：
+
+cd /home/zjr/Tracker
+set +e
+
+(
+set -euo pipefail
+
+export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SLAT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+BASE_SS=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+
+OUT=${RUN}/cache_train2000_official_ss_with_vggt_sidecar_historical_v2_fix2_v1
+
+"${PY}" -u -m official_ss_with_vggt_perf_v1.build_cache \
+  --mode finalize \
+  --split_manifest "${SLAT}/protocol2128_train2000_v1/train.json" \
+  --base_manifest "${BASE_SS}/cache_train2000_official_ss_v1/lifting_manifest.json" \
+  --output_dir "${OUT}" \
+  --expected_selected_views 8 \
+  --max_objects 0 \
+  2>&1 | tee "${OUT}/logs/finalize_retry1.log"
+
+test -s "${OUT}/with_vggt_ss_manifest.json"
+test -s "${OUT}/report.json"
+)
+
+FINALIZE_RC=$?
+echo "TRAIN_FINALIZE_RC=${FINALIZE_RC} (0=PASS)"
+echo "current terminal remains open"
+
+finalize会用CPU读取并校验全部2000个sidecar，这个阶段GPU空闲
+是正常现象，不要因为GPU利用率为0就中止。
+
+
+P6-R3. 构建尚未开始的Dev64 cache
+----------------------------------------------------------------------
+
+为降低8个重型pipeline同时初始化的瞬时host压力，Dev64使用4张空闲卡。
+worker count不进入最终sidecar/cache科学identity；如GPU0--3不空闲，
+可将`BUILD_GPUS`换成其他4张空闲卡。
+
+cd /home/zjr/Tracker
+set +e
+
+(
+set -euo pipefail
+
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+SLAT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+BASE_SS=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+DEV_OUT=${RUN}/cache_dev64_official_ss_with_vggt_sidecar_historical_v2_fix2_v1
+
+SPLIT_MANIFEST="${SLAT}/protocol2128_train2000_v1/dev.json" \
+BASE_MANIFEST="${BASE_SS}/cache_dev64_official_ss_v1/lifting_manifest.json" \
+OUTPUT_DIR="${DEV_OUT}" \
+BUILD_GPUS=0,1,2,3 \
+PROJECT_ROOT=/home/zjr/Tracker \
+PYTHON=/home/zjr/anaconda3/envs/reconviagen/bin/python \
+  bash official_ss_with_vggt_perf_v1/run_build_cache_8gpu.sh \
+  2>&1 | tee "${RUN}/logs/P6_dev64_retry1.log"
+
+RUN_ROOT="${RUN}" \
+PROJECT_ROOT=/home/zjr/Tracker \
+PYTHON=/home/zjr/anaconda3/envs/reconviagen/bin/python \
+  bash official_ss_with_vggt_perf_v1/validate_full_caches.sh
+)
+
+P6_REPAIR_RC=$?
+echo "P6_REPAIR_RC=${P6_REPAIR_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P6-R4. 两套cache PASS后恢复P7--P17流水线
+----------------------------------------------------------------------
+
+下面使用新tmux名和新log，不覆盖worker3失败时的旧日志。
+流水线将复用已PASS的P5，检测Train2000/Dev64两个report后跳过P6重建，
+然后继续P7验证、P8训练和后续评测。
+
+cd /home/zjr/Tracker
+
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+
+tmux new-session -d -s vggtsspipeline_retry1 \
+  "bash -lc 'cd /home/zjr/Tracker && exec bash official_ss_with_vggt_perf_v1/run_source_p5retry_p6_p7_p8_pipeline.sh >> ${RUN}/logs/P5retry_P6_P17_pipeline_v2_retry1.log 2>&1'"
+
+echo "retry pipeline launched"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P5retry_P6_P17_pipeline_v2_retry1.log
+
+  watch -n 20 'date -u; cat /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P5retry_P6_P17_pipeline_v2.status 2>/dev/null || true'
+
+禁止操作：
+
+- 不要删除`cache_train2000_official_ss_with_vggt_sidecar_historical_v2_fix2_v1`；
+- 不要删除现有1750个record/sidecar；
+- 不要删除旧worker3失败log；
+- 不要对partial cache执行`test ! -e "${OUT}"`；
+- 不要直接用8个worker重跑Train2000，否则已完成worker也会先重新加载大模型。
+
+
+P9. step2000完成检查
+======================================================================
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  OUT=${RUN}/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1
+  LOG=${RUN}/logs/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1.log
+  test "$(cat "${LOG}.exit_code")" = 0
+  test -s "${OUT}/checkpoints/step_002000.pt"
+  test -s "${OUT}/report.json"
+
+  "${PY}" - "${OUT}/report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+assert r["format"] == "official_ss_with_vggt_perf_v1.native_ss_genrecon.v2"
+assert r["completed"] is True and r["passed"] is True and r["step"] == 2000
+assert r["global_micro_samples"] == 16000
+assert r["model_summary"]["stock_floor"] == "VSS0"
+assert r["model_summary"]["fresh_initialization_only"] is True
+assert r["model_summary"]["runtime_input_policy"]["ddp_device_ids"] is None
+assert r["model_summary"]["vggt_camera_consumed"] is False
+assert r["data_identity"]["object_count"] == 2000
+print(json.dumps({
+  "passed": True,
+  "step": r["step"],
+  "global_micro_samples": r["global_micro_samples"],
+  "elapsed_seconds": r["elapsed_seconds"],
+  "checkpoint": r["checkpoint"],
+  "pair_identity": r["data_identity"]["feature_contract"]["with_vggt_ss"]["pair_identity"],
+}, indent=2, ensure_ascii=False))
+PY
+)
+P9_RC=$?
+echo "P9_RC=${P9_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P10. Dev64前16对象冻结CFG校准（GPU0）
+======================================================================
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  source /home/zjr/anaconda3/etc/profile.d/conda.sh
+  conda activate reconviagen
+  export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+  export ATTN_BACKEND=flash_attn SPCONV_ALGO=native
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  DEV=${RUN}/cache_dev64_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/with_vggt_ss_manifest.json
+  CKPT=${RUN}/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1/checkpoints/step_002000.pt
+  CAL=${RUN}/dev64_VSS_step2000_calibrate0_16_seed424344_v1
+  test -s "${DEV}"
+  test -s "${CKPT}"
+  test ! -e "${CAL}"
+
+  CUDA_VISIBLE_DEVICES=0 "${PY}" -u -m official_ss_with_vggt_perf_v1.evaluate \
+    --mode calibrate \
+    --cache_manifest "${DEV}" \
+    --checkpoint "${CKPT}" \
+    --output_dir "${CAL}" \
+    --object_start 0 --object_end 16 \
+    --joint_seeds 42,43,44 \
+    --candidate_cfg_strengths 1,3,5 \
+    --weights ema --steps 25 --cfg_interval 0.5,1.0 \
+    --guidance_rescale 0.0 --rescale_t 3.0 --amp_dtype bf16 \
+    --min_iou_gain_mean -1 --min_recall_gain_mean -1 \
+    --min_latent_mse_gain_mean -1 --min_count_ratio 0.1 --max_count_ratio 10
+
+  test -s "${CAL}/calibration.json"
+)
+P10_RC=$?
+echo "P10_RC=${P10_RC} (0=program/calibration PASS)"
+echo "current terminal remains open"
+
+
+P11. 六卡评测未参与校准的Dev48并汇总
+======================================================================
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  RUN=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  CACHE_MANIFEST=${RUN}/cache_dev64_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/with_vggt_ss_manifest.json \
+  CHECKPOINT=${RUN}/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1/checkpoints/step_002000.pt \
+  CALIBRATION=${RUN}/dev64_VSS_step2000_calibrate0_16_seed424344_v1/calibration.json \
+  OUTPUT_ROOT=${RUN}/dev48_VSS_step2000_seed424344_6gpu_v1 \
+  EVAL_GPUS=0,1,2,3,4,5 \
+  PROJECT_ROOT=/home/zjr/Tracker \
+    bash official_ss_with_vggt_perf_v1/run_eval_dev48_6gpu.sh
+)
+P11_RC=$?
+echo "P11_RC=${P11_RC} (0=program完整；科学门见aggregate report/SCIENCE_RC)"
+echo "current terminal remains open"
+
+P11监视：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/dev48_VSS_step2000_seed424344_6gpu_v1/logs/shard*_gpu*.log
+
+
+P12. 输出held-out SS结果
+======================================================================
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+REPORT=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/dev48_VSS_step2000_seed424344_6gpu_v1/aggregate_v1/report.json
+test -s "${REPORT}"
+"${PY}" - "${REPORT}" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+print(json.dumps({
+  "passed": r["passed"],
+  "objects": r["object_count"],
+  "records": r["record_count"],
+  "summary": r["correct"]["summary"],
+  "pose_control": r["correct_over_pose_control_iou"],
+  "checks": r["checks"],
+  "deployment": r["deployment"],
+  "scope_guard": r["scope_guard"],
+}, indent=2, ensure_ascii=False))
+PY
+echo "current terminal remains open"
+
+
+三、结果能说明什么、还不能说明什么
+======================================================================
+
+P10/P11直接回答：
+
+  在完全相同native ss_vggt_cond下，
+  VSS（posed-DINO+LoRA）相对VSS0（with-VGGT Stock SS）的occupancy/latent增量。
+
+这比把旧no-VGGT Native-SS直接接到with-VGGT SLat更严格，因为SS自身的Stock
+cross-attention domain已经恢复为ReconViaGen原生VGGT+DINO context。
+
+它仍不能单独回答完整mesh端点是否更好。下一阶段应冻结：
+
+  VSS step2000 EMA + frozen CFG
+  -> 当前with-VGGT Native-SLat checkpoint
+  -> 同一Stock mesh decoder
+
+并在相同Dev48、相同seed、coordinate-keyed noise下，与N/N0/V0/R做paired mesh比较。
+该下游bridge必须是独立评测，不能把SS occupancy gate直接写成完整mesh结论。
+
+
+四、失败时的安全边界
+======================================================================
+
+- cache worker失败：保留输出和日志；原命令可resume完整对象，但不要手改sidecar/record；
+- 1/2GPU smoke失败：保留独立smoke目录，不要拿它resume正式训练；
+- 正式训练失败：只有checkpoint identity和resume合同核对通过后才可resume；
+- Dev science RC=3：表示预注册科学门未过，不是程序崩溃；
+- 任何阶段都不要修改旧no-VGGT cache/checkpoint/report或正在训练的with-VGGT SLat资产；
+- 目前状态只能写“CPU/static ready；等待真实cache/CUDA smoke”，smoke真实通过后再升级结论。
+
+
+五、VSS step2000 + with-VGGT SLat 的 Train64 / Dev48 predicted-support Mesh评测
+======================================================================
+
+这一节在with-VGGT SS与SLat训练、P10校准、P11 Dev48 SS评测全部完成后运行。
+
+本节不运行任何“GT support作为SLat输入”的分支。三条固定分支是：
+
+  A = VSS0 predicted support -> V0 Stock SLat
+  B = VSS  predicted support -> V0 Stock SLat
+  C = VSS  predicted support -> V  trained SLat
+
+因此可以直接读：
+
+  B-A：只隔离with-VGGT Native-SS的增量；
+  C-B：在完全相同VSS predicted support上，只隔离trained SLat增量；
+  C-A：当前完整with-VGGT VSS+V端点的端到端增量。
+
+官方GT SLat/mesh只充当量化target，不作为任何预测分支的support输入。
+
+Train64是训练重叠拟合诊断；正式Dev结果只取Dev[16:64)的48个对象，因为
+Dev[0:16)已经参与VSS CFG校准，不能再写成held-out结果。
+
+
+P13. 补齐Dev64的with-VGGT SLat sidecar（八卡，一次性）
+----------------------------------------------------------------------
+
+Train64 sidecar已经存在：
+
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+    cache_train64_protocol2128_views8_with_vggt_sidecar_v1/
+
+Dev64需要单独按原冻结64对象、原冻结8 views构建。不要重新选图。
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  source /home/zjr/anaconda3/etc/profile.d/conda.sh
+  conda activate reconviagen
+  export PYTHONPATH="$PWD:$PWD/ReconViaGen:$PWD/ReconViaGen/wheels/vggt"
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+  OUT=${ROOT}/cache_dev64_protocol2128_views8_with_vggt_sidecar_v1
+
+  test -s "${ROOT}/protocol2128_train2000_v1/dev.json"
+  test -s "${ROOT}/cache_dev64_protocol2128_views8_v1/slat_manifest.json"
+  test -s "${ROOT}/cache_dev64_protocol2128_views8_v1/lifting_manifest.json"
+  test ! -e "${OUT}"
+
+  SPLIT_MANIFEST="${ROOT}/protocol2128_train2000_v1/dev.json" \
+  BASE_SLAT_MANIFEST="${ROOT}/cache_dev64_protocol2128_views8_v1/slat_manifest.json" \
+  BASE_LIFTING_MANIFEST="${ROOT}/cache_dev64_protocol2128_views8_v1/lifting_manifest.json" \
+  OUTPUT_DIR="${OUT}" \
+  BUILD_GPUS=0,1,2,3,4,5,6,7 \
+  MAX_OBJECTS=0 \
+  PYTHON="${PY}" \
+    bash pose_point_depth_mv/background_jobs/run_proobjaverse_official_slat_with_vggt_cache.sh
+
+  test -s "${OUT}/with_vggt_slat_manifest.json"
+  test -s "${OUT}/with_vggt_lifting_manifest.json"
+)
+P13_RC=$?
+echo "P13_RC=${P13_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P14. CPU前置检查（不会加载大模型）
+----------------------------------------------------------------------
+
+下面默认测试SLat step10000。要测试step15000，只把SLAT_STEP改为15000；输出目录和
+expected step会同步变化，不能把不同step写进同一输出。
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SLAT_STEP=${SLAT_STEP:-10000}
+  PAD=$(printf '%06d' "${SLAT_STEP}")
+  SROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+  SSROOT=/data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1
+  VRUN=${SROOT}/V_with_vggt_train2000_step15000_seed42_8gpu_strict_perf_v1_v1
+
+  FILES=(
+    "${SROOT}/cache_train64_protocol2128_views8_with_vggt_sidecar_v1/with_vggt_slat_manifest.json"
+    "${SROOT}/cache_train64_protocol2128_views8_with_vggt_sidecar_v1/with_vggt_lifting_manifest.json"
+    "${SROOT}/cache_dev64_protocol2128_views8_with_vggt_sidecar_v1/with_vggt_slat_manifest.json"
+    "${SROOT}/cache_dev64_protocol2128_views8_with_vggt_sidecar_v1/with_vggt_lifting_manifest.json"
+    "${SSROOT}/cache_train2000_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/with_vggt_ss_manifest.json"
+    "${SSROOT}/cache_dev64_official_ss_with_vggt_sidecar_historical_v2_fix2_v1/with_vggt_ss_manifest.json"
+    "${SSROOT}/VSS_with_vggt_train2000_step2000_seed42_8gpu_v1/checkpoints/step_002000.pt"
+    "${SSROOT}/dev48_VSS_step2000_seed424344_6gpu_v1/aggregate_v1/report.json"
+    "${VRUN}/checkpoints/step_${PAD}.pt"
+    "/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json"
+  )
+  for FILE in "${FILES[@]}"; do test -s "${FILE}"; done
+
+  "${PY}" -m py_compile \
+    official_ss_with_vggt_perf_v1/ss_slat_endpoint.py \
+    official_ss_with_vggt_perf_v1/evaluate_ss_slat.py
+  bash -n \
+    official_ss_with_vggt_perf_v1/run_predicted_support_endpoint_split.sh \
+    official_ss_with_vggt_perf_v1/run_predicted_support_endpoint_train64_dev48.sh
+  nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu \
+    --format=csv,noheader,nounits
+)
+P14_RC=$?
+echo "P14_RC=${P14_RC} (0=PASS)"
+echo "current terminal remains open"
+
+
+P15. 一个tmux长任务：八卡依次跑Train64再跑held-out Dev48
+----------------------------------------------------------------------
+
+默认使用8卡。若届时只能用5卡，可以把EVAL_GPUS改成例如3,4,5,6,7；脚本会自动按
+对象数做不重叠均匀分片，不会改变对象、seed或指标合同。
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  LOG=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/logs/with_vggt_VSS2000_Vstep10000_train64_dev48_predicted_8gpu_v1.log
+  EXIT=${LOG}.exit_code
+  test ! -e "${LOG}"
+  test ! -e "${EXIT}"
+  if tmux has-session -t withvggtendpoint 2>/dev/null; then
+    echo "ERROR: tmux session withvggtendpoint already exists"
+    exit 90
+  fi
+
+  tmux new-session -d -s withvggtendpoint \
+    "cd /home/zjr/Tracker && \
+     EVAL_GPUS=0,1,2,3,4,5,6,7 SLAT_STEP=10000 \
+     bash official_ss_with_vggt_perf_v1/run_predicted_support_endpoint_train64_dev48.sh \
+     2>&1 | tee '${LOG}'; rc=\${PIPESTATUS[0]}; printf '%s\n' \"\${rc}\" >'${EXIT}'; exit \"\${rc}\""
+
+  echo "launched tmux=withvggtendpoint log=${LOG}"
+)
+P15_RC=$?
+echo "P15_RC=${P15_RC} (0=后台启动成功；失败也不会退出当前终端)"
+echo "current terminal remains open"
+
+测试step15000时，必须新建不同tmux名、LOG名，并改成：
+
+  SLAT_STEP=15000
+
+不要复用step10000输出目录。
+
+
+P15监视
+----------------------------------------------------------------------
+
+主日志：
+
+  tail -F /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/logs/with_vggt_VSS2000_Vstep10000_train64_dev48_predicted_8gpu_v1.log
+
+当前波次各worker：
+
+  tail -F /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/eval_with_vggt_VSS2000_Vstep10000_predicted_support_seed424344_8gpu_v1/*/logs/shard*.log
+
+简洁进度：
+
+watch -n 20 '
+date -u
+ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/eval_with_vggt_VSS2000_Vstep10000_predicted_support_seed424344_8gpu_v1
+for SPLIT in train64_predicted dev48_predicted; do
+  echo "===== ${SPLIT} ====="
+  find "${ROOT}/${SPLIT}" -path "*/ss_coords/*.json" -type f 2>/dev/null | wc -l
+  find "${ROOT}/${SPLIT}" -name pair_record.json -type f 2>/dev/null | wc -l
+  test -s "${ROOT}/${SPLIT}/aggregate_v1/report.json" && echo "aggregate=COMPLETE" || true
+done
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits
+'
+
+每个对象有3个seed，所以Train64完整时pair_record=192，Dev48完整时pair_record=144。
+
+
+P16. 完成后一次查看Train64与Dev48的A/B/C结果
+----------------------------------------------------------------------
+
+cd /home/zjr/Tracker
+set +e
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/eval_with_vggt_VSS2000_Vstep10000_predicted_support_seed424344_8gpu_v1
+
+  for SPLIT in train64_predicted dev48_predicted; do
+    REPORT=${ROOT}/${SPLIT}/aggregate_v1/report.json
+    test -s "${REPORT}"
+    echo
+    echo "===== ${SPLIT} ====="
+    "${PY}" - "${REPORT}" <<'PY'
+import json, sys
+r=json.load(open(sys.argv[1], encoding="utf-8"))
+assert r["with_vggt_endpoint_contract"]["gt_support_used_as_slat_input"] is False
+assert r["integrity"]["object_coverage_exact"] is True
+for key, value in r["extended_pairwise_metrics"].items():
+    summary=value["summary"] if value else None
+    print(key)
+    if summary is None:
+        print("  missing")
+        continue
+    for metric in (
+        "pred_to_gt_mean_improvement", "gt_to_pred_mean_improvement",
+        "chamfer_l1_improvement", "chamfer_l2_improvement",
+        "precision_0p01_delta", "precision_0p02_delta", "precision_0p05_delta",
+        "recall_0p01_delta", "recall_0p02_delta", "recall_0p05_delta",
+        "fscore_0p01_delta",
+        "fscore_0p02_delta", "fscore_0p05_delta",
+        "normal_consistency_delta", "largest_component_ratio_delta",
+    ):
+        if metric in summary:
+            row=summary[metric]
+            print(f"  {metric}: mean={row.get('mean')} median={row.get('median')} "
+                  f"win={row.get('positive_rate')} CI={row.get('bootstrap_mean_95_ci')}")
+print("scope:", r["scope_guard"])
+PY
+  done
+)
+P16_RC=$?
+echo "P16_RC=${P16_RC} (0=报告结构与完整性PASS；science gate可单独为false)"
+echo "current terminal remains open"
+
+
+P17. 输出与判读边界
+----------------------------------------------------------------------
+
+step10000默认输出：
+
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+    eval_with_vggt_VSS2000_Vstep10000_predicted_support_seed424344_8gpu_v1/
+      train64_predicted/aggregate_v1/report.json
+      dev48_predicted/aggregate_v1/report.json
+
+必须同时看：
+
+  Train64 C-B：V是否至少能在训练对象上学会；
+  Dev48   C-B：V的SLat增量是否泛化到相同VSS support；
+  Dev48   B-A：VSS相对VSS0的纯support增量；
+  Dev48   C-A：完整新端点相对双Stock floor的端到端增量。
+
+`passed=false`可能只是预注册科学门未过；只要程序完成且integrity矩阵为true，负结果也
+必须保留和分析。真实CUDA/OOM、checkpoint identity、cache pair mismatch则是程序失败，
+不能写成科学负结果。
+
+
+P10--P17-R2. P10完成后改用GPU0、3继续，并持续保留两卡
+======================================================================
+
+若日志已经出现：
+
+  {"passed": true, "cfg_strength": 5.0}
+  waiting for exclusive eval GPUs (before_P11)
+
+表示P10已经完成，阻塞只是旧四卡资源门，不是科学/程序失败。最新版两卡续跑入口：
+
+  official_ss_with_vggt_perf_v1/run_source_posttrain_2gpu03.sh
+
+它会严格复用并验证现有P10 calibration；P11改为Dev[16:40)和Dev[40:64)两个
+shard；P13/P15使用相同两卡动态分片。新的P11、P15、status、summary均使用
+`2gpu03_hold`版本化路径，不覆盖四卡证据。
+
+30K SLat 10K/30K/60K/70K评测不应串在GPU0/3之后，而应同时使用GPU4/5/6/7：
+
+  EVAL_GPUS=4,5,6,7 EVAL_GPU_HOLD_MIB=64 \
+    bash pose_point_depth_mv/background_jobs/run_proobjaverse_slat29861_legacy_eval_4gpu4567.sh
+
+with-VGGT使用GPU0/3，30K使用GPU4/5/6/7，共六卡并行；两项分别用低显存
+CUDA holder保持各自卡位。完整停止旧串行tmux、双后台启动、监视与独立输出路径见：
+
+  pose_point_depth_mv/官方30K四Checkpoint评测与withVGGT_SS四卡并行命令_20260818.txt
+
+
+P6-R5. P6_REPAIR_RC=0 后改用四卡续跑（最新，代替P6-R4的8卡启动）
+======================================================================
+
+当GPU 4--7同时用于30K checkpoint评测时，with-VGGT SS后续固定用
+GPU 0--3。四卡训练使用`grad_accum=2`，保持global effective batch=8，
+并使用全新`4gpu_gb8` output identity，不覆盖旧8卡路径。
+
+直接执行：
+
+  cd /home/zjr/Tracker
+
+  tmux new-session -d -s vggtss4 \
+    "bash -lc 'cd /home/zjr/Tracker && PIPELINE_GPUS=0,1,2,3 exec bash official_ss_with_vggt_perf_v1/run_source_after_p6_4gpu_gb8.sh >> /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P7_P17_4gpu_gb8_v1.master.log 2>&1'"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_native_ss_train2000_with_vggt_20260817_v1/logs/P7_P17_4gpu_gb8_v1.master.log
+
+完整双任务并行命令、30K 10K/30K/60K/70K评测命令、输出路径和
+科学边界见：
+
+  pose_point_depth_mv/官方30K四Checkpoint评测与withVGGT_SS四卡并行命令_20260818.txt

@@ -1,0 +1,1267 @@
+大数据直接 Flow 训练与测试命令（2026-07-20）
+================================================
+
+一、当前模型结构
+----------------
+
+输入仍使用原 ReconViaGen 的 stock image/VGGT condition，同时增加一条位于 SS Flow
+16^3 token 空间内的物理分支：
+
+  每个 view 的 VGGT patch + DINO/Image patch
+  + 真实 K/T、camera ray、VGGT depth/depth confidence、mask
+  + 稀疏 AR/Colmap point prior
+      -> N3 已验证的 gaussian3 correspondence/reliability 特征
+      -> 保留 view identity 的 same-voxel pair fusion
+      -> 3x3x3 local 3D convolution
+      -> zero-init 1024-d physical token
+      -> 在 SS Flow block 0 前与原 4096 个 16^3 token 相加
+      -> 24 个冻结 SS Flow block + attention LoRA
+      -> SS latent / frozen decoder
+
+冻结：VGGT、DINO/Image encoder、stock get_ss_cond、N3 correspondence head、
+SS Flow base、SS decoder。训练：view-identity physical encoder 和 SS Flow LoRA。
+
+严格回退：physical_present=False 或 null evidence 时，同时关闭 physical residual 和
+Flow LoRA，velocity 必须 bit-exact 等于 stock ReconViaGen。
+
+P0-performance 训练目标：
+
+  1. correct physical 的 Flow matching（主损失）；
+  2. frozen decoder occupancy（弱辅助，weight=0.001，每 4 个 micro-step 一次）；
+  3. 小权重 delta norm。
+
+P0 不构建 corruption 分支，wrong-stock、correct-gain、rank 权重均为 0。只有 P0 在
+object-disjoint 数据上优于 stock 后，才运行 P1-weak-mechanism：每步随机一个
+pose/depth/visual corruption，仅增加 0.01 的弱 relative-rank 正则。corruption 的主要
+职责仍是评估机制归因，不是主训练目标。
+
+注意：两卡真实 smoke 中 raw occupancy loss 约 31.6，原 0.02 权重会压过约 0.067
+的 Flow loss，因此正式命令使用 0.001。0.02 只验证过链路，不应继续用于训练。
+
+二、代码改动
+------------
+
+  pose_point_depth_mv/direct_flow.py
+    N3 绑定、显式 XYZ-volume/Flow-token 映射、schema/hash 绑定、view-identity
+    pose/depth/visual/point evidence、16^3 local encoder、stock-preserving Flow LoRA。
+
+  pose_point_depth_mv/train_direct_flow.py
+    performance/weak-mechanism profile、object-balanced sampler、两卡 DDP、
+    BF16/FP16 finite guard、完整 resume/checkpoint 绑定、可选 paired corruption、
+    Flow + frozen-decoder occupancy 联合训练及独立输出梯度审计。
+
+  pose_point_depth_mv/eval_direct_flow.py
+    UID-first 配对且 object-balanced 的 teacher-forced 和 rollout 评估；分别报告：
+      benchmark_relaxed：只要求优于 stock ReconViaGen；
+      mechanism_strict：额外要求 correct 优于 pose/depth/visual corruptions。
+
+  pose_point_depth_mv/test_direct_flow.py
+  pose_point_depth_mv/test_direct_flow_statistics.py
+    distinct-axis 16^3 token 顺序、null exact-zero、stock bypass、梯度、cache schema、
+    object-balanced sampler、UID rollout 配对与 object-balanced 统计测试。
+
+  pose_point_depth_mv/audit_direct_flow_admission.py
+    完整 train/val cache、stock condition、N3/hash、schema 与 object-disjoint 自动准入，
+    并严格绑定四份审计报告的 manifest/schema/UID hash。
+
+  ar_ss_flow/build_pose_lifting_cache.py
+    将 native stock pipeline 与替换 VGGT 的 lifting pipeline 分离；缓存 stock_condition
+    必须来自未替换的 ReconViaGen VGGT，lifting 特征使用独立的 depth/VGGT pipeline。
+
+  ar_ss_flow/audit_pose_lifting_cache.py
+  ar_ss_flow/audit_cached_stock_condition.py
+    审计报告保存 cache manifest、schema、配置和 UID/object hash，供 admission 绑定。
+
+  pose_point_depth_mv/eval_direct_flow.py
+    pilot rollout 放宽为明显退化门 0.01/0.01/0.02；D10.1 增加 frozen-decoder
+    teacher occupancy 评估。
+
+三、运行约定
+------------
+
+1. 每一节单独复制运行，全部前台执行并实时输出，不使用 nohup/background/PID monitor。
+2. 所有 shell 段都不执行 exit；错误只记录到 *.exit_code，段末 true 保持终端开启。
+3. output 已完整存在时复用；存在不完整目录时返回 98，不自动删除、不覆盖。
+4. 先完成 D0-D10。只有 D10 的 object-disjoint 结果满足放宽门，才运行 D11-D13。
+5. 放宽门只支持“优于 stock ReconViaGen”的结论。与 TRELLIS/Pixal3D 的正式比较仍需
+   在相同输入、相同 split、相同最终 3D 指标下另行评估。
+
+固定 N3 依赖：
+
+  N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+  CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+
+
+D0. 代码与单元测试
+==================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+      pose_point_depth_mv/direct_flow.py \
+      pose_point_depth_mv/train_direct_flow.py \
+      pose_point_depth_mv/eval_direct_flow.py \
+      pose_point_depth_mv/audit_direct_flow_admission.py \
+      pose_point_depth_mv/test_direct_flow.py \
+      pose_point_depth_mv/test_direct_flow_statistics.py \
+      ar_ss_flow/build_pose_lifting_cache.py \
+      ar_ss_flow/audit_pose_lifting_cache.py \
+      ar_ss_flow/test_audit_pose_lifting_cache.py \
+      ar_ss_flow/audit_cached_stock_condition.py
+    COMPILE_CODE=$?
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest -v \
+      pose_point_depth_mv.test_direct_flow \
+      pose_point_depth_mv.test_direct_flow_statistics \
+      ar_ss_flow.test_audit_pose_lifting_cache
+    TEST_CODE=$?
+
+    if [ "${COMPILE_CODE}" -eq 0 ] && [ "${TEST_CODE}" -eq 0 ]; then
+      CODE=0
+    else
+      CODE=2
+    fi
+  fi
+  echo "${CODE}" | tee pose_point_depth_mv/D0_direct_flow_tests.exit_code
+  echo "D0 code=${CODE}"
+  true
+)
+
+
+D1. 构建 train256-object pilot lifting cache（256 unique object，各 1 sequence）
+===============================================================================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    SOURCE=/data/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/cache/train/manifest.json
+    CACHE=/data/ar_ss_flow_direct_train256obj_v3_native_stock_20260720
+
+    if [ -f "${CACHE}/manifest.json" ] && [ -f "${CACHE}/cache_audit.json" ]; then
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+from pathlib import Path
+cache = Path(sys.argv[1])
+manifest = json.loads((cache / "manifest.json").read_text())
+audit = json.loads((cache / "cache_audit.json").read_text())
+ok = (
+    manifest.get("sample_count") == 256
+    and manifest.get("object_count") == 256
+    and manifest.get("selection", {}).get("mode") == "object_balanced"
+    and audit.get("passed") is True
+)
+print({"sample_count": manifest.get("sample_count"), "object_count": manifest.get("object_count"),
+       "selection": manifest.get("selection"), "cache_audit_passed": audit.get("passed")})
+raise SystemExit(0 if ok else 2)
+' "${CACHE}"
+      CODE=$?
+      echo "reuse train256 cache: code=${CODE}"
+    elif [ -e "${CACHE}" ]; then
+      echo "incomplete cache already exists, inspect it manually: ${CACHE}"
+      CODE=98
+    else
+      CUDA_VISIBLE_DEVICES=1 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        ar_ss_flow/build_pose_lifting_cache.py \
+        --source_cache_manifest "${SOURCE}" \
+        --output_dir "${CACHE}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --vggt_pretrained Stable-X/vggt-object-v0-1 \
+        --indices all \
+        --max_samples 0 \
+        --max_objects 256 \
+        --sequences_per_object 1 \
+        --object_seed 42 \
+        --device cuda \
+        --save_correct_geometry \
+        --log_every 1 \
+        2>&1 | tee "${CACHE}.build.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${CACHE}.build.exit_code"
+  fi
+  echo "D1 code=${CODE}"
+  true
+)
+
+
+D2. 构建 object-disjoint val64 cache（64 sequence / 当前为 46 unique object）
+============================================================================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    SOURCE=/data/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/cache/val/manifest.json
+    CACHE=/data/ar_ss_flow_direct_val64_v3_native_stock_20260720
+
+    if [ -f "${CACHE}/manifest.json" ] && [ -f "${CACHE}/cache_audit.json" ]; then
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+from pathlib import Path
+cache = Path(sys.argv[1])
+manifest = json.loads((cache / "manifest.json").read_text())
+audit = json.loads((cache / "cache_audit.json").read_text())
+ok = manifest.get("sample_count") == 64 and audit.get("passed") is True
+print({"sample_count": manifest.get("sample_count"), "cache_audit_passed": audit.get("passed")})
+raise SystemExit(0 if ok else 2)
+' "${CACHE}"
+      CODE=$?
+      echo "reuse val64 cache: code=${CODE}"
+    elif [ -e "${CACHE}" ]; then
+      echo "incomplete cache already exists, inspect it manually: ${CACHE}"
+      CODE=98
+    else
+      CUDA_VISIBLE_DEVICES=1 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        ar_ss_flow/build_pose_lifting_cache.py \
+        --source_cache_manifest "${SOURCE}" \
+        --output_dir "${CACHE}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --vggt_pretrained Stable-X/vggt-object-v0-1 \
+        --indices 0-63 \
+        --max_samples 0 \
+        --device cuda \
+        --save_correct_geometry \
+        --log_every 1 \
+        2>&1 | tee "${CACHE}.build.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${CACHE}.build.exit_code"
+  fi
+  echo "D2 code=${CODE}"
+  true
+)
+
+
+D3. 审计 train256 与 val64 lifting cache
+=========================================
+
+(
+  set -uo pipefail
+  OVERALL=0
+  if cd /home/zjr/Tracker; then
+    for CACHE in \
+      /data/ar_ss_flow_direct_train256obj_v3_native_stock_20260720 \
+      /data/ar_ss_flow_direct_val64_v3_native_stock_20260720; do
+      # Keep the failed cross-device v1 report as evidence; v2 reconstructs
+      # cached geometry on CPU and only uses CUDA for runtime volume replay.
+      OUT=${CACHE}/independent_audit_v2
+      if [ -f "${OUT}/report.json" ]; then
+        /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import hashlib, json, sys
+from pathlib import Path
+report_path = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2]).resolve()
+r = json.loads(report_path.read_text(encoding="utf-8"))
+m = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+sample_count = len(m.get("samples", ()))
+ok = (
+    r.get("audit_version") == "ar_ss_flow.pose_lifting_cache_audit.v2"
+    and r.get("passed") is True
+    and Path(r.get("cache_manifest", "")).resolve() == manifest_path
+    and r.get("manifest_sha256") == manifest_sha256
+    and r.get("sample_count") == sample_count
+    and r.get("audited_count") == sample_count
+)
+raise SystemExit(0 if ok else 2)
+' "${OUT}/report.json" "${CACHE}/manifest.json"
+        CODE=$?
+        echo "reuse cache audit: ${OUT} code=${CODE}"
+      elif [ -e "${OUT}" ]; then
+        echo "incomplete audit output exists: ${OUT}"
+        CODE=98
+      elif [ ! -f "${CACHE}/manifest.json" ]; then
+        echo "missing cache manifest: ${CACHE}/manifest.json"
+        CODE=98
+      else
+        CUDA_VISIBLE_DEVICES=1 \
+        /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+          ar_ss_flow/audit_pose_lifting_cache.py \
+          --cache_manifest "${CACHE}/manifest.json" \
+          --output_dir "${OUT}" \
+          --indices all \
+          --max_samples 0 \
+          --device cuda \
+          --min_depth_enabled_ratio 0.80 \
+          --max_cached_geometry_diff 1.0e-5 \
+          --max_roundtrip_error 1.0e-4 \
+          --fail_on_error \
+          2>&1 | tee "${OUT}.log"
+        CODE=${PIPESTATUS[0]}
+      fi
+      echo "${CODE}" | tee "${OUT}.exit_code"
+      if [ "${CODE}" -ne 0 ]; then OVERALL=${CODE}; fi
+    done
+  else
+    OVERALL=97
+  fi
+  echo "${OVERALL}" | tee pose_point_depth_mv/D3_cache_audits.exit_code
+  echo "D3 overall=${OVERALL}"
+  true
+)
+
+
+D4. 核验 cached stock condition 与原生 ReconViaGen bit-exact
+============================================================
+
+审计脚本从每个 manifest 自动各选择一条 2/4/8-view 样本。
+
+(
+  set -uo pipefail
+  OVERALL=0
+  if cd /home/zjr/Tracker; then
+    for CACHE in \
+      /data/ar_ss_flow_direct_train256obj_v3_native_stock_20260720 \
+      /data/ar_ss_flow_direct_val64_v3_native_stock_20260720; do
+      OUT=${CACHE}/stock_condition_audit_2_4_8
+      if [ -f "${OUT}/report.json" ]; then
+        /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+raise SystemExit(0 if r.get("passed") is True else 2)
+' "${OUT}/report.json"
+        CODE=$?
+        echo "reuse stock audit: ${OUT} code=${CODE}"
+      elif [ -e "${OUT}" ]; then
+        echo "incomplete stock audit exists: ${OUT}"
+        CODE=98
+      elif [ ! -f "${CACHE}/manifest.json" ]; then
+        echo "missing cache manifest: ${CACHE}/manifest.json"
+        CODE=98
+      else
+        CUDA_VISIBLE_DEVICES=1 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+          ar_ss_flow/audit_cached_stock_condition.py \
+          --cache_manifest "${CACHE}/manifest.json" \
+          --output_dir "${OUT}" \
+          --pretrained Stable-X/trellis-vggt-v0-2 \
+          --indices auto_2_4_8 \
+          --device cuda \
+          --max_abs_tolerance 0 \
+          --rms_tolerance 0 \
+          --min_cosine 1 \
+          --require_fp16_equal \
+          --fail_on_error \
+          2>&1 | tee "${OUT}.log"
+        CODE=${PIPESTATUS[0]}
+      fi
+      echo "${CODE}" | tee "${OUT}.exit_code"
+      if [ "${CODE}" -ne 0 ]; then OVERALL=${CODE}; fi
+    done
+  else
+    OVERALL=97
+  fi
+  echo "${OVERALL}" | tee pose_point_depth_mv/D4_stock_audits.exit_code
+  echo "D4 overall=${OVERALL}"
+  true
+)
+
+
+D5. P0-performance 两卡 BF16 s5：DDP、LoRA、occupancy 与 finite guard
+=====================================================================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    CACHE=/data/ar_ss_flow_direct_train256obj_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    OUT=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s5_seed42_2gpu_bf16_v3_smoke
+
+    if [ -f "${OUT}/train_report.json" ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+ok = r.get("completed_global_step") == 5 and r.get("nonfinite_attempts") == 0 and r.get("finite") is True
+raise SystemExit(0 if ok else 2)
+' "${OUT}/train_report.json"
+      CODE=$?
+      echo "reuse complete smoke: code=${CODE}"
+    elif [ -e "${OUT}" ]; then
+      echo "incomplete smoke output exists: ${OUT}"
+      CODE=98
+    else
+      mkdir -p "$(dirname "${OUT}")"
+      CUDA_VISIBLE_DEVICES=1,2 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      NCCL_IB_DISABLE=1 \
+      OMP_NUM_THREADS=4 \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/torchrun \
+        --standalone \
+        --nproc_per_node=2 \
+        -m pose_point_depth_mv.train_direct_flow \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --correspondence_checkpoint "${CORR_CKPT}" \
+        --n3_report "${N3_REPORT}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices 0-3 \
+        --max_steps 5 \
+        --save_every 5 \
+        --log_every 1 \
+        --num_workers 0 \
+        --seed 42 \
+        --lr 1e-5 \
+        --grad_accum 2 \
+        --grad_clip 1.0 \
+        --amp_dtype bf16 \
+        --nonfinite_policy error \
+        --max_nonfinite_attempts 0 \
+        --lora_rank 16 \
+        --lora_alpha 32 \
+        --physical_hidden_dim 128 \
+        --physical_scale 1.0 \
+        --gradient_checkpointing \
+        --training_profile performance \
+        --sampling_mode object_balanced \
+        --t_schedule uniform \
+        --flow_weight 1.0 \
+        --occupancy_weight 0.001 \
+        --occupancy_every 1 \
+        --delta_norm_weight 0.001 \
+        --loss_gradient_audit_every 1 \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D5 code=${CODE}"
+  true
+)
+
+
+D5b. P1-weak-mechanism 两卡 BF16 s2 接线 smoke（不作为正式训练）
+================================================================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    CACHE=/data/ar_ss_flow_direct_train256obj_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    OUT=pose_point_depth_mv/outputs/direct_flow_p1weak_train256obj_s2_seed42_2gpu_bf16_v3_smoke
+
+    if [ -f "${OUT}/train_report.json" ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+      echo "reuse complete weak-mechanism smoke: ${OUT}"
+      CODE=0
+    elif [ -e "${OUT}" ]; then
+      echo "incomplete weak-mechanism smoke exists: ${OUT}"
+      CODE=98
+    else
+      mkdir -p "$(dirname "${OUT}")"
+      CUDA_VISIBLE_DEVICES=1,2 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      NCCL_IB_DISABLE=1 \
+      OMP_NUM_THREADS=4 \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/torchrun \
+        --standalone \
+        --nproc_per_node=2 \
+        -m pose_point_depth_mv.train_direct_flow \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --correspondence_checkpoint "${CORR_CKPT}" \
+        --n3_report "${N3_REPORT}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices 0-3 \
+        --max_steps 2 \
+        --save_every 2 \
+        --log_every 1 \
+        --num_workers 0 \
+        --seed 42 \
+        --lr 1e-5 \
+        --grad_accum 2 \
+        --grad_clip 1.0 \
+        --amp_dtype bf16 \
+        --nonfinite_policy error \
+        --max_nonfinite_attempts 0 \
+        --lora_rank 16 \
+        --lora_alpha 32 \
+        --physical_hidden_dim 128 \
+        --physical_scale 1.0 \
+        --gradient_checkpointing \
+        --training_profile weak_mechanism \
+        --sampling_mode object_balanced \
+        --t_schedule uniform \
+        --flow_weight 1.0 \
+        --occupancy_weight 0.0 \
+        --delta_norm_weight 0.001 \
+        --loss_gradient_audit_every 1 \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D5b code=${CODE}"
+  true
+)
+
+
+D6. s5 finite checkpoint 审计
+============================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    RUN=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s5_seed42_2gpu_bf16_v3_smoke
+    if [ ! -f "${RUN}/train_report.json" ] || [ ! -f "${RUN}/checkpoints/last.pt" ]; then
+      echo "missing smoke outputs: ${RUN}"
+      CODE=98
+    else
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+        --train_report "${RUN}/train_report.json" \
+        --checkpoint "${RUN}/checkpoints/last.pt" \
+        --expected_updates 5 \
+        --max_nonfinite_attempts 0 \
+        --output "${RUN}/finite_run_audit.json"
+      CODE=$?
+    fi
+    echo "${CODE}" | tee "${RUN}.audit.exit_code"
+  fi
+  echo "D6 code=${CODE}"
+  true
+)
+
+
+D7. 两卡 train256 / 300-update pilot
+====================================
+
+这是放宽标准后的首个正式 pilot。cache 含 256 unique train objects，训练每个epoch先采
+object再选sequence；不把 mechanism_strict 作为扩大数据的硬门，但评估仍完整报告
+corruption specificity。
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    CACHE=/data/ar_ss_flow_direct_train256obj_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    OUT=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3
+
+    if [ -f "${OUT}/train_report.json" ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+ok = r.get("completed_global_step") == 300 and r.get("nonfinite_attempts") == 0 and r.get("finite") is True
+raise SystemExit(0 if ok else 2)
+' "${OUT}/train_report.json"
+      CODE=$?
+      echo "reuse complete pilot: code=${CODE}"
+    elif [ -e "${OUT}" ]; then
+      echo "incomplete pilot output exists: ${OUT}"
+      CODE=98
+    else
+      mkdir -p "$(dirname "${OUT}")"
+      CUDA_VISIBLE_DEVICES=1,2 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      NCCL_IB_DISABLE=1 \
+      OMP_NUM_THREADS=4 \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/torchrun \
+        --standalone \
+        --nproc_per_node=2 \
+        -m pose_point_depth_mv.train_direct_flow \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --correspondence_checkpoint "${CORR_CKPT}" \
+        --n3_report "${N3_REPORT}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices all \
+        --max_steps 300 \
+        --save_every 50 \
+        --log_every 5 \
+        --num_workers 0 \
+        --seed 42 \
+        --lr 1e-5 \
+        --grad_accum 8 \
+        --grad_clip 1.0 \
+        --amp_dtype bf16 \
+        --nonfinite_policy error \
+        --max_nonfinite_attempts 0 \
+        --lora_rank 16 \
+        --lora_alpha 32 \
+        --physical_hidden_dim 128 \
+        --physical_scale 1.0 \
+        --gradient_checkpointing \
+        --training_profile performance \
+        --sampling_mode object_balanced \
+        --t_schedule uniform \
+        --flow_weight 1.0 \
+        --occupancy_weight 0.001 \
+        --occupancy_every 4 \
+        --delta_norm_weight 0.001 \
+        --loss_gradient_audit_every 50 \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D7 code=${CODE}"
+  true
+)
+
+
+D8. 300-update finite 审计
+===========================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    RUN=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3
+    if [ ! -f "${RUN}/train_report.json" ] || [ ! -f "${RUN}/checkpoints/last.pt" ]; then
+      echo "missing pilot outputs: ${RUN}"
+      CODE=98
+    else
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+        --train_report "${RUN}/train_report.json" \
+        --checkpoint "${RUN}/checkpoints/last.pt" \
+        --expected_updates 300 \
+        --max_nonfinite_attempts 0 \
+        --output "${RUN}/finite_run_audit.json"
+      CODE=$?
+    fi
+    echo "${CODE}" | tee "${RUN}.audit.exit_code"
+  fi
+  echo "D8 code=${CODE}"
+  true
+)
+
+
+D9. object-disjoint val32 checkpoint trajectory（50/100/150/200/250/300）
+============================================================================
+
+此阶段使用 1 noise seed 和 3 个 t 做低成本选点。所有评估为 report_only，科学 FAIL
+不会产生非零运行码，也不会关闭终端。
+
+(
+  set -uo pipefail
+  OVERALL=0
+  if cd /home/zjr/Tracker; then
+    RUN=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3
+    CACHE=/data/ar_ss_flow_direct_val64_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    TRAJ=${RUN}/eval_val32_checkpoint_trajectory
+
+    for STEP in 50 100 150 200 250 300; do
+      PAD=$(printf '%06d' "${STEP}")
+      CKPT=${RUN}/checkpoints/step_${PAD}.pt
+      OUT=${TRAJ}/step_${PAD}
+      if [ -f "${OUT}/report.json" ]; then
+        echo "reuse trajectory report: step=${STEP}"
+        CODE=0
+      elif [ -e "${OUT}" ]; then
+        echo "incomplete trajectory output exists: ${OUT}"
+        CODE=98
+      elif [ ! -f "${CKPT}" ]; then
+        echo "missing checkpoint: ${CKPT}"
+        CODE=98
+      else
+        CUDA_VISIBLE_DEVICES=1 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+          -m pose_point_depth_mv.eval_direct_flow \
+          --cache_manifest "${CACHE}/manifest.json" \
+          --flow_checkpoint "${CKPT}" \
+          --correspondence_checkpoint "${CORR_CKPT}" \
+          --n3_report "${N3_REPORT}" \
+          --output_dir "${OUT}" \
+          --pretrained Stable-X/trellis-vggt-v0-2 \
+          --indices all \
+          --max_samples 32 \
+          --device cuda \
+          --seeds 42 \
+          --t_values 0.1,0.5,0.9 \
+          --amp_dtype bf16 \
+          --decision_profile report_only \
+          2>&1 | tee "${OUT}.log"
+        CODE=${PIPESTATUS[0]}
+      fi
+      echo "${CODE}" | tee "${OUT}.exit_code"
+      if [ "${CODE}" -ne 0 ]; then OVERALL=${CODE}; fi
+    done
+
+    if [ "${OVERALL}" -eq 0 ]; then
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+from pathlib import Path
+root = Path("pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3/eval_val32_checkpoint_trajectory")
+print("step benchmark strict gain_mean gain_median stock_win positive_t")
+for path in sorted(root.glob("step_*/report.json")):
+    r = json.loads(path.read_text())
+    c = r["branch_summary"]["correct"]
+    print(path.parent.name, r["benchmark_relaxed"]["passed"], r["mechanism_strict"]["passed"],
+          c["gain_vs_stock"]["mean"], c["gain_vs_stock"]["median"],
+          c["stock_object_win_rate"], r["positive_t_count"])
+' 2>&1 | tee "${TRAJ}/trajectory_summary.log"
+      SUMMARY_CODE=${PIPESTATUS[0]}
+      if [ "${SUMMARY_CODE}" -ne 0 ]; then OVERALL=${SUMMARY_CODE}; fi
+    fi
+  else
+    OVERALL=97
+  fi
+  echo "${OVERALL}" | tee pose_point_depth_mv/D9_trajectory.exit_code
+  echo "D9 overall=${OVERALL}"
+  true
+)
+
+
+D10. 最佳 checkpoint 的 val64 正式 teacher-forced 与 rollout
+==============================================================
+
+先查看 D9 的 trajectory_summary.log，再把 BEST_STEP 改成客观最优点；默认 300。
+
+D10.1 teacher-forced：3 noise seeds x 5 t，object-disjoint
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    BEST_STEP=${BEST_STEP:-300}
+    PAD=$(printf '%06d' "${BEST_STEP}")
+    RUN=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3
+    CACHE=/data/ar_ss_flow_direct_val64_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    CKPT=${RUN}/checkpoints/step_${PAD}.pt
+    OUT=${RUN}/eval_val64_best${PAD}_noise424344_t013579
+
+    if [ -f "${OUT}/report.json" ]; then
+      echo "reuse teacher report: ${OUT}/report.json"
+      CODE=0
+    elif [ -e "${OUT}" ]; then
+      echo "incomplete teacher output exists: ${OUT}"
+      CODE=98
+    elif [ ! -f "${CKPT}" ]; then
+      echo "missing best checkpoint: ${CKPT}"
+      CODE=98
+    else
+      CUDA_VISIBLE_DEVICES=1 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        -m pose_point_depth_mv.eval_direct_flow \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --flow_checkpoint "${CKPT}" \
+        --correspondence_checkpoint "${CORR_CKPT}" \
+        --n3_report "${N3_REPORT}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices all \
+        --max_samples 0 \
+        --device cuda \
+        --seeds 42,43,44 \
+        --t_values 0.1,0.3,0.5,0.7,0.9 \
+        --amp_dtype bf16 \
+        --benchmark_min_object_win 0.55 \
+        --benchmark_min_positive_t 3 \
+        --mechanism_min_object_win 0.55 \
+        --mechanism_min_positive_t 4 \
+        --decision_profile benchmark_relaxed \
+        --decode_teacher \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D10.1 runtime code=${CODE}"
+  true
+)
+
+D10.2 正式 relaxed 门：val64 teacher + 8-sample / 30-step rollout
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    BEST_STEP=${BEST_STEP:-300}
+    PAD=$(printf '%06d' "${BEST_STEP}")
+    RUN=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3
+    CACHE=/data/ar_ss_flow_direct_val64_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    CKPT=${RUN}/checkpoints/step_${PAD}.pt
+    OUT=${RUN}/eval_val64_best${PAD}_with_rollout8_steps30_relaxed
+
+    if [ -f "${OUT}/report.json" ]; then
+      echo "reuse rollout report: ${OUT}/report.json"
+      CODE=0
+    elif [ -e "${OUT}" ]; then
+      echo "incomplete rollout output exists: ${OUT}"
+      CODE=98
+    elif [ ! -f "${CKPT}" ]; then
+      echo "missing best checkpoint: ${CKPT}"
+      CODE=98
+    else
+      CUDA_VISIBLE_DEVICES=1 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+        -m pose_point_depth_mv.eval_direct_flow \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --flow_checkpoint "${CKPT}" \
+        --correspondence_checkpoint "${CORR_CKPT}" \
+        --n3_report "${N3_REPORT}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices all \
+        --max_samples 0 \
+        --device cuda \
+        --seeds 42,43,44 \
+        --t_values 0.1,0.3,0.5,0.7,0.9 \
+        --amp_dtype bf16 \
+        --benchmark_min_object_win 0.55 \
+        --benchmark_min_positive_t 3 \
+        --decision_profile benchmark_relaxed \
+        --benchmark_require_rollout \
+        --max_rollout_iou_degradation 0.01 \
+        --max_rollout_precision_degradation 0.01 \
+        --max_rollout_largest_component_degradation 0.02 \
+        --rollout_steps 30 \
+        --rollout_max_samples 8 \
+        --rollout_seeds 42 \
+        --rollout_controls pose_cyclic1,depth_view_cyclic1 \
+        --cfg_strength 7.5 \
+        --guidance_rescale 0.5 \
+        --rescale_t 3.0 \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D10.2 runtime code=${CODE}"
+  true
+)
+
+D10.3 汇总打印（不会因科学 FAIL 返回非零）
+
+将 BEST_STEP 与 D10.1/D10.2 保持一致。
+
+(
+  set -uo pipefail
+  if cd /home/zjr/Tracker; then
+    BEST_STEP=${BEST_STEP:-300}
+    PAD=$(printf '%06d' "${BEST_STEP}")
+    RUN=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3
+    TEACHER=${RUN}/eval_val64_best${PAD}_noise424344_t013579/report.json
+    ROLLOUT=${RUN}/eval_val64_best${PAD}_with_rollout8_steps30_relaxed/report.json
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+from pathlib import Path
+teacher_path, rollout_path = map(Path, sys.argv[1:3])
+if teacher_path.is_file():
+    r = json.loads(teacher_path.read_text())
+    print("==== TEACHER")
+    print("runtime selected profile/pass =", r["selected_decision_profile"], r["selected_passed"])
+    print("benchmark_relaxed =", r["benchmark_relaxed"])
+    print("mechanism_strict =", r["mechanism_strict"])
+    print("stock exact off/null =", r["physical_off_max_abs"], r["null_evidence_max_abs"])
+    for name, row in r["branch_summary"].items():
+        print(name, "gain=", row["gain_vs_stock"], "stock_win=", row["stock_object_win_rate"],
+              "correct_adv=", row["correct_advantage"], "correct_win=", row["correct_object_win_rate"])
+else:
+    print("missing teacher report:", teacher_path)
+if rollout_path.is_file():
+    r = json.loads(rollout_path.read_text())
+    print("==== ROLLOUT")
+    print(json.dumps(r.get("rollout"), indent=2))
+else:
+    print("missing rollout report:", rollout_path)
+' "${TEACHER}" "${ROLLOUT}"
+  fi
+  true
+)
+
+
+Pilot 裁决
+==========
+
+数值硬门：
+
+  finite_run_audit passed=true；nonfinite_attempts=0；
+  physical_off_max_abs=0；null_evidence_max_abs=0。
+
+放宽 baseline 门（允许继续扩大数据）：
+
+  object-disjoint val64 上 benchmark_relaxed passed=true，即：
+    correct-vs-stock mean > 0；
+    median > 0；
+    object win rate >= 55%；
+    至少 3/5 t 为正。
+
+  D10.2 的 benchmark_relaxed passed=true；pilot阶段仅排除明显退化，代码要求 30-step rollout 的
+  object-balanced IoU/precision/largest-component ratio 平均退化不超过 0.01/0.01/0.02；
+  若 teacher 正、rollout 轻微混合，可先扩大到全 train，但必须保存 checkpoint trajectory。
+
+机制门不再阻止 baseline pilot，但限制论文表述：
+
+  mechanism_strict=false：只能声称加入多视角物理输入后的模型优于 stock baseline，
+  不能声称收益已被证明来自正确 pose/depth/visual correspondence。
+
+  benchmark_relaxed=false 且所有 checkpoint 都失败：停止本架构，不直接长训。
+
+
+D11. 仅在 pilot 放宽门通过后：构建完整 train/val lifting cache
+==============================================================
+
+完整 train 为 1259 sequences / 897 unique objects；完整 val 为 175 sequences /
+128 unique objects。这是中等规模微调集，不是 foundation-scale 数据。若它只带来训练集收益，
+下一步应扩充 object-disjoint 对象数量，而不是继续增加同对象 epoch。
+
+(
+  set -uo pipefail
+  OVERALL=0
+  if cd /home/zjr/Tracker; then
+    PILOT=pose_point_depth_mv/outputs/direct_flow_p0_train256obj_s300_seed42_2gpu_bf16_v3/eval_val64_best000300_with_rollout8_steps30_relaxed/report.json
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+ok = p.is_file() and json.loads(p.read_text(encoding="utf-8")).get("selected_passed") is True
+raise SystemExit(0 if ok else 2)
+' "${PILOT}"
+    PILOT_CODE=$?
+    if [ "${PILOT_CODE}" -ne 0 ]; then
+      echo "D11 blocked: D10.2 benchmark_relaxed selected_passed is not true: ${PILOT}"
+      OVERALL=96
+    else
+    for SPLIT in train val; do
+      SOURCE=/data/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/cache/${SPLIT}/manifest.json
+      CACHE=/data/ar_ss_flow_direct_${SPLIT}_all_v3_native_stock_20260720
+      if [ -f "${CACHE}/manifest.json" ] && [ -f "${CACHE}/cache_audit.json" ]; then
+        echo "reuse full ${SPLIT} cache: ${CACHE}"
+        CODE=0
+      elif [ -e "${CACHE}" ]; then
+        echo "incomplete full cache exists: ${CACHE}"
+        CODE=98
+      else
+        CUDA_VISIBLE_DEVICES=1 \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
+        ATTN_BACKEND=flash_attn \
+        SPCONV_ALGO=native \
+        MPLCONFIGDIR=/tmp/matplotlib \
+        NUMBA_CACHE_DIR=/tmp/numba_cache \
+        TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+          ar_ss_flow/build_pose_lifting_cache.py \
+          --source_cache_manifest "${SOURCE}" \
+          --output_dir "${CACHE}" \
+          --pretrained Stable-X/trellis-vggt-v0-2 \
+          --vggt_pretrained Stable-X/vggt-object-v0-1 \
+          --indices all \
+          --max_samples 0 \
+          --device cuda \
+          --save_correct_geometry \
+          --log_every 1 \
+          2>&1 | tee "${CACHE}.build.log"
+        CODE=${PIPESTATUS[0]}
+      fi
+      echo "${CODE}" | tee "${CACHE}.build.exit_code"
+      if [ "${CODE}" -ne 0 ]; then OVERALL=${CODE}; fi
+    done
+    fi
+  else
+    OVERALL=97
+  fi
+  echo "${OVERALL}" | tee pose_point_depth_mv/D11_full_cache_build.exit_code
+  echo "D11 overall=${OVERALL}"
+  true
+)
+
+完整 cache 的审计不能复用旧路径报告，必须执行下面 D11a 的自包含命令。
+
+
+D11a. 完整 cache 独立审计与 native stock 审计
+================================================
+
+(
+  set -uo pipefail
+  OVERALL=0
+  if cd /home/zjr/Tracker; then
+    for SPLIT in train val; do
+      CACHE=/data/ar_ss_flow_direct_${SPLIT}_all_v3_native_stock_20260720
+      for KIND in independent_audit stock_condition_audit_2_4_8; do
+        if [ "${KIND}" = independent_audit ]; then
+          OUT="${CACHE}/independent_audit_v2"
+          SCRIPT=ar_ss_flow/audit_pose_lifting_cache.py
+          EXTRA="--indices all --max_samples 0 --min_depth_enabled_ratio 0.80 --max_cached_geometry_diff 1e-5 --max_roundtrip_error 1e-4"
+        else
+          OUT="${CACHE}/${KIND}"
+          SCRIPT=ar_ss_flow/audit_cached_stock_condition.py
+          EXTRA="--indices auto_2_4_8 --require_fp16_equal --max_abs_tolerance 0 --rms_tolerance 0 --min_cosine 1"
+        fi
+        if [ -f "${OUT}/report.json" ]; then
+          /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import hashlib, json, sys
+from pathlib import Path
+report_path = Path(sys.argv[1])
+kind = sys.argv[2]
+manifest_path = Path(sys.argv[3]).resolve()
+r = json.loads(report_path.read_text(encoding="utf-8"))
+m = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+reported_sha256 = r.get("manifest_sha256", r.get("cache_manifest_sha256"))
+ok = (
+    r.get("passed") is True
+    and Path(r.get("cache_manifest", "")).resolve() == manifest_path
+    and reported_sha256 == manifest_sha256
+)
+if kind == "independent_audit":
+    sample_count = len(m.get("samples", ()))
+    ok = (
+        ok
+        and r.get("audit_version") == "ar_ss_flow.pose_lifting_cache_audit.v2"
+        and r.get("sample_count") == sample_count
+        and r.get("audited_count") == sample_count
+    )
+raise SystemExit(0 if ok else 2)
+' "${OUT}/report.json" "${KIND}" "${CACHE}/manifest.json"
+          CODE=$?
+          echo "reuse ${SPLIT} ${KIND}: ${OUT}/report.json code=${CODE}"
+        elif [ -e "${OUT}" ]; then
+          echo "incomplete audit exists: ${OUT}"
+          CODE=98
+        else
+          if [ "${KIND}" = independent_audit ]; then
+            CUDA_VISIBLE_DEVICES=1 \
+            /home/zjr/anaconda3/envs/reconviagen/bin/python -u "${SCRIPT}" \
+              --cache_manifest "${CACHE}/manifest.json" \
+              --output_dir "${OUT}" \
+              --device cuda --fail_on_error ${EXTRA} \
+              2>&1 | tee "${OUT}.log"
+          else
+            CUDA_VISIBLE_DEVICES=1 \
+            HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+            ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+            /home/zjr/anaconda3/envs/reconviagen/bin/python -u "${SCRIPT}" \
+              --cache_manifest "${CACHE}/manifest.json" \
+              --output_dir "${OUT}" \
+              --pretrained Stable-X/trellis-vggt-v0-2 \
+              --device cuda --fail_on_error ${EXTRA} \
+              2>&1 | tee "${OUT}.log"
+          fi
+          CODE=${PIPESTATUS[0]}
+        fi
+        echo "${CODE}" | tee "${OUT}.exit_code"
+        if [ "${CODE}" -ne 0 ]; then OVERALL=${CODE}; fi
+      done
+    done
+  else
+    OVERALL=97
+  fi
+  echo "${OVERALL}" | tee pose_point_depth_mv/D11a_full_audits.exit_code
+  true
+)
+
+
+D11b. 完整数据自动准入（D12 的硬依赖）
+========================================
+
+先完成完整 cache 的 D3/D4 审计，再运行本节。
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    TRAIN=/data/ar_ss_flow_direct_train_all_v3_native_stock_20260720
+    VAL=/data/ar_ss_flow_direct_val_all_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    OUT=pose_point_depth_mv/outputs/direct_flow_full_admission_v3/report.json
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      -m pose_point_depth_mv.audit_direct_flow_admission \
+      --train_cache_manifest "${TRAIN}/manifest.json" \
+      --eval_cache_manifest "${VAL}/manifest.json" \
+      --train_cache_audit "${TRAIN}/independent_audit_v2/report.json" \
+      --eval_cache_audit "${VAL}/independent_audit_v2/report.json" \
+      --train_stock_audit "${TRAIN}/stock_condition_audit_2_4_8/report.json" \
+      --eval_stock_audit "${VAL}/stock_condition_audit_2_4_8/report.json" \
+      --n3_report "${N3_REPORT}" \
+      --correspondence_checkpoint "${CORR_CKPT}" \
+      --output "${OUT}" \
+      --min_train_samples 1259 \
+      --min_train_objects 897 \
+      --min_eval_samples 175 \
+      --min_eval_objects 128 \
+      --fail_on_error
+    CODE=$?
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D11b code=${CODE}"
+  true
+)
+
+
+D12. 完整 897-object 两卡 1000-update 训练
+==========================================
+
+(
+  set -uo pipefail
+  CODE=97
+  if cd /home/zjr/Tracker; then
+    CACHE=/data/ar_ss_flow_direct_train_all_v3_native_stock_20260720
+    N3_REPORT=pose_point_depth_mv/outputs/c0_3_gaussian3_s200_multiseed_holdout_summary_20260718/report.json
+    CORR_CKPT=pose_point_depth_mv/outputs/c0_3_gaussian3_train16_s200_seed42_bf16_20260718/checkpoints/last.pt
+    ADMISSION=pose_point_depth_mv/outputs/direct_flow_full_admission_v3/report.json
+    OUT=pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+ok = path.is_file() and json.loads(path.read_text()).get("passed") is True
+raise SystemExit(0 if ok else 2)
+' "${ADMISSION}"
+    ADMISSION_CODE=$?
+
+    if [ "${ADMISSION_CODE}" -ne 0 ]; then
+      echo "D12 blocked: full admission report is missing or failed: ${ADMISSION}"
+      CODE=96
+    elif [ -f "${OUT}/train_report.json" ] && [ -f "${OUT}/checkpoints/last.pt" ]; then
+      echo "complete full run already exists: ${OUT}"
+      CODE=0
+    elif [ -e "${OUT}" ]; then
+      echo "incomplete full run exists: ${OUT}"
+      CODE=98
+    else
+      mkdir -p "$(dirname "${OUT}")"
+      CUDA_VISIBLE_DEVICES=1,2 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      NCCL_IB_DISABLE=1 \
+      OMP_NUM_THREADS=4 \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/torchrun \
+        --standalone \
+        --nproc_per_node=2 \
+        -m pose_point_depth_mv.train_direct_flow \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --correspondence_checkpoint "${CORR_CKPT}" \
+        --n3_report "${N3_REPORT}" \
+        --admission_report "${ADMISSION}" \
+        --output_dir "${OUT}" \
+        --pretrained Stable-X/trellis-vggt-v0-2 \
+        --indices all \
+        --max_steps 1000 \
+        --save_every 100 \
+        --log_every 10 \
+        --num_workers 0 \
+        --seed 42 \
+        --lr 1e-5 \
+        --grad_accum 16 \
+        --grad_clip 1.0 \
+        --amp_dtype bf16 \
+        --nonfinite_policy error \
+        --max_nonfinite_attempts 0 \
+        --lora_rank 16 \
+        --lora_alpha 32 \
+        --physical_hidden_dim 128 \
+        --physical_scale 1.0 \
+        --gradient_checkpointing \
+        --training_profile performance \
+        --sampling_mode object_balanced \
+        --t_schedule uniform \
+        --flow_weight 1.0 \
+        --occupancy_weight 0.001 \
+        --occupancy_every 4 \
+        --delta_norm_weight 0.001 \
+        --loss_gradient_audit_every 100 \
+        2>&1 | tee "${OUT}.log"
+      CODE=${PIPESTATUS[0]}
+    fi
+    echo "${CODE}" | tee "${OUT}.exit_code"
+  fi
+  echo "D12 code=${CODE}"
+  true
+)
+
+
+D13. 完整 run 审计与评估原则
+================================
+
+1. 用 D8 审计，将 RUN 改为 direct_flow_p0_trainall_s1000...，expected_updates 改为 1000。
+2. 先在完整 val 的前 64 条上，对 step100...1000 做 D9 同协议轨迹；不要只看 last.pt。
+3. 选择 object-disjoint benchmark_relaxed 最好的 checkpoint，再对完整 val 运行 D10.1。
+4. 只有完整 val 正向后才构建 untouched holdout cache并评估；不得用 holdout 选 checkpoint。
+5. 建议至少补 seed43/44。单 seed 结果只作为工程 pilot，不作为稳定泛化结论。

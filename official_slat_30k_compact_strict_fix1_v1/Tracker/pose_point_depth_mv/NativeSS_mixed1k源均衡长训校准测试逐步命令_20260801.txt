@@ -1,0 +1,434 @@
+# 本文件不是bash脚本。不要执行 `bash 本文件`。
+# 按 A0、A1、T0...顺序，每次只复制一个完整的 (...) 命令块到终端。
+#
+# 冻结协议：
+#   train：868 objects / 1417 sequences，保留自然来源比例并按object均衡采样；
+#   checkpoint-dev：16 objects，legacy/gap/pilot/omni各4，2/4/8-view=6/5/5；
+#   CFG-calibration：16 objects，四来源各4，2/4/8-view=5/6/5；
+#   final：32 objects，四来源各8，2/4/8-view=11/11/10。
+#
+# 64个验证对象全部从原932-object train cache中确定性留出，不进入本轮训练；同时明确
+# 排除失败SS64训练使用过的排序前64对象。checkpoint、CFG和final三组互不重叠。
+# 长训从Stock初始化，不resume旧SS64 step500。T0默认用物理GPU2和GPU5执行双卡DDP；
+# V0/V2/V4仍是单卡评估。复制T0/V0/V2/V4前仍需用nvidia-smi确认目标GPU空闲。
+
+
+# A0：冻结source/view-balanced split。只生成新JSON，不复制或修改原cache tensor。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  LIFT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/lifting_train_shared_v1/manifest.json
+  POINTPOSE=/data/zjr/native3d_condition_reviewed1k_inputs_20260730_v3/pointpose_train/manifest.json
+  OUT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1
+
+  test -s "${LIFT}" || exit 96
+  test -s "${POINTPOSE}" || exit 96
+  if [ -s "${OUT}/split_audit.json" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}/split_audit.json')); assert p['passed'] is True; print(json.dumps(p['counts'], indent=2))"
+  elif [ -e "${OUT}" ]; then
+    echo "A0 partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    "${PY}" -u -m pose_point_depth_mv.native_ss_mixed1k_protocol freeze-split \
+      --lifting_manifest "${LIFT}" \
+      --pointpose_manifest "${POINTPOSE}" \
+      --output_dir "${OUT}" \
+      --seed 20260801
+  fi
+)
+
+
+# A1：加载新manifest，逐样本复核val64，并检查cache合同与object-disjoint。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1
+
+  "${PY}" -u -m pose_point_depth_mv.native_ss_mixed1k_protocol audit-split \
+    --split_dir "${SPLIT}"
+)
+
+
+# T0：868对象、2000 optimizer updates的双卡DDP长训。
+# world2*每卡grad_accum4=全局有效batch8；2000*8/868约18.4次对象曝光，
+# 接近旧Direct SS的1000*16/897约17.8次，训练合同不因双卡而加倍。
+# 可在复制前执行 `export GPUS=5,6` 覆盖默认物理GPU2,5；必须恰好提供两张卡。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+  GPUS=${GPUS:-2,5}
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1
+  TRAIN=${SPLIT}/train868_manifest.json
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  OUT=${ROOT}/ss868_sourceholdout_seed42_v1
+  LOG=${ROOT}/logs/T0_ss868_train.log
+
+  test -s "${TRAIN}" || exit 96
+  test -x "${TORCHRUN}" || exit 96
+  [ "$(awk -F, '{print NF}' <<<"${GPUS}")" -eq 2 ] || exit 96
+  mkdir -p "${ROOT}/logs"
+  if [ -s "${OUT}/report.json" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}/report.json')); assert p['passed'] is True and p['step']==2000; print('reuse complete T0')"
+  elif [ -e "${OUT}" ]; then
+    echo "T0 partial output exists; preserve it and prepare an explicit resume directory: ${OUT}"
+    exit 98
+  else
+    set +e
+    env \
+      CUDA_VISIBLE_DEVICES="${GPUS}" \
+      PYTHONUNBUFFERED=1 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${TORCHRUN}" --standalone --nproc_per_node=2 --module \
+        pose_point_depth_mv.train_native_ss_genrecon \
+        --cache_manifest "${TRAIN}" \
+        --output_dir "${OUT}" \
+        --max_steps 2000 \
+        --save_every 250 \
+        --log_every 20 \
+        --grad_accum 4 \
+        --num_workers 0 \
+        --seed 42 \
+        --lora_rank 8 \
+        --lora_alpha 16 \
+        --condition_channels 1024 \
+        --new_lr 1e-4 \
+        --lora_lr 3e-5 \
+        --new_weight_decay 0.01 \
+        --warmup_steps 40 \
+        --ema_decay 0.9995 \
+        --p_uncond 0.1 \
+        --t_logit_mean 1 \
+        --t_logit_std 1 \
+        --min_condition_views 1 \
+        --max_condition_views 16 \
+        --amp_dtype bf16 \
+        --gradient_checkpointing \
+      2>&1 | tee "${LOG}"
+    RC=${PIPESTATUS[0]}
+    set -e
+    echo "T0_RC=${RC}"
+    [ "${RC}" -eq 0 ] || exit "${RC}"
+  fi
+)
+
+# T0监视命令（另一个终端复制）：
+tail -f '/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/logs/T0_ss868_train.log'
+
+
+# T1：训练完成合同与四个粗选checkpoint完整性检查。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  RUN=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1
+  TRAIN=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/train868_manifest.json
+
+  "${PY}" - "${RUN}" "${TRAIN}" <<'PY'
+import hashlib, json, sys, torch
+from pathlib import Path
+from pose_point_depth_mv.native_ss_genrecon import validate_native_ss_genrecon_checkpoint
+run, train = Path(sys.argv[1]), Path(sys.argv[2])
+report = json.load(open(run / 'report.json'))
+assert report['passed'] is True and report['step'] == 2000
+distributed = report['model_summary']['optimization']['distributed']
+assert distributed['world_size'] == 2
+assert distributed['per_rank_grad_accum'] == 4
+assert distributed['global_effective_batch'] == 8
+assert report['global_micro_samples'] == 2000 * 8
+assert report['data_identity']['object_count'] == 868
+assert report['data_identity']['sample_count'] == 1417
+assert report['data_identity']['manifest_sha256'] == hashlib.sha256(train.read_bytes()).hexdigest()
+for step in (500, 1000, 1500, 2000):
+    path = run / 'checkpoints' / f'step_{step:06d}.pt'
+    checkpoint = torch.load(path, map_location='cpu')
+    validate_native_ss_genrecon_checkpoint(checkpoint, pretrained='Stable-X/trellis-vggt-v0-2')
+    assert checkpoint['step'] == step
+    assert checkpoint['args']['grad_accum'] == 4
+    assert checkpoint['model_summary']['optimization']['distributed'] == distributed
+    assert checkpoint['data_identity'] == report['data_identity']
+    assert checkpoint['ema']['updates'] == step
+print(json.dumps({
+    'step': report['step'],
+    'objects': report['data_identity']['object_count'],
+    'sequences': report['data_identity']['sample_count'],
+    'distributed': distributed,
+    'effective_exposures_per_object': report['global_micro_samples'] / 868,
+    'ema': report['ema'],
+}, indent=2))
+print('T1 PASS')
+PY
+)
+
+
+# V0：source-balanced checkpoint-dev16上粗选step和raw/EMA。
+# 固定CFG=1、seed42，只消费indices0-15；共8个顺序执行的长评估。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${GPU:-2}
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  DIAG=${RUN}/checkpoint_weight_selection_dev16_v1
+  mkdir -p "${DIAG}/logs"
+
+  for STEP in 500 1000 1500 2000; do
+    PAD=$(printf '%06d' "${STEP}")
+    CKPT=${RUN}/checkpoints/step_${PAD}.pt
+    test -s "${CKPT}" || exit 96
+    for WEIGHTS in ema raw; do
+      OUT=${DIAG}/step${PAD}_${WEIGHTS}_cfg1_seed42
+      LOG=${DIAG}/logs/step${PAD}_${WEIGHTS}_cfg1_seed42.log
+      if [ -s "${OUT}/calibration.json" ]; then
+        echo "reuse V0 step=${STEP} weights=${WEIGHTS}"
+      elif [ -e "${OUT}" ]; then
+        echo "V0 partial output exists; preserve and inspect: ${OUT}"
+        exit 98
+      else
+        set +e
+        env \
+          CUDA_VISIBLE_DEVICES="${GPU}" \
+          HF_HUB_OFFLINE=1 \
+          TRANSFORMERS_OFFLINE=1 \
+          ATTN_BACKEND=flash_attn \
+          SPCONV_ALGO=native \
+          PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+          "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon \
+            --mode calibrate \
+            --cache_manifest "${VAL}" \
+            --indices 0-15 \
+            --checkpoint "${CKPT}" \
+            --output_dir "${OUT}" \
+            --weights "${WEIGHTS}" \
+            --joint_seeds 42 \
+            --candidate_cfg_strengths 1 \
+            --steps 25 \
+            --cfg_interval 0.5,1.0 \
+            --guidance_rescale 0 \
+            --rescale_t 3 \
+            --amp_dtype bf16 \
+            --bootstrap_samples 3000 \
+            --min_iou_gain_mean 0 \
+            --min_recall_gain_mean 0 \
+            --min_latent_mse_gain_mean 0 \
+            --min_count_ratio 0.85 \
+            --max_count_ratio 1.20 \
+          2>&1 | tee "${LOG}"
+        RC=${PIPESTATUS[0]}
+        set -e
+        echo "V0 step=${STEP} weights=${WEIGHTS} RC=${RC}"
+        if [ "${RC}" -ne 0 ] && [ "${RC}" -ne 2 ]; then exit "${RC}"; fi
+        test -s "${OUT}/calibration.json" || exit 96
+      fi
+    done
+  done
+)
+
+
+# V1：预注册选择。8个候选都失败时停止，不消费CFG16和final32。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  DIAG=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/checkpoint_weight_selection_dev16_v1
+  OUT=${DIAG}/coarse_selection.json
+
+  if [ -s "${OUT}" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}')); print(json.dumps(p, indent=2)); assert p['passed'] is True"
+  elif [ -e "${OUT}" ]; then
+    echo "V1 partial output exists: ${OUT}"
+    exit 98
+  else
+    "${PY}" -u -m pose_point_depth_mv.native_ss_mixed1k_protocol select-coarse \
+      --input_dir "${DIAG}" \
+      --output "${OUT}"
+  fi
+)
+
+
+# V2：独立source-balanced CFG16（indices16-31）上选择CFG=1/3/5。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${GPU:-2}
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  SEL=${RUN}/checkpoint_weight_selection_dev16_v1/coarse_selection.json
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  OUT=${RUN}/cfg_calibration_sourcebalanced16_seed424344_v1
+  LOG=${ROOT}/logs/V2_cfg_calibration_sourcebalanced16.log
+
+  test -s "${SEL}" || exit 96
+  CKPT=$("${PY}" -c "import json; print(json.load(open('${SEL}'))['selected']['checkpoint'])")
+  WEIGHTS=$("${PY}" -c "import json; print(json.load(open('${SEL}'))['selected']['weights'])")
+  test -s "${CKPT}" || exit 96
+  if [ -s "${OUT}/calibration.json" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}/calibration.json')); print(json.dumps({'passed':p['passed'],'selected':p['selected']}, indent=2)); assert p['passed'] is True"
+  elif [ -e "${OUT}" ]; then
+    echo "V2 partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    set +e
+    env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon \
+        --mode calibrate \
+        --cache_manifest "${VAL}" \
+        --indices 16-31 \
+        --checkpoint "${CKPT}" \
+        --output_dir "${OUT}" \
+        --weights "${WEIGHTS}" \
+        --joint_seeds 42,43,44 \
+        --candidate_cfg_strengths 1,3,5 \
+        --steps 25 \
+        --cfg_interval 0.5,1.0 \
+        --guidance_rescale 0 \
+        --rescale_t 3 \
+        --amp_dtype bf16 \
+        --bootstrap_samples 5000 \
+        --min_iou_gain_mean 0 \
+        --min_recall_gain_mean 0 \
+        --min_latent_mse_gain_mean 0 \
+        --min_count_ratio 0.85 \
+        --max_count_ratio 1.20 \
+      2>&1 | tee "${LOG}"
+    RC=${PIPESTATUS[0]}
+    set -e
+    echo "V2_RC=${RC}"
+    if [ "${RC}" -ne 0 ] && [ "${RC}" -ne 2 ]; then exit "${RC}"; fi
+    test -s "${OUT}/calibration.json" || exit 96
+    [ "${RC}" -eq 0 ] || exit 2
+  fi
+)
+
+# V2监视命令（另一个终端复制）：
+tail -f '/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/logs/V2_cfg_calibration_sourcebalanced16.log'
+
+
+# V3：给校准增加IoU/recall对象胜率和count-ratio median保护。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  CAL=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/cfg_calibration_sourcebalanced16_seed424344_v1/calibration.json
+  OUT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/cfg_calibration_sourcebalanced16_seed424344_v1/strict_audit.json
+
+  if [ -s "${OUT}" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}')); print(json.dumps(p, indent=2)); assert p['passed'] is True"
+  else
+    "${PY}" -u -m pose_point_depth_mv.native_ss_mixed1k_protocol audit-calibration \
+      --calibration "${CAL}" \
+      --output "${OUT}"
+  fi
+)
+
+
+# V4：一次性final32。只使用V1的checkpoint/raw-EMA和V2的CFG，不再调参。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${GPU:-2}
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  SEL=${RUN}/checkpoint_weight_selection_dev16_v1/coarse_selection.json
+  CAL=${RUN}/cfg_calibration_sourcebalanced16_seed424344_v1/calibration.json
+  CAL_AUDIT=${RUN}/cfg_calibration_sourcebalanced16_seed424344_v1/strict_audit.json
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  OUT=${RUN}/final_sourcebalanced32_seed424344_v1
+  LOG=${ROOT}/logs/V4_final_sourcebalanced32.log
+
+  test -s "${CAL_AUDIT}" || exit 96
+  "${PY}" -c "import json; assert json.load(open('${CAL_AUDIT}'))['passed'] is True" || exit 96
+  CKPT=$("${PY}" -c "import json; print(json.load(open('${SEL}'))['selected']['checkpoint'])")
+  WEIGHTS=$("${PY}" -c "import json; print(json.load(open('${SEL}'))['selected']['weights'])")
+  if [ -s "${OUT}/report.json" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}/report.json')); print(json.dumps({'passed':p['passed'],'checks':p['checks']}, indent=2))"
+  elif [ -e "${OUT}" ]; then
+    echo "V4 partial output exists; preserve and inspect: ${OUT}"
+    exit 98
+  else
+    set +e
+    env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon \
+        --mode evaluate \
+        --cache_manifest "${VAL}" \
+        --indices 32-63 \
+        --checkpoint "${CKPT}" \
+        --calibration "${CAL}" \
+        --output_dir "${OUT}" \
+        --weights "${WEIGHTS}" \
+        --joint_seeds 42,43,44 \
+        --steps 25 \
+        --cfg_interval 0.5,1.0 \
+        --guidance_rescale 0 \
+        --rescale_t 3 \
+        --amp_dtype bf16 \
+        --bootstrap_samples 10000 \
+        --min_iou_gain_mean 0 \
+        --min_iou_win_rate 0.5 \
+        --min_recall_gain_mean 0 \
+        --min_latent_mse_gain_mean 0 \
+        --min_count_ratio 0.85 \
+        --max_count_ratio 1.20 \
+        --min_pose_control_iou_advantage 0 \
+      2>&1 | tee "${LOG}"
+    RC=${PIPESTATUS[0]}
+    set -e
+    echo "V4_RC=${RC}"
+    if [ "${RC}" -ne 0 ] && [ "${RC}" -ne 2 ]; then exit "${RC}"; fi
+    test -s "${OUT}/report.json" || exit 96
+  fi
+)
+
+# V4监视命令（另一个终端复制）：
+tail -f '/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/logs/V4_final_sourcebalanced32.log'
+
+
+# V5：按四来源汇总final，并施加Direct-SS式强门。
+# 来源内n=8只作安全诊断；正式总体统计单位仍为32个object。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REPORT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/report.json
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/split_audit.json
+  OUT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/final_sourcebalanced32_seed424344_v1/source_strict_summary.json
+
+  if [ -s "${OUT}" ]; then
+    "${PY}" -c "import json; p=json.load(open('${OUT}')); print(json.dumps(p, indent=2)); assert p['passed'] is True"
+  else
+    "${PY}" -u -m pose_point_depth_mv.native_ss_mixed1k_protocol summarize-final \
+      --report "${REPORT}" \
+      --split_audit "${SPLIT}" \
+      --output "${OUT}"
+  fi
+)
+
+
+# 判读：
+#   V1失败：扩大数据后仍无可部署checkpoint/raw-EMA候选，停止。
+#   V2/V3失败：没有稳定CFG，停止，不消费final32。
+#   V4基础门或V5强门失败：保留报告，停止Native SLAT/Mesh。
+#   V5通过：只证明Native SS在四来源均衡final上优于Stock；SLAT和Mesh仍需独立门。

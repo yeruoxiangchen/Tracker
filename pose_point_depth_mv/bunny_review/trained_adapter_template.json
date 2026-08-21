@@ -1,0 +1,46 @@
+{
+  "format": "pose_point_depth_mv.bunny_command_adapter.v1",
+  "adapter_id": "replace_with_current_training_runtime",
+  "cwd": "/home/zjr/Tracker",
+  "environment": {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "ATTN_BACKEND": "flash_attn",
+    "SPCONV_ALGO": "native"
+  },
+  "command": [
+    "/home/zjr/anaconda3/envs/reconviagen/bin/python",
+    "-u",
+    "-m",
+    "REPLACE_WITH_CURRENT_INFERENCE_MODULE",
+    "--protocol",
+    "{protocol}",
+    "--output_dir",
+    "{output_dir}"
+  ],
+  "expected_mesh": "mesh.glb",
+  "input_view_indices": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "checkpoint_paths": [
+    "/REPLACE/WITH/CHECKPOINT.pt"
+  ],
+  "code_paths": [
+    "/home/zjr/Tracker/REPLACE_WITH_CURRENT_INFERENCE_CODE.py"
+  ],
+  "input_contract": {
+    "images": "five frozen RGBA paths are available in adapter_context.json",
+    "camera": "uncalibrated",
+    "sparse_points": "must be declared by the concrete adapter",
+    "tm2w": "must be declared by the concrete adapter"
+  },
+  "reference_mesh_declared_as_model_input": false,
+  "notes": [
+    "Copy this template to a new filename and replace only the current-model command/checkpoint fields.",
+    "The command must write expected_mesh below {output_dir}; the shared review/finalize code remains unchanged."
+  ]
+}

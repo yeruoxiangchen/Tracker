@@ -1,0 +1,509 @@
+当前实验是否应减少 corruption、转向相对 base 改善
+====================================================
+
+结论
+----
+
+可以，而且当前阶段应该这样调整：
+
+  主目标：证明新模型在 object-disjoint 数据上优于 stock ReconViaGen。
+
+  次目标：检查收益是否至少没有完全依赖错误的 pose/depth/visual 绑定。
+
+  Corruption 不再作为扩大训练数据之前的绝对硬门，但不能完全删除。它应从“决定模型
+能不能继续”的主指标，降为“解释收益来源和部署安全性”的辅助指标。
+
+原因是此前的标准同时要求：
+
+  correct > stock
+  correct > pose corruption
+  correct > depth corruption
+  correct > visual corruption
+  corruptions 接近 stock
+  多个 t、多个 seed、对象胜率和 bootstrap CI 全部通过
+
+这适合证明严格 correspondence 机制，但对于当前问题过于苛刻。我们现在首先需要回答的
+更基础问题是：
+
+  给 Flow 提供 pose、depth、多视角 visual feature 和 sparse point，
+  是否能提高 ReconViaGen 的生成质量？
+
+如果连这个问题都没有正面结果，继续细分 corruption 没有价值。
+
+
+新的指标优先级
+--------------
+
+一级：相对 stock ReconViaGen 的改善
+
+Teacher-forced：
+
+  correct Flow loss < stock Flow loss
+  relative gain mean > 0
+  relative gain median > 0
+  object win rate >= 55%
+  5 个 t 中至少 3 个为正
+
+Sampling/geometry：
+
+  correct rollout IoU >= stock
+  precision 不稳定下降
+  recall、component count、largest component ratio 同时报告
+  后续完整 mesh 增加 Chamfer、F-score、normal consistency
+
+这是决定是否扩大到完整 897-object train split 的主门。
+
+
+二级：视角数量是否带来额外收益
+
+对同一对象、同一 noise 比较：
+
+  stock_2view / stock_4view / stock_8view
+  correct_2view / correct_4view / correct_8view
+
+重点计算：
+
+  physical 多视角净收益
+  =
+  (correct_8view - stock_8view)
+  -
+  (correct_2view - stock_2view)
+
+否则只能说明 ReconViaGen 本身从更多图像获益，不能说明新 pose/depth lifting 有贡献。
+
+
+三级：最小 corruption 检查
+
+训练和普通 checkpoint trajectory 不再每次做完整 corruption 网格。保留两类最关键控制：
+
+  pose_cyclic1
+  depth_view_cyclic1
+
+visual_view_cyclic1 可以只在最终最佳 checkpoint 上运行一次。
+
+Corruption 的最低要求改为：
+
+  correct 平均不劣于 pose/depth corruption；
+  corruption 不应系统性显著优于 correct；
+  physical-off/null 必须继续 bit-exact stock。
+
+不再要求所有 corruption 都严格回到 stock，也不再要求它们全部达到 55% 或 65% 对象胜率。
+
+
+训练目标调整建议
+----------------
+
+当前训练每个 micro-step 都计算一个 corruption，并使用：
+
+  wrong_stock_weight = 0.05
+  rank_weight = 0.05
+
+若目标转向 base 改善，建议 pilot 改为：
+
+  flow_weight = 1.0
+  occupancy_weight = 0.001
+  correct_gain_weight = 0.05
+  wrong_stock_weight = 0.01
+  rank_weight = 0.01
+  delta_norm_weight = 0.001
+
+并进一步考虑：
+
+  75% micro-step：只训练 correct-vs-target
+  25% micro-step：额外计算 pose/depth corruption
+
+这样大部分算力用于学习正确输入如何改善 Flow，corruption 只用于防止模型完全忽略对应关系。
+
+当前代码仍在每个 micro-step 计算 wrong branch。第一轮可以先只降低两个 corruption 权重，
+避免同时修改调度和权重导致无法归因；若训练速度成为主要瓶颈，再实现 25% corruption schedule。
+
+
+推荐实验顺序
+------------
+
+阶段 B0：工程 smoke
+
+  目标：finite、DDP、checkpoint、stock exact fallback。
+  当前已经通过。
+
+阶段 B1：train256 / 300 updates baseline-centered pilot
+
+  使用 180 unique objects。
+  checkpoint 50/100/150/200/250/300。
+  每个 checkpoint 先只在 val32 运行：
+
+    correct vs stock
+    1 noise seed
+    t = 0.1, 0.5, 0.9
+
+  不在轨迹阶段运行完整 corruption 和 rollout。
+
+阶段 B2：最佳 checkpoint 的正式 val64
+
+  运行：
+
+    correct vs stock，3 seeds x 5 t
+    pose corruption
+    depth corruption
+    8-object 30-step rollout
+
+  主裁决使用 benchmark_relaxed；mechanism_strict 只报告，不阻止进入下一阶段。
+
+阶段 B3：完整 897-object 训练
+
+仅当 B2 满足：
+
+  mean > 0
+  median > 0
+  object win >= 55%
+  至少 3/5 t 为正
+  rollout 没有稳定退化
+
+才构建完整 train cache并训练。
+
+阶段 B4：正式归因
+
+只有完整训练在完整 val 上相对 stock 正向后，才投入算力运行：
+
+  visual corruption
+  多种 pose/depth corruption
+  point-only / pose-depth-only / visual-only ablation
+  2/4/8-view paired evaluation
+  完整 mesh 指标
+  多训练 seed
+
+
+可以放宽到什么程度
+--------------------
+
+工程 pilot 可以接受：
+
+  object win rate >= 55%
+  mean/median 为正
+  bootstrap CI 暂时跨 0
+  mechanism_strict 暂时失败
+
+但不能接受：
+
+  train 正、object-disjoint val 负；
+  teacher-forced 正、rollout 持续负；
+  少数对象的大幅收益掩盖多数对象退化；
+  physical-off/null 不再严格等于 stock；
+  增加视角后新模型相对 stock 的净收益反而持续下降。
+
+
+最终裁决
+--------
+
+当前应该把实验重心从“先证明完美 correspondence”改为：
+
+  1. 先证明相对 stock ReconViaGen 有可重复的 object-disjoint 收益；
+  2. 再判断收益是否来自正确 pose/depth/visual 绑定；
+  3. 最后证明更多视角和完整 mesh 指标也改善。
+
+因此可以减少 corruption 测试和训练权重，但不能完全移除。最合理的比例是：
+
+  约 80% 注意力和计算预算用于 correct-vs-stock；
+  约 20% 用于最小 pose/depth corruption 安全检查。
+
+如果完整数据训练后只优于 stock、却没有 corruption specificity，仍然可以作为工程改进进行
+报告，但论文表述只能是“多视角物理增强的 ReconViaGen 微调”，不能声称已经证明了严格的
+pose-depth correspondence 因果机制。
+
+
+当前如何判断输入特征是否改善 base
+====================================
+
+一、这里的 base 是什么
+----------------------
+
+当前直接比较的 base 是：
+
+  原生 stock ReconViaGen sparse-structure Flow
+  + 原生 image/VGGT get_ss_cond
+  + Flow LoRA disabled
+  + physical branch disabled
+
+记为：
+
+  v_stock = StockFlow(x_t, t, stock_condition)
+
+新模型使用完全相同的：
+
+  x_t
+  t
+  stock image/VGGT condition
+
+但开启：
+
+  view-identity visual/pose/depth/point encoder
+  physical residual
+  SS Flow LoRA
+
+记为：
+
+  v_correct = PhysicalFlowLoRA(
+      x_t,
+      t,
+      stock_condition,
+      correct_pose_depth_visual_point
+  )
+
+两条路径的目标、noise、t 和 stock condition 完全相同。因此两者的Flow MSE差异只来自
+新加入的physical encoder和Flow LoRA，而不是使用了不同的噪声样本。
+
+
+二、target是什么
+----------------
+
+每个训练样本缓存了：
+
+  target = ss_latent["z"]
+
+形状为：
+
+  [8, 16, 16, 16]
+
+它是从监督mesh得到的目标Sparse Structure latent，代码中通常记为x_0。它不是输入给
+模型的AR先验，也不是VGGT depth；它只作为训练/teacher-forced评估的监督目标。
+
+同一个cache还保存：
+
+  target_coords
+
+它表示目标occupancy坐标，主要用于frozen decoder occupancy监督和解码后的IoU等几何指标。
+
+
+三、target velocity是什么
+------------------------
+
+target velocity不是：
+
+  相机移动速度；
+  物体位姿速度；
+  点云或mesh顶点的物理速度。
+
+它是Flow Matching在latent空间中构造的监督向量场。
+
+先采样与target同形状的高斯噪声：
+
+  epsilon ~ N(0, I)
+
+再采样时间：
+
+  t in [0, 1]
+
+ReconViaGen当前SS sampler使用：
+
+  sigma_min = 1e-5
+  s(t) = sigma_min + (1 - sigma_min) * t
+
+由目标latent x_0和噪声epsilon构造中间状态：
+
+  x_t = (1 - t) * x_0 + s(t) * epsilon
+
+代码随后计算：
+
+  target_velocity
+  =
+  [x_t - (1 - sigma_min) * x_0]
+  /
+  s(t)
+
+由于sigma_min只有1e-5，它非常接近标准Flow Matching形式：
+
+  x_t ~= (1 - t) * x_0 + t * epsilon
+
+  target_velocity ~= epsilon - x_0
+
+因此target velocity表达的是：
+
+  在当前噪声状态x_t和时间t下，Flow网络应预测怎样的latent方向，
+  才能在反向Euler积分过程中从噪声轨迹回到目标SS latent x_0。
+
+它的形状也是：
+
+  [8, 16, 16, 16]
+
+即每个SS latent位置和每个latent channel都有一个监督值。
+
+
+四、如何计算相对base改善
+------------------------
+
+对于同一个：
+
+  object
+  target x_0
+  epsilon
+  t
+  x_t
+  stock condition
+
+分别计算：
+
+  stock_loss = MSE(v_stock, target_velocity)
+
+  correct_loss = MSE(v_correct, target_velocity)
+
+然后计算相对改善：
+
+  relative_gain
+  =
+  (stock_loss - correct_loss)
+  /
+  max(stock_loss, 1e-8)
+
+解释为：
+
+  relative_gain > 0
+    新输入使预测更接近目标velocity，优于base。
+
+  relative_gain = 0
+    与base等价，没有可测改善。
+
+  relative_gain < 0
+    新输入使velocity预测更差。
+
+例如：
+
+  stock_loss   = 0.100
+  correct_loss = 0.097
+
+则：
+
+  relative_gain = 3%
+
+当前评估不会只平均所有record，而是继续按object聚合，并报告：
+
+  object-balanced mean
+  median
+  object win rate
+  每个t的mean
+  positive t count
+
+这可以避免拥有更多sequence或更大数值尺度的少数对象完全主导结论。
+
+
+五、训练时如何推动相对base改善
+------------------------------
+
+主损失是：
+
+  L_flow = MSE(v_correct, target_velocity)
+
+此外还有correct相对stock的辅助项：
+
+  relative_gain
+  =
+  (L_stock - L_correct) / max(L_stock, eps)
+
+  L_gain
+  =
+  relu(gain_margin - relative_gain)
+
+其中L_stock被detach，只作为固定参考，不反向修改stock base。
+
+当前还加入弱occupancy监督：
+
+  v_correct
+    -> sampler._pred_to_xstart(x_t, t, v_correct)
+    -> predicted x_0
+    -> frozen SS decoder
+    -> occupancy logits
+    -> 与target_coords计算BCE
+
+因此训练不完全只看velocity MSE，但Flow Matching仍是主要目标，occupancy权重目前只有0.001。
+
+
+六、这个指标能证明什么
+----------------------
+
+若在object-disjoint val/holdout上，多个noise seed和多个t都满足：
+
+  correct_loss < stock_loss
+
+则可以说明：
+
+  当前联合输入特征能够帮助模型更准确地预测目标SS latent的Flow方向。
+
+也就是说，整包输入：
+
+  多视角visual feature
+  pose/K/T/ray
+  VGGT depth和depth confidence
+  sparse point prior
+  N3 correspondence/reliability
+
+对base的teacher-forced SS Flow预测存在增量信息。
+
+
+七、这个指标不能单独证明什么
+----------------------------
+
+仅有Flow MSE改善不能直接证明：
+
+  最终30-step采样一定更好；
+  occupancy IoU一定提高；
+  最终mesh Chamfer/F-score一定提高；
+  增加视角一定提高mesh精度；
+  收益具体来自depth、pose、point还是visual中的哪一项。
+
+原因是teacher-forced只在真实target与noise构造的x_t上做单步预测。完整生成时，模型会沿着
+自己产生的状态连续运行，多步误差可能累积，也可能抵消。
+
+所以base改善需要分三级确认：
+
+  第一级：teacher-forced Flow MSE
+    判断输入是否改善局部向量场预测。
+
+  第二级：30-step SS rollout + frozen decoder
+    判断IoU、precision、recall和连通性是否改善。
+
+  第三级：完整SS -> SLAT -> mesh
+    判断Chamfer、F-score、normal consistency和最终mesh质量。
+
+当前代码已实现前两级中的teacher-forced和小规模SS rollout；完整SLAT/mesh指标与严格的
+2/4/8-view paired实验尚未实现。
+
+
+八、怎样判断单项输入特征是否有效
+------------------------------
+
+当前correct-vs-stock只判断“联合输入包”是否有效，不能直接归因单一特征。
+
+若要分别判断，应使用相同训练预算或至少相同checkpoint进行以下消融：
+
+  visual only
+  visual + pose
+  visual + pose + depth
+  visual + pose + depth + point
+  full without N3 score
+  full model
+
+最有信息量的增量比较是：
+
+  depth增量
+  = gain(visual + pose + depth) - gain(visual + pose)
+
+  point增量
+  = gain(full) - gain(visual + pose + depth)
+
+  N3增量
+  = gain(full) - gain(full without N3 score)
+
+这些消融同样必须使用相同object、noise、t和stock condition。否则不能把MSE差异归因于
+对应输入特征。
+
+
+当前实际结论
+------------
+
+目前direct Flow只完成1-update smoke。该报告中的：
+
+  relative_gain ~= -0.00405，即约-0.405%
+
+但它只有1个样本和1次更新，只能验证代码链路，不能判定输入有效或无效。
+
+必须完成train256 checkpoint trajectory和object-disjoint val64后，才能用上述协议判断相对
+base是否真正改善。

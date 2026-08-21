@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# 将已经完成的 6-case / seed42 评估结果渲染成四列：
+#   GT / ReconViaGen original / Direct stock / Direct Full step100
+#
+# 不运行模型推理，也不包含 Pixal3D。每个对象的四列严格共享：
+#   1. 评估报告冻结的 canonical 坐标变换；
+#   2. 仅由该对象 GT 推导的一次性显示缩放/居中；
+#   3. 同一条 turntable 相机轨迹。
+#
+# 默认占用一张 GPU，例如：
+#   GPU=4 bash pose_point_depth_mv/GT_ReconViaGen_Stock_Full同输入6例公共相机渲染命令_20260730.txt
+
+set -euo pipefail
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-4}
+INPUT_REPORT=/data/zjr/reconviagen_stock_full_sameinput_step100_mesh6_seed42_20260730_v1/report.json
+OUTPUT_DIR=/data/zjr/reconviagen_stock_full_sameinput_step100_mesh6_seed42_20260730_v1/render_gt_recon_stock_full_rigidpose_v3
+LOG=${OUTPUT_DIR}.log
+
+if [ ! -x "${PY}" ]; then
+  echo "blocked: Python is missing: ${PY}"
+  exit 96
+fi
+if [ ! -s "${INPUT_REPORT}" ]; then
+  echo "blocked: six-case evaluation report is missing: ${INPUT_REPORT}"
+  exit 96
+fi
+
+"${PY}" -u -m pose_point_depth_mv.render_reconviagen_stock_full_six \
+  --input_report "${INPUT_REPORT}" \
+  --output_dir "${OUTPUT_DIR}" \
+  --expected_objects 6 \
+  --preflight_only
+
+mkdir -p "$(dirname "${LOG}")"
+CUDA_VISIBLE_DEVICES="${GPU}" \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+"${PY}" -u -m pose_point_depth_mv.render_reconviagen_stock_full_six \
+  --input_report "${INPUT_REPORT}" \
+  --output_dir "${OUTPUT_DIR}" \
+  --expected_objects 6 \
+  --device cuda \
+  --frames 72 \
+  --resolution 320 \
+  --fps 12 \
+  --contact_frames 6 \
+  --display_margin 0.9 \
+  --alignment_mode rigid_pose_gt \
+  --alignment_seed 20260730 \
+  --candidate_samples 1000 \
+  --alignment_samples 4000 \
+  --candidate_iterations 8 \
+  --final_iterations 30 \
+  2>&1 | tee "${LOG}"
+RENDER_RC=${PIPESTATUS[0]}
+
+echo "RENDER_RC=${RENDER_RC}"
+echo "六例总览: ${OUTPUT_DIR}/all_six_normal_contact_sheet.png"
+echo "HTML: ${OUTPUT_DIR}/index.html"
+echo "report: ${OUTPUT_DIR}/report.json"
+echo "各对象: ${OUTPUT_DIR}/cases/<pair_id>/normal_contact_sheet.png"
+echo "current terminal remains open"
+exit "${RENDER_RC}"

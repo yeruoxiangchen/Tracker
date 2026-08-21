@@ -1,0 +1,342 @@
+# Direct-SLAT V4 step100/200/300/400 统一评估命令
+# 2026-07-29
+#
+# 目的：
+# - 在完全相同的 val 对象、noise、CFG、坐标与 25-step sampler 下比较四个 checkpoint。
+# - 同时汇总：
+#     1. 每 100-step 训练窗口的 teacher/rollout/endpoint proxy；
+#     2. 8-object teacher-forced 诊断；
+#     3. 6-object same-coordinate same-noise Full-vs-Stock Mesh；
+#     4. 部署 rollout 中 raw/effective residual 与 raw-ratio 超 cap 比例。
+# - 只做 exploratory checkpoint selection；不能据此宣称 Full > Stock。
+#
+# 已有并复用：
+# - step100 checkpoint、teacher、Mesh；
+# - step400 checkpoint、Mesh。
+#
+# 需要新跑：
+# - step200/300/400 teacher；
+# - step200/300 Mesh。
+#
+# GPU：
+# - 所有新评估严格串行，只使用 1 张 GPU。
+# - 运行前把 GPU 改为真正空闲的卡；不要与 Mixed10k 渲染或他人任务重叠。
+# - 本文件不会启动训练，不会修改任何 checkpoint。
+
+
+###############################################################################
+# E0. 公共变量与静态检查（每个新终端先执行）
+###############################################################################
+
+cd /home/zjr/Tracker
+set +e
+set -o pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+
+# 必须根据 nvidia-smi 修改。例如：
+#   export GPU=3
+GPU=${GPU:-3}
+
+TRAIN_CACHE=/data/zjr/ar_slat_direct_train_all_step000900_seed424344_lhslatv2_20260723
+VAL_CACHE=/data/zjr/ar_slat_direct_val_all_step000900_seed424344_lhslatv2_20260723
+
+V4_WORK=/data/zjr/direct_slat_v4_rollout_endpoint_20260728
+TRAIN100=${V4_WORK}/train897_step100_seed42_2gpu_v1
+LONG400=${V4_WORK}/train897_step400_from_step100_seed42_2gpu_v1
+
+CKPT100=${TRAIN100}/checkpoints/step_000100.pt
+CKPT200=${LONG400}/checkpoints/step_000200.pt
+CKPT300=${LONG400}/checkpoints/step_000300.pt
+CKPT400=${LONG400}/checkpoints/step_000400.pt
+
+CURVE_WORK=/data/zjr/direct_slat_v4_checkpoint_curve_step100_200_300_400_seed42_20260729_v1
+LOG_ROOT=${CURVE_WORK}/logs
+AGG=${CURVE_WORK}/aggregate_v1
+
+TEACHER100=${TRAIN100}/eval_val8_activecfg_seed42_t0579_v1
+TEACHER200=${CURVE_WORK}/teacher_step000200_val8_activecfg_seed42_t0579_v1
+TEACHER300=${CURVE_WORK}/teacher_step000300_val8_activecfg_seed42_t0579_v1
+TEACHER400=${CURVE_WORK}/teacher_step000400_val8_activecfg_seed42_t0579_v1
+
+MESH100=${TRAIN100}/mesh6_v4_seed42_v1
+MESH200=${CURVE_WORK}/mesh_step000200_same6_seed42_v1
+MESH300=${CURVE_WORK}/mesh_step000300_same6_seed42_v1
+MESH400=${LONG400}/mesh6_v4_seed42_v1
+
+MATRIX_UIDS=0d18146b4fdd40ef9dfeb08e19fc4335_seq000,0cd491abba6140dda5eea7c4c2452979_seq000,29ddf51d78ae455caba970b9cd3eb75c_seq001,092bb80346414104abd5cace71892752_seq000,04d712a0dae0421cae9083484f4332ee_seq001,262afaaf596a4cf683f74b5768bd4db8_seq000
+
+mkdir -p "${LOG_ROOT}"
+
+run_logged() {
+  LOG_PATH=$1
+  shift
+  set +e
+  "$@" 2>&1 | tee "${LOG_PATH}"
+  COMMAND_RC=${PIPESTATUS[0]}
+  printf '%s\n' "${COMMAND_RC}" > "${LOG_PATH}.exit_code"
+  return "${COMMAND_RC}"
+}
+
+nvidia-smi \
+  --query-gpu=index,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+
+E0_RC=0
+for PATH_TO_CHECK in \
+  "${TRAIN_CACHE}/manifest.json" \
+  "${VAL_CACHE}/manifest.json" \
+  "${LONG400}/report.json" \
+  "${CKPT100}" "${CKPT200}" "${CKPT300}" "${CKPT400}" \
+  "${TEACHER100}/report.json" \
+  "${MESH100}/report.json" "${MESH400}/report.json"; do
+  if [ ! -s "${PATH_TO_CHECK}" ]; then
+    echo "E0 missing: ${PATH_TO_CHECK}"
+    E0_RC=96
+  fi
+done
+
+if [ "${E0_RC}" -eq 0 ]; then
+  "${PY}" -m py_compile \
+    pose_point_depth_mv/summarize_direct_slat_checkpoint_curve.py \
+    pose_point_depth_mv/eval_direct_slat_flow.py \
+    pose_point_depth_mv/export_direct_slat_mesh_pairs.py || E0_RC=$?
+fi
+if [ "${E0_RC}" -eq 0 ]; then
+  "${PY}" -m unittest \
+    pose_point_depth_mv.test_direct_slat_checkpoint_curve || E0_RC=$?
+fi
+
+echo "E0_RC=${E0_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# E1. 统一 8-object teacher-forced 评估
+###############################################################################
+
+# step100 已存在，会直接复用。step200/300/400 串行运行。
+
+for SPEC in \
+  "100:${CKPT100}:${TEACHER100}" \
+  "200:${CKPT200}:${TEACHER200}" \
+  "300:${CKPT300}:${TEACHER300}" \
+  "400:${CKPT400}:${TEACHER400}"; do
+  IFS=: read -r STEP CHECKPOINT OUTPUT_DIR <<<"${SPEC}"
+  if [ -s "${OUTPUT_DIR}/report.json" ]; then
+    echo "reuse teacher step${STEP}: ${OUTPUT_DIR}"
+  elif [ -e "${OUTPUT_DIR}" ]; then
+    echo "E1 blocked: partial teacher output exists; preserve and inspect: ${OUTPUT_DIR}"
+  else
+    run_logged "${LOG_ROOT}/teacher_step${STEP}.log" env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.eval_direct_slat_flow \
+        --cache_manifest "${VAL_CACHE}/manifest.json" \
+        --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+        --checkpoint "${CHECKPOINT}" \
+        --output_dir "${OUTPUT_DIR}" \
+        --pretrained "${PRETRAINED}" \
+        --max_objects 8 \
+        --noise_seeds 42 \
+        --t_values 0.5,0.7,0.9 \
+        --amp_dtype bf16 \
+        --bootstrap_samples 2000 \
+        --min_object_win_rate 0.50 \
+        --decision_profile report_only
+    E1_ITEM_RC=$?
+    echo "teacher step${STEP} rc=${E1_ITEM_RC}"
+    if [ "${E1_ITEM_RC}" -ne 0 ]; then
+      echo "E1 stopped at step${STEP}"
+      break
+    fi
+  fi
+done
+
+echo "current terminal remains open"
+
+
+###############################################################################
+# E2. 统一 6-object same-coordinate same-noise Mesh 评估
+###############################################################################
+
+# step100/400 已存在，会直接复用。只新跑 step200/300。
+# 这里所有 Full/Stock：
+# - 共用 frozen Direct-SS corrected coordinates；
+# - 共用 object_uid_v1 初始噪声；
+# - 使用相同 25-step native schedule、CFG=5、active interval=[0.5,1.0]。
+
+for SPEC in \
+  "100:${CKPT100}:${MESH100}" \
+  "200:${CKPT200}:${MESH200}" \
+  "300:${CKPT300}:${MESH300}" \
+  "400:${CKPT400}:${MESH400}"; do
+  IFS=: read -r STEP CHECKPOINT OUTPUT_DIR <<<"${SPEC}"
+  if [ -s "${OUTPUT_DIR}/report.json" ]; then
+    echo "reuse Mesh step${STEP}: ${OUTPUT_DIR}"
+  elif [ -e "${OUTPUT_DIR}" ]; then
+    echo "E2 blocked: partial Mesh output exists; preserve and inspect: ${OUTPUT_DIR}"
+  else
+    run_logged "${LOG_ROOT}/mesh_step${STEP}.log" env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+        --cache_manifest "${VAL_CACHE}/manifest.json" \
+        --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+        --checkpoint "${CHECKPOINT}" \
+        --output_dir "${OUTPUT_DIR}" \
+        --pretrained "${PRETRAINED}" \
+        --uids "${MATRIX_UIDS}" \
+        --joint_seeds 42 \
+        --steps 25 \
+        --cfg_strength 5.0 \
+        --cfg_interval 0.5,1.0 \
+        --rescale_t 3.0 \
+        --slat_guided_delta_policy post_cfg_v2 \
+        --slat_delta_bound_mode smooth_rms_v2 \
+        --support_interval_policy cfg_active_only_v1 \
+        --surface_samples 20000 \
+        --bootstrap_samples 5000 \
+        --amp_dtype bf16 \
+        --noise_identity_mode object_uid_v1
+    E2_ITEM_RC=$?
+    echo "Mesh step${STEP} rc=${E2_ITEM_RC}"
+    if [ "${E2_ITEM_RC}" -ne 0 ]; then
+      echo "E2 stopped at step${STEP}"
+      break
+    fi
+  fi
+done
+
+echo "current terminal remains open"
+
+
+###############################################################################
+# E3. CPU 汇总四 checkpoint 曲线
+###############################################################################
+
+E3_RC=0
+for REQUIRED_REPORT in \
+  "${TEACHER100}/report.json" "${TEACHER200}/report.json" \
+  "${TEACHER300}/report.json" "${TEACHER400}/report.json" \
+  "${MESH100}/report.json" "${MESH200}/report.json" \
+  "${MESH300}/report.json" "${MESH400}/report.json"; do
+  if [ ! -s "${REQUIRED_REPORT}" ]; then
+    echo "E3 blocked: missing ${REQUIRED_REPORT}"
+    E3_RC=96
+  fi
+done
+
+if [ "${E3_RC}" -ne 0 ]; then
+  true
+elif [ -s "${AGG}/report.json" ]; then
+  echo "reuse immutable aggregate: ${AGG}"
+elif [ -e "${AGG}" ]; then
+  echo "E3 blocked: partial aggregate exists; preserve and inspect: ${AGG}"
+  E3_RC=98
+else
+  run_logged "${LOG_ROOT}/aggregate.log" \
+    "${PY}" -u -m pose_point_depth_mv.summarize_direct_slat_checkpoint_curve \
+      --training_report "${LONG400}/report.json" \
+      --checkpoint "100=${CKPT100}" \
+      --checkpoint "200=${CKPT200}" \
+      --checkpoint "300=${CKPT300}" \
+      --checkpoint "400=${CKPT400}" \
+      --teacher_report "100=${TEACHER100}/report.json" \
+      --teacher_report "200=${TEACHER200}/report.json" \
+      --teacher_report "300=${TEACHER300}/report.json" \
+      --teacher_report "400=${TEACHER400}/report.json" \
+      --mesh_report "100=${MESH100}/report.json" \
+      --mesh_report "200=${MESH200}/report.json" \
+      --mesh_report "300=${MESH300}/report.json" \
+      --mesh_report "400=${MESH400}/report.json" \
+      --expected_steps 100,200,300,400 \
+      --window_steps 100 \
+      --output_dir "${AGG}"
+  E3_RC=$?
+fi
+
+echo "E3_RC=${E3_RC}"
+test -s "${AGG}/summary.txt" && sed -n '1,220p' "${AGG}/summary.txt"
+echo "report: ${AGG}/report.json"
+echo "curve: ${AGG}/curve.csv"
+echo "current terminal remains open"
+
+
+###############################################################################
+# E4. 汇总产物严格检查
+###############################################################################
+
+E4_RC=0
+if [ ! -s "${AGG}/report.json" ]; then
+  echo "E4 blocked: run E1-E3 first"
+  E4_RC=96
+else
+  "${PY}" -c \
+    'import json,math,sys
+r=json.load(open(sys.argv[1]))
+assert r["format"]=="pose_point_depth_mv.direct_slat_checkpoint_curve.v1"
+assert r["formal"] is False
+assert [row["step"] for row in r["rows"]]==[100,200,300,400]
+assert all(row["deployed_flow"]["inactive_interval"]["exact_stock_pass"]
+           for row in r["rows"])
+assert all(row["teacher"]["object_count"]==8 for row in r["rows"])
+assert all(row["mesh"]["object_count"]==6 for row in r["rows"])
+assert all(row["mesh"]["formal"] is False for row in r["rows"])
+for row in r["rows"]:
+    active=row["deployed_flow"]["active_interval"]
+    for key in ("raw_ratio_over_cap_rate",
+                "raw_delta_to_stock_rms_mean",
+                "effective_delta_to_stock_rms_mean"):
+        assert math.isfinite(float(active[key]))
+print(json.dumps({
+  "passed":True,
+  "steps":[row["step"] for row in r["rows"]],
+  "teacher_objects":8,
+  "mesh_objects":6,
+  "formal":False,
+  "automatic_checkpoint_selection":
+      r["decision"]["automatic_checkpoint_selection"],
+},indent=2))' \
+    "${AGG}/report.json"
+  E4_RC=$?
+fi
+
+echo "E4_RC=${E4_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# 如何裁决
+###############################################################################
+
+# 1. 最先看 curve.csv / summary.txt 中的 Mesh：
+#    Chamfer improvement、F-score delta、normal delta、LCR delta。
+#
+# 2. teacher/rollout gain 上升，但 Mesh 不上升：
+#    判为 proxy -> rollout/decoder mismatch，不能继续单纯增加训练步数。
+#
+# 3. raw-ratio-over-cap 持续升高、raw delta ratio 升高，而 effective ratio 与
+#    Mesh 基本不变：
+#    判为模型在推 residual 到 trust-region 边界。
+#
+# 4. 本协议只有 6 objects × 1 seed，因此无论哪个 checkpoint 看起来最好，
+#    都只能选候选；随后必须冻结 fresh blind、更多对象、多 seed 协议。
+#
+# 5. 不要在 E1-E4 完成前删除任何已有 step100/400 产物，也不要覆盖 partial
+#    output。若出现 partial，保留目录并查看对应 logs/*.log 和 .exit_code。

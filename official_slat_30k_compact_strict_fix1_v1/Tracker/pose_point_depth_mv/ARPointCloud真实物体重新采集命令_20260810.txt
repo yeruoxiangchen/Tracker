@@ -1,0 +1,188 @@
+Pose+Mask 真实物体采集 + No-VGGT 完整重建（一条服务命令）
+============================================================
+
+目的
+----
+只启动一个 Python 服务，与现有手机客户端完成以下完整闭环：
+1. 录制 RGB、AR 相机位姿/内参；ARPointCloudManager 世界点只是可选诊断数据。
+2. 用户在手机上点选物体，沿用原有 SAM2 video 分割与视角 QC。
+3. 固化全部有效 RGB/mask/pose/K，不以 AR 点云作为重建门。
+4. 自动构建 runtime-O 与 DINO-only 输入。
+5. 自动运行当前 mixed real+synth No-VGGT Native-SS + Native-SLat。
+6. 导出 runtime-O OBJ、AR 稀疏世界坐标 OBJ、世界坐标 GLB 和 6 张 Mesh 环绕预览图。
+
+不再运行旧 ReconViaGen 或 CoarseModel 强制几何变形，也不读取 GT。默认输出的是
+完整几何 Mesh；世界坐标 GLB 是快速几何 GLB，不执行额外 Gaussian/UV 纹理重放。
+
+手机端交互沿用 CoarseModel/connect/server.py 的同一套流程：开始录制、
+上传、预处理、点选物体、SAM2 分割、输入 QC 和生成。默认 `pose_mask`
+主线不要求 Unity 绑定或上传 ARPointCloudManager 点云。
+
+0. Unity Inspector（Pose+Mask 主线）
+------------------------------------------------
+1. 必须正常上传与 RGB 帧严格同步的 AR pose 和相机内参。
+2. 必须完成 SAM2 mask，mask 不能为空或包含大块背景。
+3. serverURL 指向本机局域网地址，例如 http://192.168.1.10:5000。
+4. `pointCloudManager` 和 `uploadSlamPoints` 可以关闭；即使有上传，点云也只作诊断留档。
+
+1. 启动采集 + 重建服务（推荐的最短前台命令）
+------------------------------------------------------
+cd /home/zjr/Tracker
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python pose_point_depth_mv/collect_ar_object_server.py
+
+上述两行即是完整服务启动方式。脚本内置的当前部署默认值为：
+- GPU 4
+- 输出根目录 /home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR
+- 0.0.0.0:5000
+- 离线 Hugging Face/Transformers
+- 强制输入 QC
+- Pose+Mask runtime-O，不读取、融合或筛选 AR 点云
+- 8 帧模型输入、6 张 512 x 512 Mesh 预览图
+
+这是前台服务：当前终端必须保持打开，控制台输出就是实时日志，按 Ctrl+C 停止服务。
+不要再加 &、nohup、tmux 或 detached launcher。
+
+1.1 完整参数版（仅在需要覆盖 GPU、端口、输出目录或筛选阈值时使用）
+------------------------------------------------------------------
+cd /home/zjr/Tracker
+
+ENV_BIN=/home/zjr/anaconda3/envs/reconviagen/bin
+PY=${ENV_BIN}/python
+GPU=${GPU:-4}
+OUT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR
+
+mkdir -p "${OUT}"
+
+PATH="${ENV_BIN}:${PATH}" \
+CUDA_VISIBLE_DEVICES="${GPU}" \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+RECON_ENFORCE_INPUT_QC=1 \
+"${PY}" -u -m pose_point_depth_mv.collect_ar_object_server \
+  --output_root "${OUT}" \
+  --host 0.0.0.0 \
+  --port 5000 \
+  --gpu "${GPU}" \
+  --geometry_mode pose_mask \
+  --preview_render_frames 24 \
+  --preview_count 6 \
+  --preview_resolution 512
+
+上述命令已经冻结到当前部署文件：
+- mixed No-VGGT SS step 2000 EMA
+- mixed No-VGGT SLat step 2000 EMA
+- SS/SLat 真实 Full EMA 迁移合同
+- stock SLat freeze v2
+
+如需覆盖 checkpoint，可使用服务的 --native_ss_checkpoint、
+--native_slat_checkpoint、--ss_migration_contract、--slat_migration_contract 和
+--stock_slat_freeze 参数。正常采集不要加 --capture_only。
+
+2. 每个物体的采集方法
+--------------------
+1. 手机点击开始录制后，围绕物体缓慢移动一圈，并加入少量俯视/仰视角度。
+2. 建议采 40 到 80 帧；不要快速甩动手机。
+3. 物体和背景需要有足够纹理；避免严重反光、透明、过暗和运动模糊。
+4. 完成 SAM2 点选与 mask 审核；mask 不要切掉物体，也不要包含大块桌面。
+5. 提交后服务会继续做 DINO、SS、SLat、Mesh 解码和 6 张预览图渲染，单物体通常约 3--8 分钟。
+6. 手机只有收到“物体重建完成”才表示完整流程成功。
+7. 默认不再出现“时序稳定体素不足”作为重建拒绝理由。
+
+默认筛选合同：
+1. server 固化全部已上传且具有 RGB/mask/pose/K 的帧；旧 18 帧筛选只作 QC 抽样，
+   不再裁剪当前模型的候选集。
+2. runtime-O 从全部候选帧中排除去畸变后空 mask，用 mask 中心射线估计物体中心，
+   再以最小最大方位角缺口的确定性策略直接选 8 帧。
+3. 选中的 8 帧统一做相机去畸变、基于 mask 的 1.10 倍前景裁剪，再缩放到 518 x 518；
+   只有这 8 帧进入 DINO-only 和后续 No-VGGT 重建。
+
+实际进入模型的帧可在以下文件审计：
+reconstructions/<session_id>/02_runtime_o/runtime_input_manifest.json
+其中 selected_frame_names 和 selected_source_view_indices 记录了最终 8 帧，
+prepared_rgb_paths 和 prepared_mask_paths 指向真正送入编码器的预处理图像。
+
+3. 运行中进度与最终结果
+----------------------
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR
+
+浏览器或命令行查看当前阶段：
+curl -s http://127.0.0.1:5000/reconstruction_status
+
+阶段顺序固定为：
+raw_cache -> runtime_o -> dino_only_input -> no_vggt_ss_slat_mesh -> world_mesh_bundle -> mesh_previews
+
+每个成功物体的最终文件：
+reconstructions/<session_id>/final/reconstructed_object_runtime_o.obj
+reconstructions/<session_id>/final/reconstructed_object_world.obj
+reconstructions/<session_id>/final/reconstructed_object_world.glb
+reconstructions/<session_id>/final/previews/mesh_view_00.png ... mesh_view_05.png
+reconstructions/<session_id>/final/previews/mesh_views_contact_sheet.png
+reconstructions/<session_id>/reconstruction_report.json
+reconstructions/<session_id>/reconstruction.log
+
+最新一次成功结果：
+latest_reconstruction.json
+
+因此最终世界坐标 Mesh 位于：
+/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/reconstructions/<session_id>/final/reconstructed_object_world.glb
+
+latest_reconstruction.json 会指向最新一次成功重建的 Mesh 路径。
+预览图只对 Mesh 做显示用居中和等比缩放，不会改动 OBJ/GLB 的世界坐标。
+
+4. 数据与审计检查
+-----------------
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - "${ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+manifest = json.loads((root / "capture_manifest.json").read_text())
+assert manifest["passed"] is True
+for row in manifest["objects"]:
+    report = json.loads(Path(row["capture_report"]).read_text())
+    assert report["passed"] is True
+    assert report["geometry_mode"] == "pose_mask_only"
+    assert report["point_cloud_consumed"] is False
+    assert report["selected_frame_count"] >= 8
+    assert Path(report["outputs"]["points3D"]).is_file()
+print({"passed": True, "objects": manifest["object_count"],
+       "manifest": str(root / "capture_manifest.json")})
+PY
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - "${ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+result = json.loads((root / "latest_reconstruction.json").read_text())
+assert result["passed"] is True
+assert result["vggt_model_loaded"] is False
+assert result["vggt_model_executed"] is False
+assert all(Path(path).is_file() for path in result["meshes"].values())
+assert len(result["previews"]["images"]) == 6
+assert all(Path(path).is_file() for path in result["previews"]["images"])
+assert Path(result["previews"]["contact_sheet"]).is_file()
+print({"passed": True, "session": result["session_id"],
+       "meshes": result["meshes"], "previews": result["previews"]})
+PY
+
+单个通过的 session 结构：
+datasets/<session_id>/images/                 全部有效候选 RGB
+datasets/<session_id>/masks/                  SAM2 mask
+datasets/<session_id>/poses.txt               AR pose 和内参
+datasets/<session_id>/slam_points_diagnostic_only.jsonl  可选诊断点，模型不读
+datasets/<session_id>/sparse/0/points3D.txt   合法空 COLMAP 点文件
+datasets/<session_id>/sparse/0/object_points.npz          P_W 为 [0,3]
+datasets/<session_id>/capture_report.json     单物体完整审计
+capture_manifest.json                         全部通过物体索引
+
+注意
+----
+- runtime/data 下保留手机原始 session；datasets 下只出现通过硬检查的数据。
+- 失败详情写入对应 runtime/data/<session_id>/capture_failure_report.json。
+- 重建中断时保留 reconstructions/<session_id>/progress.json 和 reconstruction.log；
+  手机重新提交同一 session 会复用已经完成的阶段。
+- Pose+Mask 主线不使用 min_object_points；空 AR 点云不再影响重建。
+- 如 5000 端口已被旧 server 占用，先停旧服务，或将这里和 Unity serverURL 同时改为 5001。

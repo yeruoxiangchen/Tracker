@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+#
+# 用校准 validation 对象替代缺少相机/位姿的 Bunny：
+#   Reference / Pixal3D official single-view /
+#   ReconViaGen original stock 4-view / Direct-SS900 + Direct-SLAT800 legacy
+#
+# 冻结对象不是按 step800 表现选择，而是按 Bunny 的输入/真值属性选择：
+# - source Mesh: 5,644 vertices / 9,676 faces（Bunny: 6,795 / 12,146）
+# - target SLAT coords: 6,948
+# - masked RGB std mean: 58.15（Bunny 约 50）
+# - 16-bin unique colors: 301（Bunny 约 312--365）
+# - Direct 输入视图: 4，且有完整 K/c2w/canonical target
+# - object_uid/source GLB SHA 与 Direct 训练池零重叠
+#
+# 重要：
+# - 最终 ReconViaGen stock 是从四张 RGB 重新运行原生完整链路；不是
+#   export_direct_slat_mesh_pairs 内部的 corrected-SS/native-SLAT stock 分支。
+# - Direct-SLAT step800 不传 v2/v3 的 bounded/post-CFG 参数，使用 checkpoint
+#   原本的 legacy rollout 默认值。
+# - 四列图是几何法线比较，各 Mesh 仅为显示而独立居中/等比缩放；不比较纹理。
+
+cd /home/zjr/Tracker
+set +e
+set -o pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PYTEST_PY=/home/zjr/anaconda3/bin/python
+PIXAL_PY=/home/zjr/anaconda3/envs/pixal3d/bin/python
+GPU=${GPU:-5}
+
+SAMPLE_UID=32c3a7137a8a4191ba087895d19496e8_seq001
+OBJECT_UID=32c3a7137a8a4191ba087895d19496e8
+SEED=42
+
+PRETRAINED=Stable-X/trellis-vggt-v0-2
+VAL_CACHE=/data/zjr/ar_slat_direct_val_all_step000900_seed424344_lhslatv2_20260723
+TRAIN_CACHE=/data/zjr/ar_slat_direct_train_all_step000900_seed424344_lhslatv2_20260723
+SOURCE_LIFTING=/data/ar_ss_flow_direct_val_all_v3_native_stock_20260720/manifest.json
+POINTPOSE_VAL=/data/reconvggt_pointpose_v9_ssfixed_odsplit_20260712/manifests/val.json
+
+DIRECT_SS_CKPT=/home/zjr/Tracker/pose_point_depth_mv/outputs/direct_flow_p0_trainall_s1000_seed42_2gpu_bf16_v3/checkpoints/step_000900.pt
+DIRECT_SLAT_CKPT=/home/zjr/Tracker/pose_point_depth_mv/outputs/direct_slat_step900support_trainall_s1000_seed42_2gpu_bf16_v3/checkpoints/step_000800.pt
+EXPECTED_SS_SHA256=522d1618062e108c64ab71a97a328d07ce0374946f7d13228de883bb9ad0d2a1
+EXPECTED_SLAT_SHA256=b13a89ddc6b4821665521ca8b0db116cf924b25993088f2a6bbcee4594acc69c
+
+PIXAL_REVISION=0b31f9160aa400719af409098bff7936a932f726
+PIXAL_SNAPSHOT=/home/zjr/.cache/huggingface/hub/models--TencentARC--Pixal3D/snapshots/${PIXAL_REVISION}
+NAF_COMMIT=37f2dfc180f2de53d98bd601109c0da0dd6b0f43
+NAF_ROOT=/data/models/valeoai_NAF_${NAF_COMMIT}
+NAF_REPO=${NAF_ROOT}/repo
+NAF_CKPT=${NAF_ROOT}/naf_release.pth
+NAF_SOURCE_MANIFEST=${NAF_ROOT}/source_manifest.sha256
+
+PIXAL_TRANSFORM=/data/zjr/direct_slat_v2_bounded_mechanism_20260727/train897_preflight100_seed42_v1/engineering_utility_pixal3d_v1/pixal3d_native_to_direct_canonical_v1.json
+PROJECT_TOOLS=/home/zjr/Tracker/pose_point_depth_mv/tools
+
+WORK=/data/zjr/direct_slat_legacy800_calibrated_review_20260728/${OBJECT_UID}_seq001_seed42_v1
+DIRECT_OUT=${WORK}/direct_ss900_slat800_legacy
+PIXAL_OUT=${WORK}/pixal3d_native_singleview
+PIXAL_PROTOCOL=${PIXAL_OUT}/protocol.json
+RECON_OUT=${WORK}/reconviagen_original_stock_4view
+REVIEW_OUT=${WORK}/reference_pixal_recon_direct_fourway_normal
+
+mkdir -p "${WORK}"
+
+run_logged() {
+  LOG_PATH=$1
+  shift
+  set +e
+  "$@" 2>&1 | tee "${LOG_PATH}"
+  COMMAND_RC=${PIPESTATUS[0]}
+  printf '%s\n' "${COMMAND_RC}" > "${LOG_PATH}.exit_code"
+  return "${COMMAND_RC}"
+}
+
+
+###############################################################################
+# C0. CPU preflight：候选冻结、训练零重叠、checkpoint/依赖
+###############################################################################
+
+C0_RC=0
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/infer_reconviagen_stock_from_direct_cache.py \
+  pose_point_depth_mv/render_direct_slat_fourway.py \
+  pose_point_depth_mv/compare_pixal3d_singleview_smoke.py \
+  pose_point_depth_mv/evaluate_direct_slat_pixal3d_utility.py
+C0_COMPILE_RC=$?
+
+"${PYTEST_PY}" -m pytest -q \
+  pose_point_depth_mv/test_direct_slat_pixal3d_utility.py
+C0_TEST_RC=$?
+
+test -x "${PROJECT_TOOLS}/ninja"
+C0_NINJA_RC=$?
+test -s "${PIXAL_SNAPSHOT}/pipeline.json"
+C0_PIXAL_RC=$?
+test -s "${NAF_REPO}/hubconf.py"
+C0_NAF_REPO_RC=$?
+test -s "${NAF_CKPT}"
+C0_NAF_CKPT_RC=$?
+test -s "${NAF_SOURCE_MANIFEST}"
+C0_NAF_MANIFEST_RC=$?
+test -s "${PIXAL_TRANSFORM}"
+C0_TRANSFORM_FILE_RC=$?
+
+if [ "${C0_COMPILE_RC}" -ne 0 ] || \
+   [ "${C0_TEST_RC}" -ne 0 ] || \
+   [ "${C0_NINJA_RC}" -ne 0 ] || \
+   [ "${C0_PIXAL_RC}" -ne 0 ] || \
+   [ "${C0_NAF_REPO_RC}" -ne 0 ] || \
+   [ "${C0_NAF_CKPT_RC}" -ne 0 ] || \
+   [ "${C0_NAF_MANIFEST_RC}" -ne 0 ] || \
+   [ "${C0_TRANSFORM_FILE_RC}" -ne 0 ]; then
+  C0_RC=96
+fi
+
+if [ "${C0_RC}" -eq 0 ]; then
+  "${PY}" - \
+    "${VAL_CACHE}/manifest.json" \
+    "${TRAIN_CACHE}/manifest.json" \
+    "${SOURCE_LIFTING}" \
+    "${POINTPOSE_VAL}" \
+    "${SAMPLE_UID}" \
+    "${OBJECT_UID}" \
+    "${DIRECT_SS_CKPT}" \
+    "${EXPECTED_SS_SHA256}" \
+    "${DIRECT_SLAT_CKPT}" \
+    "${EXPECTED_SLAT_SHA256}" \
+    "${PIXAL_TRANSFORM}" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import trimesh
+
+from pose_point_depth_mv.evaluate_direct_slat_pixal3d_utility import (
+    validate_transform,
+)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+val_path = Path(sys.argv[1]).resolve()
+train_path = Path(sys.argv[2]).resolve()
+lifting_path = Path(sys.argv[3]).resolve()
+pointpose_path = Path(sys.argv[4]).resolve()
+uid = sys.argv[5]
+object_uid = sys.argv[6]
+ss_checkpoint = Path(sys.argv[7]).resolve()
+expected_ss = sys.argv[8]
+slat_checkpoint = Path(sys.argv[9]).resolve()
+expected_slat = sys.argv[10]
+transform_path = Path(sys.argv[11]).resolve()
+
+assert sha256(ss_checkpoint) == expected_ss
+assert sha256(slat_checkpoint) == expected_slat
+validate_transform(transform_path)
+
+val = json.loads(val_path.read_text(encoding="utf-8"))
+train = json.loads(train_path.read_text(encoding="utf-8"))
+lifting = json.loads(lifting_path.read_text(encoding="utf-8"))
+pointpose = json.loads(pointpose_path.read_text(encoding="utf-8"))
+
+assert val["format"] == "pose_point_depth_mv.direct_slat_cache.v1"
+assert val["materialized"] is True
+rows = [
+    row for row in val["samples"]
+    if row["uid"] == uid and int(row["support_seed"]) == 42
+]
+assert len(rows) == 1
+direct = rows[0]
+assert direct["object_uid"] == object_uid
+assert int(direct["view_count"]) == 4
+assert int(direct["target_point_count"]) == 6948
+assert int(direct["corrected_coord_count"]) == 4964
+
+lifting_rows = [row for row in lifting["samples"] if row["uid"] == uid]
+assert len(lifting_rows) == 1
+assert int(lifting_rows[0]["view_count"]) == 4
+cache_path = (lifting_path.parent / lifting_rows[0]["cache_file"]).resolve()
+assert cache_path.is_file()
+
+pointpose_rows = [row for row in pointpose["samples"] if row["uid"] == uid]
+assert len(pointpose_rows) == 1
+source = pointpose_rows[0]
+assert abs(float(source["render_stats"]["rgb_std_mean"]) - 58.14617919921875) < 1e-9
+assert int(source["render_stats"]["unique_colors16"]) == 301
+assert int(source["num_voxels"]) == 6948
+
+train_objects = {str(row["object_uid"]) for row in train["samples"]}
+train_glb_hashes = {str(row["source_glb_sha256"]) for row in train["samples"]}
+assert object_uid not in train_objects
+assert str(direct["source_glb_sha256"]) not in train_glb_hashes
+
+scene = trimesh.load(source["source_glb"], force="scene", process=False)
+meshes = [
+    mesh for mesh in scene.geometry.values()
+    if isinstance(mesh, trimesh.Trimesh)
+]
+vertices = sum(len(mesh.vertices) for mesh in meshes)
+faces = sum(len(mesh.faces) for mesh in meshes)
+assert vertices == 5644
+assert faces == 9676
+
+print(json.dumps({
+    "status": "passed",
+    "selection_policy": "input/GT properties only; no step800 outcomes used",
+    "uid": uid,
+    "object_uid": object_uid,
+    "direct_view_count": direct["view_count"],
+    "target_point_count": direct["target_point_count"],
+    "corrected_coord_count": direct["corrected_coord_count"],
+    "source_mesh_vertices": vertices,
+    "source_mesh_faces": faces,
+    "rgb_std_mean": source["render_stats"]["rgb_std_mean"],
+    "unique_colors16": source["render_stats"]["unique_colors16"],
+    "training_object_overlap": 0,
+    "training_source_glb_sha256_overlap": 0,
+    "source_glb": source["source_glb"],
+    "source_cache": str(cache_path),
+}, indent=2))
+PY
+  C0_AUDIT_RC=$?
+else
+  C0_AUDIT_RC=96
+fi
+
+if [ "${C0_AUDIT_RC}" -ne 0 ]; then
+  C0_RC=${C0_AUDIT_RC}
+fi
+
+echo "C0_COMPILE_RC=${C0_COMPILE_RC}"
+echo "C0_TEST_RC=${C0_TEST_RC}"
+echo "C0_NINJA_RC=${C0_NINJA_RC}"
+echo "C0_PIXAL_RC=${C0_PIXAL_RC}"
+echo "C0_NAF_REPO_RC=${C0_NAF_REPO_RC}"
+echo "C0_NAF_CKPT_RC=${C0_NAF_CKPT_RC}"
+echo "C0_NAF_MANIFEST_RC=${C0_NAF_MANIFEST_RC}"
+echo "C0_TRANSFORM_FILE_RC=${C0_TRANSFORM_FILE_RC}"
+echo "C0_AUDIT_RC=${C0_AUDIT_RC}"
+echo "C0_RC=${C0_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# C1. 旧 Direct-SLAT step800 legacy：生成 Full（内部 stock 不作为最终第三列）
+###############################################################################
+
+C1_RC=0
+if [ "${C0_RC}" -ne 0 ]; then
+  C1_RC=96
+elif [ -s "${DIRECT_OUT}/report.json" ]; then
+  echo "reuse immutable Direct step800 result: ${DIRECT_OUT}/report.json"
+elif [ -e "${DIRECT_OUT}" ]; then
+  echo "C1 partial output exists; preserve and inspect: ${DIRECT_OUT}"
+  C1_RC=91
+else
+  run_logged "${DIRECT_OUT}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.export_direct_slat_mesh_pairs \
+      --cache_manifest "${VAL_CACHE}/manifest.json" \
+      --train_cache_manifest "${TRAIN_CACHE}/manifest.json" \
+      --checkpoint "${DIRECT_SLAT_CKPT}" \
+      --output_dir "${DIRECT_OUT}" \
+      --pretrained "${PRETRAINED}" \
+      --uids "${SAMPLE_UID}" \
+      --joint_seeds "${SEED}" \
+      --max_objects 1 \
+      --steps 25 \
+      --cfg_strength 5.0 \
+      --cfg_interval 0.5,1.0 \
+      --rescale_t 3.0 \
+      --support_scale 1.0 \
+      --surface_samples 20000 \
+      --bootstrap_samples 5000 \
+      --amp_dtype bf16
+  C1_RC=$?
+fi
+
+if [ "${C1_RC}" -eq 0 ]; then
+  "${PY}" - \
+    "${DIRECT_OUT}/report.json" \
+    "${SAMPLE_UID}" \
+    "${DIRECT_SLAT_CKPT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report_path = Path(sys.argv[1]).resolve()
+uid = sys.argv[2]
+checkpoint = Path(sys.argv[3]).resolve()
+report = json.loads(report_path.read_text(encoding="utf-8"))
+assert report["format"] == "pose_point_depth_mv.direct_slat_mesh_exploratory.v1"
+assert Path(report["checkpoint"]).resolve() == checkpoint
+assert int(report["checkpoint_step"]) == 800
+assert int(report["object_count"]) == 1
+assert [int(value) for value in report["joint_seeds"]] == [42]
+matches = [
+    row for row in report["records"]
+    if row["uid"] == uid and int(row["joint_seed"]) == 42
+]
+assert len(matches) == 1
+assert matches[0]["same_initial_noise"] is True
+print(json.dumps({
+    "status": "passed",
+    "checkpoint_step": report["checkpoint_step"],
+    "uid": uid,
+    "pair_id": matches[0]["pair_id"],
+    "same_initial_noise": matches[0]["same_initial_noise"],
+}, indent=2))
+PY
+  C1_VALIDATE_RC=$?
+  if [ "${C1_VALIDATE_RC}" -ne 0 ]; then
+    C1_RC=${C1_VALIDATE_RC}
+  fi
+else
+  C1_VALIDATE_RC=96
+fi
+
+echo "C1_RC=${C1_RC}"
+echo "C1_VALIDATE_RC=${C1_VALIDATE_RC}"
+echo "Direct report: ${DIRECT_OUT}/report.json"
+echo "current terminal remains open"
+
+
+###############################################################################
+# C2. 冻结同对象、同 seed、单视图 Pixal3D protocol 和 canonical target
+###############################################################################
+
+C2_RC=0
+if [ "${C1_RC}" -ne 0 ]; then
+  C2_RC=96
+elif [ -s "${PIXAL_PROTOCOL}" ]; then
+  "${PY}" -c \
+    'import sys; from pathlib import Path; from pose_point_depth_mv.compare_pixal3d_singleview_smoke import validate_protocol; p=validate_protocol(Path(sys.argv[1])); assert len(p["cases"])==1; print("reuse frozen Pixal3D protocol")' \
+    "${PIXAL_PROTOCOL}"
+  C2_RC=$?
+elif [ -e "${PIXAL_OUT}" ]; then
+  echo "C2 partial output exists without protocol; preserve and inspect: ${PIXAL_OUT}"
+  C2_RC=91
+else
+  "${PY}" -u -m pose_point_depth_mv.compare_pixal3d_singleview_smoke \
+    prepare \
+    --current_report "${DIRECT_OUT}/report.json" \
+    --cache_manifest "${VAL_CACHE}/manifest.json" \
+    --output_dir "${PIXAL_OUT}" \
+    --selection_mode report_objects_v1 \
+    --joint_seeds "${SEED}" \
+    --view_counts 2 4 8 \
+    --selection_seed 20260728
+  C2_RC=$?
+fi
+
+echo "C2_RC=${C2_RC}"
+echo "Pixal protocol: ${PIXAL_PROTOCOL}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# C3. 官方 Pixal3D 单视图推理
+###############################################################################
+
+C3_RC=0
+if [ "${C2_RC}" -ne 0 ]; then
+  C3_RC=96
+else
+  "${PY}" -c \
+    'import json,sys; from pathlib import Path; from pose_point_depth_mv.compare_pixal3d_singleview_smoke import pixal3d_mesh_path,sha256_file,validate_protocol; pth=Path(sys.argv[1]).resolve(); p=validate_protocol(pth); ok=True
+for c in p["cases"]:
+ m=pixal3d_mesh_path(pth,c["case_id"]); r=m.with_name("result.json")
+ if not m.is_file() or not r.is_file(): ok=False; break
+ x=json.loads(r.read_text(encoding="utf-8"))
+ if x.get("protocol_sha256")!=p["protocol_sha256"] or x.get("mesh_sha256")!=sha256_file(m): ok=False; break
+raise SystemExit(0 if ok else 1)' \
+    "${PIXAL_PROTOCOL}"
+  C3_REUSE_RC=$?
+  if [ "${C3_REUSE_RC}" -eq 0 ]; then
+    echo "reuse immutable Pixal3D output: ${PIXAL_OUT}"
+  else
+    run_logged "${PIXAL_OUT}/pixal3d_infer_sdpa.log" env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      ATTN_BACKEND=sdpa \
+      SPARSE_ATTN_BACKEND=sdpa \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PIXAL_PY}" -u -m pose_point_depth_mv.compare_pixal3d_singleview_smoke \
+        infer \
+        --protocol "${PIXAL_PROTOCOL}" \
+        --model_path "${PIXAL_SNAPSHOT}" \
+        --naf_repo "${NAF_REPO}" \
+        --naf_checkpoint "${NAF_CKPT}" \
+        --naf_source_manifest "${NAF_SOURCE_MANIFEST}" \
+        --device cuda \
+        --low_vram \
+        --skip_rembg \
+        --camera_mode known_crop_fov \
+        --resolution 1024 \
+        --sampling_steps 12
+    C3_RC=$?
+  fi
+fi
+
+echo "C3_RC=${C3_RC}"
+echo "current terminal remains open"
+
+
+###############################################################################
+# C4. 原生 ReconViaGen 完整 stock：严格复用 Direct cache 的四张 RGB
+###############################################################################
+
+C4_RC=0
+if [ "${C3_RC}" -ne 0 ]; then
+  C4_RC=96
+else
+  run_logged "${RECON_OUT}.log" env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.infer_reconviagen_stock_from_direct_cache \
+      --source_lifting_manifest "${SOURCE_LIFTING}" \
+      --uid "${SAMPLE_UID}" \
+      --output_dir "${RECON_OUT}" \
+      --pretrained "${PRETRAINED}" \
+      --device cuda \
+      --low_vram \
+      --seed "${SEED}" \
+      --ss_steps 30 \
+      --ss_guidance 7.5 \
+      --ss_guidance_rescale 0.7 \
+      --ss_rescale_t 5.0 \
+      --slat_steps 12 \
+      --slat_guidance 7.5 \
+      --slat_guidance_rescale 0.5 \
+      --slat_rescale_t 3.0 \
+      --multiimage_algo multidiffusion
+  C4_RC=$?
+fi
+
+echo "C4_RC=${C4_RC}"
+echo "ReconViaGen stock report: ${RECON_OUT}/report.json"
+echo "current terminal remains open"
+
+
+###############################################################################
+# C5. canonical Reference / Pixal / original stock / Direct Full 四列法线图
+###############################################################################
+
+C5_RC=0
+if [ "${C4_RC}" -ne 0 ]; then
+  C5_RC=96
+else
+  run_logged "${REVIEW_OUT}.log" env \
+    PATH="${PROJECT_TOOLS}:${PATH}" \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    "${PY}" -u -m pose_point_depth_mv.render_direct_slat_fourway \
+      --direct_report "${DIRECT_OUT}/report.json" \
+      --pixal_protocol "${PIXAL_PROTOCOL}" \
+      --pixal_transform "${PIXAL_TRANSFORM}" \
+      --reconviagen_report "${RECON_OUT}/report.json" \
+      --output_dir "${REVIEW_OUT}" \
+      --uid "${SAMPLE_UID}" \
+      --seed "${SEED}" \
+      --device cuda \
+      --render_frames 72 \
+      --render_resolution 320 \
+      --contact_frames 6 \
+      --fps 12
+  C5_RC=$?
+fi
+
+echo "C5_RC=${C5_RC}"
+if [ "${C5_RC}" -eq 0 ]; then
+  echo "四列并排图: ${REVIEW_OUT}/normal_contact_sheet.png"
+  echo "四列并排视频: ${REVIEW_OUT}/normal_side_by_side.mp4"
+  echo "HTML: ${REVIEW_OUT}/index.html"
+  echo "审计 report: ${REVIEW_OUT}/report.json"
+else
+  echo "四列比较尚未完成；从 C0--C5 的首个非零 RC 开始检查"
+fi
+echo "current terminal remains open"

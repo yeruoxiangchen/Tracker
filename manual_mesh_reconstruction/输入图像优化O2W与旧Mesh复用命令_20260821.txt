@@ -1,0 +1,47 @@
+# Mesh 后利用原始输入 RGB/mask/pose 优化 O2W
+# 新的 manual_mesh_reconstruction/server.py 已自动执行本阶段；第一段只用于启动服务。
+
+cd /home/zjr/Tracker
+conda activate reconviagen
+GPU=4 python -u manual_mesh_reconstruction/server.py
+
+
+# 对已经完成的旧重建直接优化；不会重新运行 DINO、SS、SLat 或 Mesh decoder。
+# RECON 可指向 session 根目录、branch 目录或 branch_report.json。
+
+cd /home/zjr/Tracker
+conda activate reconviagen
+
+GPU=${GPU:-4}
+RECON='/home/zjr/Tracker/pose_point_depth_mv/outputs2/手机AR第一阶段_全视图统一O_训练一致球面最远8帧/reconstructions/你的session'
+
+python -u -m manual_mesh_reconstruction.optimize_o2w \
+  --reconstruction_dir "${RECON}" \
+  --gpu "${GPU}" \
+  --resume
+
+
+# 默认结果：
+# ${RECON}/branches/01_training_spherical_farthest8/04b_input_o2w_refinement/report.json
+# ${RECON}/branches/01_training_spherical_farthest8/04b_input_o2w_refinement/selected_T_O2W.npz
+# ${RECON}/branches/01_training_spherical_farthest8/04b_input_o2w_refinement/05_优化后O2W总览/
+# accepted=false 表示候选被安全门拒绝并保留原始 O2W，不代表程序失败。
+
+
+# 可选：保留独立参数版本，不占用 branch 默认目录。
+
+OUT="${RECON}/input_o2w_refinement_manual_v1"
+python -u -m manual_mesh_reconstruction.optimize_o2w \
+  --reconstruction_dir "${RECON}" \
+  --output_dir "${OUT}" \
+  --gpu "${GPU}" \
+  --max_optimization_views 24 \
+  --iterations 40 \
+  --render_long_side 160 \
+  --batch_size 4 \
+  --optimization_face_limit 30000 \
+  --resume
+
+echo "report: ${OUT}/report.json"
+echo "selected transform: ${OUT}/selected_T_O2W.npz"
+echo "optimized contours: ${OUT}/05_优化后O2W总览"

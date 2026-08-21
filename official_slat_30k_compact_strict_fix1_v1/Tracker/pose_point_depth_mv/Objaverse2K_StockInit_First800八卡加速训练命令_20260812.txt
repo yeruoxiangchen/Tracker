@@ -1,0 +1,60 @@
+Objaverse2K Stock-init First@800 八卡加速训练
+=============================================
+
+实验合同
+--------
+
+- 数据：Objaverse2K train 2135 objects；
+- 初始化：fresh Stock-equivalent，不继承 M8；
+- 训练：8 GPU x per-rank batch1 x grad_accum1 = global batch8；
+- seed42、max_steps=2000、在 step800 阶段停止；
+- Stock cross-attention 只接收随机视图子集中的第一视图；
+- posed-DINO 3D 分支仍接收随机子集中的全部视图；
+- 加速：每 rank 2 个 DataLoader worker，cache hash 只在 torchrun 前扫描一次，
+  默认关闭梯度检查点。
+
+默认关闭梯度检查点不改变模型结构、loss 或训练样本顺序，但可能造成浮点级梯度差异。
+因此它适合快速完成 First@800；若要让执行方式也与既有 All@800 严格一致，启动时把
+OBJAVERSE2K_STOCKFIRST_GRADIENT_CHECKPOINTING 改为1，但速度会更慢。
+
+当前 All@800 运行期间不要启动。脚本共用 Objaverse2K 总训练锁，误启动会以 rc=97
+拒绝，不会和 All 抢占 GPU。
+
+
+启动
+----
+
+cd /home/zjr/Tracker
+
+systemd-run --user \
+  --unit=tracker-objaverse2k-slat-stockfirst-step800-8gpu-fast-v1 \
+  --collect \
+  --property=WorkingDirectory=/home/zjr/Tracker \
+  --property=StandardOutput=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_stockfirst_step800_8gpu_fast.service.log \
+  --property=StandardError=append:/data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_stockfirst_step800_8gpu_fast.service.log \
+  /usr/bin/env \
+    OBJAVERSE2K_STOCKFIRST_GPUS=0,1,2,3,4,5,6,7 \
+    OBJAVERSE2K_STOCKFIRST_NUM_WORKERS=2 \
+    OBJAVERSE2K_STOCKFIRST_GRADIENT_CHECKPOINTING=0 \
+  /usr/bin/bash \
+  /home/zjr/Tracker/pose_point_depth_mv/background_jobs/run_objaverse2k_no_vggt_slat_stockfirst_step800_8gpu_fast.sh
+
+
+监视
+----
+
+tail --retry -n 50 -F \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/train_stockfirst_step800_8gpu_fast.service.log \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/slat_objaverse2135_stockfirst_step800_8gpu_fast.state \
+  /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/slat_objaverse2135_stockfirst_step800_8gpu_fast.exit_code
+
+
+完成条件
+--------
+
+test -s /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/slat_objaverse2135_stockinit_first_step2000_seed42_8gpu_bs8_fastio_v1/checkpoints/step_000800.pt
+test -s /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/slat_objaverse2135_stockinit_first_step2000_seed42_8gpu_bs8_fastio_v1/stage_report_step_000800.json
+test "$(tr -d '[:space:]' < /data/zjr/objaverse2k_no_vggt_slat_20260811_v1/logs/slat_objaverse2135_stockfirst_step800_8gpu_fast.exit_code)" = 0
+
+同一启动命令可在 step200/400/600 checkpoint 后中断恢复。非空输出目录没有 last.pt
+时脚本会以 rc=98 拒绝，防止覆盖不完整轨迹。

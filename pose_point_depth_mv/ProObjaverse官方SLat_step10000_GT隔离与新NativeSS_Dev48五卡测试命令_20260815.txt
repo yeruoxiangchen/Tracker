@@ -1,0 +1,1492 @@
+ProObjaverse official SLat step10000：GT-support隔离曲线 + 新Native-SS Dev48端到端测试
+====================================================================================
+
+固定目的
+--------
+
+第一组（严格复现第144章的GT-support SLat隔离协议）：
+
+  Train64：GT support，Stock SLat vs step10000 trained SLat
+  Dev64：  GT support，Stock SLat vs step10000 trained SLat
+
+  与已有step2000、step4000、step8000结果放在同一张表中横向比较。
+  这四个checkpoint并不被表述为严格、连续采样的learning curve。
+
+第二组（新official Native-SS predicted-support，Dev48）：
+
+  A = Stock SS -> Stock SLat
+  B = 新official Native SS step2000 -> Stock SLat
+  C = 新official Native SS step2000 -> step10000 trained SLat
+
+  报告中的三项差值分别是：
+
+  stock_slat_mesh_transfer                  = B - A
+  trained_slat_end_to_end_transfer          = C - A
+  trained_slat_increment_on_native_support  = C - B
+
+固定资源与强制执行顺序
+----------------------
+
+  1. 现有N9-5五个worker均已运行结束；是否结束以`complete=true`为准。
+     shard0的`passed=false`是已记录的Mesh安全上限结果，不等于worker仍在运行。
+  2. T3通过后，可以暂时跳过W0，先执行G0 -> G4；GT-support改用四卡4,5,6,7，
+     与GPU3上的N9 shard0没有GPU重叠。
+  3. G0仍应执行：它是CPU只读preflight，避免G1创建不可变输出后才发现合同问题。
+  4. GT aggregate和N9五个worker都结束后，可直接执行P1；P1是完全自包启动段，
+     会自己核对五份N9 report、Native-SS路径/SHA、旧service状态和GPU空闲量。
+  5. W0和P0仅保留为可选的单独只读审计，不是P1的前置命令。
+     predicted-support使用五卡3,4,5,6,7，启动后执行P2 -> P5。
+  6. P6只是旧step8000与新step10000的只读对照，可在旧N10-5 aggregate存在后执行。
+  7. G与N9 shard0虽然GPU隔离，仍会共享CPU、RAM和数据盘，速度可能略降但不改变评测语义。
+     每个worker单GPU运行；“四卡/五卡”是对象分片并行，不是DDP。
+
+固定统计协议
+------------
+
+  weights=ema
+  joint_seeds=42,43,44
+  surface_samples=20000
+  amp_dtype=bf16
+  GT-support：每个split 64 objects / 192 object-seed records
+  predicted-support：Dev indices [16,64)，48 objects / 144 object-seed pairs
+
+重要边界
+--------
+
+  - 第一组不执行Native SS；旧Native-SS report只用于验证step10000 checkpoint所冻结的训练合同。
+  - 第二组才执行新official Native SS step2000，并比较A/B/C三条完整Mesh链路。
+  - Train64是训练重叠拟合诊断；Dev64和Dev48是development，不是最终blind claim。
+  - 不修改step10000 checkpoint、manifest、report、freeze或任何历史评测输出。
+  - GT worker不支持中间结果resume；若形成partial目录，先审计日志，再换新输出后缀，禁止直接删除。
+  - predicted-support worker支持`--resume`，中断后使用本文P3，不要重开新目录。
+
+
+T0. A72上训练结束后：验证并制作可移植SHA256旁车
+===================================================
+
+说明：
+  用户之前使用`sha256sum "${CKPT}" > ...`时，旁车第一列会写入A72绝对路径。
+  文件内容哈希仍然正确，但传回源服务器后直接`sha256sum -c`会寻找不存在的
+  `/root/autodl-fs/...`。下面用相对于RUN的文件名重新制作旁车。
+
+在A72执行：
+
+cd /root/Tracker
+set -euo pipefail
+
+RUN=/root/autodl-fs/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1
+CKPT=${RUN}/checkpoints/step_010000.pt
+REPORT=${RUN}/report.json
+
+test -s "${CKPT}"
+test -s "${REPORT}"
+
+python - "${CKPT}" "${REPORT}" <<'PY'
+import json
+import sys
+import torch
+
+checkpoint_path, report_path = sys.argv[1:]
+c = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+r = json.load(open(report_path, encoding="utf-8"))
+assert c["step"] == 10000
+assert c["format"] == "pose_point_depth_mv.native_slat_genrecon_no_vggt.v1"
+assert c["data_identity"]["native_ss"] == c["model_summary"]["upstream_native_ss"]
+assert r["completed"] is True
+assert r["stage_complete"] is True
+assert r["passed"] is True
+assert r["step"] == 10000
+print({
+    "passed": True,
+    "checkpoint_step": c["step"],
+    "completed": r["completed"],
+    "stage_complete": r["stage_complete"],
+    "report_passed": r["passed"],
+    "saved_native_ss_paths": {
+        key: c["data_identity"]["native_ss"][key]
+        for key in ("report", "checkpoint")
+    },
+})
+PY
+
+(
+  cd "${RUN}"
+  sha256sum checkpoints/step_010000.pt > checkpoints/step_010000.pt.sha256
+  sha256sum report.json > report.json.sha256
+  sha256sum -c checkpoints/step_010000.pt.sha256
+  sha256sum -c report.json.sha256
+)
+
+ls -lh \
+  "${CKPT}" "${CKPT}.sha256" \
+  "${REPORT}" "${REPORT}.sha256"
+
+
+T1. A72上传（只执行一次；不要重复粘贴两遍）
+=============================================
+
+在A72执行：
+
+set -euo pipefail
+
+RUN=/root/autodl-fs/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1
+REMOTE=oss://yxc814/proobjaverse-transfer/a72_slat_step10000
+
+ossutil cp "${RUN}/checkpoints/step_010000.pt" \
+  "${REMOTE}/step_010000.pt"
+ossutil cp "${RUN}/checkpoints/step_010000.pt.sha256" \
+  "${REMOTE}/step_010000.pt.sha256"
+ossutil cp "${RUN}/report.json" \
+  "${REMOTE}/report.json"
+ossutil cp "${RUN}/report.json.sha256" \
+  "${REMOTE}/report.json.sha256"
+
+ossutil stat "${REMOTE}/step_010000.pt"
+ossutil stat "${REMOTE}/report.json"
+
+echo "UPLOAD COMPLETE"
+
+
+T2. 源服务器下载到固定目录并校验
+=================================
+
+在源服务器执行：
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+RUN=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1
+REMOTE=oss://yxc814/proobjaverse-transfer/a72_slat_step10000
+
+mkdir -p "${RUN}/checkpoints"
+
+if [ ! -s "${RUN}/checkpoints/step_010000.pt" ]; then
+  ossutil cp "${REMOTE}/step_010000.pt" \
+    "${RUN}/checkpoints/step_010000.pt"
+else
+  echo "reuse existing checkpoint: ${RUN}/checkpoints/step_010000.pt"
+fi
+
+if [ ! -s "${RUN}/checkpoints/step_010000.pt.sha256" ]; then
+  ossutil cp "${REMOTE}/step_010000.pt.sha256" \
+    "${RUN}/checkpoints/step_010000.pt.sha256"
+fi
+
+if [ ! -s "${RUN}/report.json" ]; then
+  ossutil cp "${REMOTE}/report.json" "${RUN}/report.json"
+else
+  echo "reuse existing report: ${RUN}/report.json"
+fi
+
+if [ ! -s "${RUN}/report.json.sha256" ]; then
+  ossutil cp "${REMOTE}/report.json.sha256" \
+    "${RUN}/report.json.sha256"
+fi
+
+# 只比较旁车第一列，因此即使OSS里仍是旧A72绝对文件名，也能正确验证内容。
+CKPT_EXPECTED=$(awk 'NR==1 {print $1}' "${RUN}/checkpoints/step_010000.pt.sha256")
+CKPT_ACTUAL=$(sha256sum "${RUN}/checkpoints/step_010000.pt" | awk '{print $1}')
+REPORT_EXPECTED=$(awk 'NR==1 {print $1}' "${RUN}/report.json.sha256")
+REPORT_ACTUAL=$(sha256sum "${RUN}/report.json" | awk '{print $1}')
+
+test -n "${CKPT_EXPECTED}"
+test -n "${REPORT_EXPECTED}"
+test "${CKPT_ACTUAL}" = "${CKPT_EXPECTED}"
+test "${REPORT_ACTUAL}" = "${REPORT_EXPECTED}"
+
+# 在源服务器重写的只是SHA旁车文件名，不触碰checkpoint/report内容。
+(
+  cd "${RUN}"
+  sha256sum checkpoints/step_010000.pt > checkpoints/step_010000.pt.sha256
+  sha256sum report.json > report.json.sha256
+  sha256sum -c checkpoints/step_010000.pt.sha256
+  sha256sum -c report.json.sha256
+)
+
+ls -lh \
+  "${RUN}/checkpoints/step_010000.pt" \
+  "${RUN}/report.json"
+
+
+T3. 源服务器step10000只读结构检查
+===================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+RUN=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1
+CKPT=${RUN}/checkpoints/step_010000.pt
+REPORT=${RUN}/report.json
+
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "${PY}" - "${CKPT}" "${REPORT}" <<'PY'
+import json
+import sys
+import torch
+
+c = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+r = json.load(open(sys.argv[2], encoding="utf-8"))
+assert c["step"] == 10000
+assert c["format"] == "pose_point_depth_mv.native_slat_genrecon_no_vggt.v1"
+assert c["data_identity"]["native_ss"] == c["model_summary"]["upstream_native_ss"]
+assert r["completed"] is True and r["stage_complete"] is True
+assert r["passed"] is True and r["step"] == 10000
+assert r["data_identity"] == c["data_identity"]
+print(json.dumps({
+    "passed": True,
+    "step": c["step"],
+    "format": c["format"],
+    "world_size": c["model_summary"]["optimization"]["world_size"],
+    "global_effective_batch": c["model_summary"]["optimization"]["global_effective_batch"],
+    "native_ss": c["data_identity"]["native_ss"],
+}, indent=2, ensure_ascii=False))
+PY
+
+echo "current terminal remains open"
+
+
+W0. 可选独立审计：确认N9-5已经结束（运行P1前可跳过）
+================================================================
+
+说明：
+  `complete=true`表示worker已经完成并写出最终report。
+  `passed=false`仍作为N9的正式审计结果保留，但不阻止启动一次独立的step10000评测。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+N9=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/dev48_newss2000_stock_and_slat8000_mesh_seed424344_5gpu_v1
+
+for SLOT_RANGE in \
+  shard0_16_26 \
+  shard1_26_36 \
+  shard2_36_46 \
+  shard3_46_55 \
+  shard4_55_64
+do
+  test -s "${N9}/${SLOT_RANGE}/report.json"
+done
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - "${N9}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+ranges = ("0_16_26", "1_26_36", "2_36_46", "3_46_55", "4_55_64")
+not_passed = []
+for item in ranges:
+    slot, start, end = item.split("_")
+    path = root / f"shard{slot}_{start}_{end}" / "report.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["complete"] is True, path
+    assert report["object_count"] == int(end) - int(start), path
+    if report.get("passed") is not True:
+        not_passed.append(str(path))
+print({
+    "n9_5_workers_complete": True,
+    "n9_5_all_worker_reports_passed": not not_passed,
+    "recorded_not_passed_reports": not_passed,
+    "worker_count": 5,
+})
+if not_passed:
+    print(
+        "W0 WARNING: N9 contains finalized passed=false report(s); "
+        "these remain audit evidence and are not active workers.",
+        file=sys.stderr,
+    )
+PY
+
+for SLOT in 0 1 2 3 4; do
+  for UNIT in \
+    tracker-proobj-newss-slat8k-mesh5-shard${SLOT}-v1.service \
+    tracker-proobj-newss-slat8k-mesh5-resume-shard${SLOT}-v1.service
+  do
+    if systemctl --user is-active --quiet "${UNIT}"; then
+      echo "W0 blocked: N9-5原任务或重跑仍在运行：${UNIT}"
+      exit 95
+    fi
+  done
+done
+
+echo "N9-5 five worker reports are complete and no original/resume service is active."
+echo "Any passed=false result shown above remains recorded and has not been reclassified."
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+
+
+G0. 第一组前置合同检查（CPU，不创建评测输出）
+================================================
+
+说明：
+  step10000在A72保存时，其checkpoint内部Native-SS report/checkpoint字符串可能是
+  `/root/autodl-fs/...`或`/autodl-fs/...`。源服务器上的实际文件仍是`/data/zjr/...`。
+  新入口`evaluate_proobjaverse_official_slat_gt_support_cross_host`只允许这两个路径
+  按checkpoint内冻结SHA256迁移；任何CFG、step、weights、采样参数或未知字段变化
+  都会拒绝。原第144章evaluator未被修改。
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+CKPT=${SOURCE}/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1/checkpoints/step_010000.pt
+TRAIN_CACHE=${SOURCE}/cache_train2000_protocol2128_views8_v1
+DEV_CACHE=${SOURCE}/cache_dev64_protocol2128_views8_v1
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+
+for FILE in \
+  "${CKPT}" \
+  "${TRAIN_CACHE}/slat_manifest.json" \
+  "${TRAIN_CACHE}/lifting_manifest.json" \
+  "${DEV_CACHE}/slat_manifest.json" \
+  "${DEV_CACHE}/lifting_manifest.json" \
+  "${SS_REPORT}" \
+  "${STOCK_FREEZE}"
+do
+  test -s "${FILE}"
+done
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/evaluate_proobjaverse_official_slat_gt_support_cross_host.py
+
+"${PY}" -m unittest -v \
+  pose_point_depth_mv.test_proobjaverse_official_slat_gt_support_cross_host
+
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "${PY}" - \
+  "${CKPT}" "${SS_REPORT}" \
+  "${TRAIN_CACHE}/slat_manifest.json" "${TRAIN_CACHE}/lifting_manifest.json" \
+  "${DEV_CACHE}/slat_manifest.json" "${DEV_CACHE}/lifting_manifest.json" <<'PY'
+import json
+import sys
+import torch
+
+from pose_point_depth_mv.evaluate_proobjaverse_official_slat_gt_support import (
+    _upstream_binding,
+)
+from pose_point_depth_mv.evaluate_proobjaverse_official_slat_gt_support_cross_host import (
+    validate_checkpoint_native_ss_binding_relocation,
+)
+from pose_point_depth_mv.native_3d_condition import NativeConditionSLatDataset
+from pose_point_depth_mv.no_vggt_ss_evidence import load_no_vggt_ss_evidence
+
+ckpt_path, ss_report, train_slat, train_lifting, dev_slat, dev_lifting = sys.argv[1:]
+c = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+saved = c["data_identity"]["native_ss"]
+assert saved == c["model_summary"]["upstream_native_ss"]
+_, full = load_no_vggt_ss_evidence(ss_report)
+for slat, lifting in ((train_slat, train_lifting), (dev_slat, dev_lifting)):
+    dataset = NativeConditionSLatDataset(slat, lifting, indices="all")
+    assert dataset.config["native_ss_deployment"] == full
+transition = validate_checkpoint_native_ss_binding_relocation(
+    saved, _upstream_binding(full), allow_path_relocation=True
+)
+print(json.dumps({"passed": True, "checkpoint_binding": transition}, indent=2, ensure_ascii=False))
+PY
+
+echo "G0 PASS"
+
+
+G1. N9 shard0占GPU3时：GPU 4,5,6,7并行启动GT Train64 / Dev64
+=================================================================
+
+分片固定为：
+
+  GPU4  Train64 [0,32)
+  GPU5  Train64 [32,64)
+  GPU6  Dev64   [0,32)
+  GPU7  Dev64   [32,64)
+
+一次完整粘贴执行：
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PROJECT=/home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+EVAL_GPUS=${EVAL_GPUS:-4,5,6,7}
+MIN_FREE_GPU_MIB=${MIN_FREE_GPU_MIB:-22000}
+
+IFS=, read -r -a GPUS <<<"${EVAL_GPUS}"
+if [ "${#GPUS[@]}" -ne 4 ]; then
+  echo "G1 blocked: EVAL_GPUS必须恰好有四个GPU id，当前=${EVAL_GPUS}"
+  exit 2
+fi
+declare -A SEEN_GPUS=()
+for GPU in "${GPUS[@]}"; do
+  if ! [[ "${GPU}" =~ ^[0-9]+$ ]] || [ -n "${SEEN_GPUS[${GPU}]+x}" ]; then
+    echo "G1 blocked: 非法或重复GPU id=${GPU}"
+    exit 2
+  fi
+  SEEN_GPUS[${GPU}]=1
+  FREE_MIB=$(nvidia-smi -i "${GPU}" --query-gpu=memory.free \
+    --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "${FREE_MIB}" =~ ^[0-9]+$ ]] || [ "${FREE_MIB}" -lt "${MIN_FREE_GPU_MIB}" ]; then
+    echo "G1 blocked: GPU ${GPU} free=${FREE_MIB:-?} MiB, required=${MIN_FREE_GPU_MIB} MiB"
+    exit 95
+  fi
+done
+
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+CKPT=${SOURCE}/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1/checkpoints/step_010000.pt
+TRAIN_CACHE=${SOURCE}/cache_train2000_protocol2128_views8_v1
+DEV_CACHE=${SOURCE}/cache_dev64_protocol2128_views8_v1
+SS_REPORT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+STOCK_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+
+for FILE in \
+  "${CKPT}" \
+  "${TRAIN_CACHE}/slat_manifest.json" "${TRAIN_CACHE}/lifting_manifest.json" \
+  "${DEV_CACHE}/slat_manifest.json" "${DEV_CACHE}/lifting_manifest.json" \
+  "${SS_REPORT}" "${STOCK_FREEZE}"
+do
+  test -s "${FILE}"
+done
+
+# 在启动任何worker前，先对四个不可变输出目录和unit做全量检查。
+for SPEC in \
+  "train64 0 0 32" \
+  "train64 1 32 64" \
+  "dev64 0 0 32" \
+  "dev64 1 32 64"
+do
+  read -r SPLIT SHARD START END <<<"${SPEC}"
+  ROOT=${SOURCE}/eval_${SPLIT}_B_scale_step10000_seed424344_4gpu_a72_v1
+  OUT=${ROOT}/shard${SHARD}_${START}_${END}
+  UNIT=tracker-proobj-slat-step10000-${SPLIT}-shard${SHARD}-a72-v1.service
+  if [ -e "${OUT}" ]; then
+    echo "G1 blocked: output already exists: ${OUT}"
+    exit 73
+  fi
+  if systemctl --user is-active --quiet "${UNIT}"; then
+    echo "G1 blocked: service already active: ${UNIT}"
+    exit 75
+  fi
+done
+
+mkdir -p "${SOURCE}/logs"
+SPECS=(
+  "train64 0 ${GPUS[0]} 0 32 ${TRAIN_CACHE}"
+  "train64 1 ${GPUS[1]} 32 64 ${TRAIN_CACHE}"
+  "dev64 0 ${GPUS[2]} 0 32 ${DEV_CACHE}"
+  "dev64 1 ${GPUS[3]} 32 64 ${DEV_CACHE}"
+)
+
+for SPEC in "${SPECS[@]}"; do
+  read -r SPLIT SHARD GPU START END CACHE <<<"${SPEC}"
+  ROOT=${SOURCE}/eval_${SPLIT}_B_scale_step10000_seed424344_4gpu_a72_v1
+  OUT=${ROOT}/shard${SHARD}_${START}_${END}
+  LOG=${SOURCE}/logs/G1_eval_${SPLIT}_step10000_shard${SHARD}_gpu${GPU}.log
+  UNIT=tracker-proobj-slat-step10000-${SPLIT}-shard${SHARD}-a72-v1
+  mkdir -p "${ROOT}"
+
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=${PROJECT} \
+    --property=StandardOutput=append:${LOG} \
+    --property=StandardError=append:${LOG} \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_proobjaverse_official_slat_gt_support_cross_host \
+      --allow_checkpoint_data_path_relocation \
+      --arm condition_lora \
+      --cache_manifest "${CACHE}/slat_manifest.json" \
+      --lifting_cache_manifest "${CACHE}/lifting_manifest.json" \
+      --checkpoint "${CKPT}" \
+      --native_ss_report "${SS_REPORT}" \
+      --stock_slat_freeze "${STOCK_FREEZE}" \
+      --output_dir "${OUT}" \
+      --weights ema \
+      --joint_seeds 42,43,44 \
+      --max_objects 64 \
+      --object_start "${START}" \
+      --object_end "${END}" \
+      --surface_samples 20000 \
+      --amp_dtype bf16
+
+  echo "started ${SPLIT} shard${SHARD} on physical GPU ${GPU}: ${UNIT}.service"
+done
+
+echo "G1 launched exactly four workers on ${EVAL_GPUS}; GPU3 remains reserved for N9 shard0."
+echo "current terminal remains open"
+
+
+G2. 监视第一组四个worker
+==========================
+
+watch -n 20 '
+date -u
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+for SPEC in "train64 0 0 32" "train64 1 32 64" "dev64 0 0 32" "dev64 1 32 64"; do
+  set -- ${SPEC}
+  SPLIT=$1; SHARD=$2; START=$3; END=$4
+  UNIT=tracker-proobj-slat-step10000-${SPLIT}-shard${SHARD}-a72-v1.service
+  OUT=${SOURCE}/eval_${SPLIT}_B_scale_step10000_seed424344_4gpu_a72_v1/shard${SHARD}_${START}_${END}
+  LOG_GLOB=${SOURCE}/logs/G1_eval_${SPLIT}_step10000_shard${SHARD}_gpu*.log
+  printf "%s shard%s service=" "${SPLIT}" "${SHARD}"
+  systemctl --user is-active "${UNIT}" 2>/dev/null || true
+  printf "  mesh_pairs="
+  find "${OUT}/mesh_pairs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
+  if [ -s "${OUT}/report.json" ]; then printf "  report=COMPLETE"; fi
+  echo
+  tail -n 1 ${LOG_GLOB} 2>/dev/null || true
+done
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+'
+
+
+G3. 第一组四个worker完成后CPU聚合
+===================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+
+for SPLIT in train64 dev64; do
+  ROOT=${SOURCE}/eval_${SPLIT}_B_scale_step10000_seed424344_4gpu_a72_v1
+  R0=${ROOT}/shard0_0_32/report.json
+  R1=${ROOT}/shard1_32_64/report.json
+  FINAL=${ROOT}/aggregate_v1
+
+  test -s "${R0}"
+  test -s "${R1}"
+  test ! -e "${FINAL}"
+
+  "${PY}" - "${R0}" "${R1}" <<'PY'
+import json
+import sys
+for path in sys.argv[1:]:
+    r = json.load(open(path, encoding="utf-8"))
+    assert r["passed"] is True
+    assert r["object_count"] == 32
+    assert r["run_config"]["checkpoint_step"] == 10000
+    assert r["run_config"]["weights"] == "ema"
+    assert r["run_config"]["seeds"] == [42, 43, 44]
+    assert r["run_config"]["native_ss_executed"] is False
+print({"passed": True, "shards": sys.argv[1:]})
+PY
+
+  "${PY}" -u -m pose_point_depth_mv.aggregate_proobjaverse_official_slat_gt_support \
+    --shard_reports "${R0},${R1}" \
+    --output_dir "${FINAL}" \
+    --expected_objects 64 \
+    --bootstrap_samples 5000
+done
+
+echo "current terminal remains open"
+
+
+G4. GT-support四checkpoint横向对照（step2000/4000/8000/10000）
+================================================================
+
+cd /home/zjr/Tracker
+set -euo pipefail
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+
+"${PY}" - "${SOURCE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+paths = {
+    "train64": {
+        2000: root / "eval_train64_B_scale_step2000_seed424344_v1/report.json",
+        4000: root / "eval_train64_B_scale_step4000_seed424344_v1/report.json",
+        8000: root / "eval_train64_B_scale_step8000_seed424344_4gpu_v1/aggregate_v1/report.json",
+        10000: root / "eval_train64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/report.json",
+    },
+    "dev64": {
+        2000: root / "eval_dev64_B_scale_step2000_seed424344_v1/report.json",
+        4000: root / "eval_dev64_B_scale_step4000_seed424344_v1/report.json",
+        8000: root / "eval_dev64_B_scale_step8000_seed424344_4gpu_v1/aggregate_v1/report.json",
+        10000: root / "eval_dev64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/report.json",
+    },
+}
+metrics = (
+    "chamfer_l1_improvement",
+    "fscore_0p02_delta",
+    "normal_consistency_delta",
+    "largest_component_ratio_delta",
+)
+print("split\tstep\tmetric\tmean\tmedian\twin_rate\tbootstrap_mean_95_ci\treport")
+for split, step_paths in paths.items():
+    for step, path in step_paths.items():
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        assert report["passed"] is True
+        assert report["object_count"] == 64
+        assert report["run_config"]["checkpoint_step"] == step
+        assert report["run_config"]["weights"] == "ema"
+        assert report["run_config"]["seeds"] == [42, 43, 44]
+        for metric in metrics:
+            row = report["summary"][metric]
+            print(
+                f"{split}\t{step}\t{metric}\t{row['mean']:+.8f}\t"
+                f"{row['median']:+.8f}\t{row['positive_rate']:.6f}\t"
+                f"{row['bootstrap_mean_95_ci']}\t{path}"
+            )
+PY
+
+echo
+cat "${SOURCE}/eval_train64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/summary.txt"
+echo
+cat "${SOURCE}/eval_dev64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/summary.txt"
+echo
+echo "判读：这是step2000/4000/8000/10000四个固定checkpoint的同表横向对照，不宣称为严格连续曲线。"
+echo "Train64看训练集拟合，Dev64看是否同步泛化；GT-support结果不等于predicted-support部署结论。"
+echo "current terminal remains open"
+
+
+P0. 可选只读检查：锁定N9-5实际使用的新Native-SS report
+=========================================================
+
+说明：
+  不重新猜`*_8gpu_v1`或`*_6gpu_v1`。直接从已经完成的N9-5 shard0
+  `run_identity.native_ss_report`读取，并要求五个N9-5 worker完全一致。
+  本段故意不在当前交互shell启用`set -e`：任何门失败都打印`P0 BLOCKED`，
+  保留当前终端。五个worker的结束门是`complete=true`；`passed=false`是已完成的
+  N9 Mesh审计结果，会明确警告但不阻止独立的step10000评测。
+
+set +e
+P0_RC=0
+
+cd /home/zjr/Tracker || P0_RC=$?
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+N9=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/dev48_newss2000_stock_and_slat8000_mesh_seed424344_5gpu_v1
+
+REPORTS=(
+  "${N9}/shard0_16_26/report.json" \
+  "${N9}/shard1_26_36/report.json" \
+  "${N9}/shard2_36_46/report.json" \
+  "${N9}/shard3_46_55/report.json" \
+  "${N9}/shard4_55_64/report.json"
+)
+
+for REPORT in "${REPORTS[@]}"; do
+  if [ ! -s "${REPORT}" ]; then
+    echo "P0 missing report: ${REPORT}" >&2
+    P0_RC=20
+  fi
+done
+
+SS_REPORT=
+if [ "${P0_RC}" -eq 0 ]; then
+  SS_REPORT=$("${PY}" - "${REPORTS[@]}" <<'PY'
+import json
+import sys
+
+rows = []
+for path in sys.argv[1:]:
+    report = json.load(open(path, encoding="utf-8"))
+    rows.append((path, report))
+    print(
+        f"{path}: complete={report.get('complete')!r} "
+        f"passed={report.get('passed')!r}",
+        file=sys.stderr,
+    )
+
+paths = {r["run_identity"]["native_ss_report"] for _, r in rows}
+hashes = {r["run_identity"]["native_ss_report_sha256"] for _, r in rows}
+if len(paths) != 1 or len(hashes) != 1:
+    print(
+        f"P0 BLOCKED: inconsistent Native-SS binding: "
+        f"paths={sorted(paths)!r} hashes={sorted(hashes)!r}",
+        file=sys.stderr,
+    )
+    raise SystemExit(21)
+
+incomplete = [
+    path
+    for path, report in rows
+    if report.get("complete") is not True
+]
+if incomplete:
+    print(
+        "P0 BLOCKED: N9-5 reports are not all complete:\n  "
+        + "\n  ".join(incomplete),
+        file=sys.stderr,
+    )
+    raise SystemExit(22)
+
+not_passed = [
+    path for path, report in rows if report.get("passed") is not True
+]
+if not_passed:
+    print(
+        "P0 WARNING: finalized N9 report(s) have passed=false; "
+        "preserving them as audit evidence and continuing because all workers "
+        "are complete:\n  " + "\n  ".join(not_passed),
+        file=sys.stderr,
+    )
+
+print(next(iter(paths)))
+PY
+  )
+  P0_RC=$?
+fi
+
+if [ "${P0_RC}" -eq 0 ] && [ ! -s "${SS_REPORT}" ]; then
+  echo "P0 BLOCKED: locked Native-SS report missing: ${SS_REPORT:-<empty>}" >&2
+  P0_RC=23
+fi
+
+if [ "${P0_RC}" -eq 0 ]; then
+  "${PY}" - "${SS_REPORT}" <<'PY'
+import json
+import sys
+from pose_point_depth_mv.proobjaverse_official_ss import load_official_native_ss_deployment
+
+payload, binding = load_official_native_ss_deployment(sys.argv[1])
+assert payload["passed"] is True and payload["object_count"] == 48
+assert binding["checkpoint_step"] == 2000
+assert binding["weights"] == "ema"
+assert binding["cfg_strength"] == 5.0
+assert binding["steps"] == 25
+assert binding["cfg_interval"] == [0.5, 1.0]
+assert binding["amp_dtype"] == "bf16"
+assert binding["false_checks"] == []
+print(json.dumps({
+    "passed": True,
+    "locked_native_ss_report": sys.argv[1],
+    "native_ss_binding": binding,
+    "n9_5_five_worker_reports_complete": True,
+}, indent=2, ensure_ascii=False))
+PY
+  P0_RC=$?
+fi
+
+if [ "${P0_RC}" -eq 0 ]; then
+  printf 'SS_REPORT=%s\n' "${SS_REPORT}"
+  echo "P0 PASS: Native-SS deployment is locked and all five N9 workers are complete."
+else
+  echo "P0 BLOCKED rc=${P0_RC}; do not start P1 until the stated contract issue is resolved." >&2
+fi
+
+# 无论P0通过还是阻断，都不要把当前交互终端留在errexit模式。
+set +e
+echo "current terminal remains open"
+
+
+P1. 直接启动：GPU 3,4,5,6,7五卡并行Dev48 A/B/C（无需W0/P0）
+=======================================================================
+
+五个分片固定为：
+
+  GPU3 [16,26)  10 objects
+  GPU4 [26,36)  10 objects
+  GPU5 [36,46)  10 objects
+  GPU6 [46,55)   9 objects
+  GPU7 [55,64)   9 objects
+
+一次完整粘贴执行：
+
+# P1在严格子shell中执行。任何guard/exit只结束子shell，不关闭当前交互终端。
+set +e
+(
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PROJECT=/home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+MESH_GPUS=${MESH_GPUS:-3,4,5,6,7}
+MIN_FREE_GPU_MIB=${MIN_FREE_GPU_MIB:-22000}
+
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+N9=${RUN}/dev48_newss2000_stock_and_slat8000_mesh_seed424344_5gpu_v1
+
+# 强制执行顺序：先要求step10000的GT Train64/Dev64均已完成聚合。
+GT_TRAIN_REPORT=${SOURCE}/eval_train64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/report.json
+GT_DEV_REPORT=${SOURCE}/eval_dev64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/report.json
+test -s "${GT_TRAIN_REPORT}"
+test -s "${GT_DEV_REPORT}"
+"${PY}" -c '
+import json,sys
+for path in sys.argv[1:]:
+    r=json.load(open(path,encoding="utf-8"))
+    assert r["passed"] is True
+    assert r["object_count"]==64 and r["record_count"]==192
+    assert r["run_config"]["checkpoint_step"]==10000
+print({"gt_aggregates_complete":True,"reports":sys.argv[1:]})
+' "${GT_TRAIN_REPORT}" "${GT_DEV_REPORT}"
+
+# N9-5的五个worker也必须已完成；尤其不能让旧worker与P1争用GPU3。
+# 这里用complete判断是否结束。passed=false仍保留为N9正式结果，但不误判成活跃worker。
+for REPORT in \
+  "${N9}/shard0_16_26/report.json" \
+  "${N9}/shard1_26_36/report.json" \
+  "${N9}/shard2_36_46/report.json" \
+  "${N9}/shard3_46_55/report.json" \
+  "${N9}/shard4_55_64/report.json"
+do
+  test -s "${REPORT}"
+done
+
+"${PY}" -c '
+import json,sys
+incomplete=[]
+not_passed=[]
+rows=[]
+for path in sys.argv[1:]:
+    r=json.load(open(path,encoding="utf-8"))
+    rows.append((path,r))
+    print("{}: complete={!r} passed={!r}".format(path, r.get("complete"), r.get("passed")))
+    if r.get("complete") is not True:
+        incomplete.append(path)
+    if r.get("passed") is not True:
+        not_passed.append(path)
+if incomplete:
+    print("P1 BLOCKED: N9-5 reports are not all complete:\n  " + "\n  ".join(incomplete), file=sys.stderr)
+    raise SystemExit(22)
+paths={r["run_identity"]["native_ss_report"] for _,r in rows}
+hashes={r["run_identity"]["native_ss_report_sha256"] for _,r in rows}
+if len(paths) != 1 or len(hashes) != 1:
+    print(
+        "P1 BLOCKED: inconsistent Native-SS binding: paths={!r} hashes={!r}".format(
+            sorted(paths), sorted(hashes)
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(23)
+if not_passed:
+    print(
+        "P1 WARNING: finalized N9 passed=false report(s) remain audit evidence; "
+        "launching the independent step10000 evaluation:\n  " + "\n  ".join(not_passed),
+        file=sys.stderr,
+    )
+print({
+    "n9_5_workers_complete":True,
+    "n9_5_all_worker_reports_passed":not not_passed,
+    "recorded_not_passed_reports":not_passed,
+    "locked_native_ss_report":next(iter(paths)),
+    "locked_native_ss_report_sha256":next(iter(hashes)),
+    "worker_count":len(sys.argv)-1,
+})
+' \
+  "${N9}/shard0_16_26/report.json" \
+  "${N9}/shard1_26_36/report.json" \
+  "${N9}/shard2_36_46/report.json" \
+  "${N9}/shard3_46_55/report.json" \
+  "${N9}/shard4_55_64/report.json"
+
+for SLOT in 0 1 2 3 4; do
+  for UNIT in \
+    tracker-proobj-newss-slat8k-mesh5-shard${SLOT}-v1.service \
+    tracker-proobj-newss-slat8k-mesh5-resume-shard${SLOT}-v1.service
+  do
+    if systemctl --user is-active --quiet "${UNIT}"; then
+      echo "P1 blocked: N9-5原任务或重跑仍在运行：${UNIT}"
+      exit 95
+    fi
+  done
+done
+
+IFS=, read -r -a GPUS <<<"${MESH_GPUS}"
+if [ "${#GPUS[@]}" -ne 5 ]; then
+  echo "P1 blocked: MESH_GPUS必须恰好有五个GPU id，当前=${MESH_GPUS}"
+  exit 2
+fi
+declare -A SEEN_GPUS=()
+for GPU in "${GPUS[@]}"; do
+  if ! [[ "${GPU}" =~ ^[0-9]+$ ]] || [ -n "${SEEN_GPUS[${GPU}]+x}" ]; then
+    echo "P1 blocked: 非法或重复GPU id=${GPU}"
+    exit 2
+  fi
+  SEEN_GPUS[${GPU}]=1
+  FREE_MIB=$(nvidia-smi -i "${GPU}" --query-gpu=memory.free \
+    --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "${FREE_MIB}" =~ ^[0-9]+$ ]] || [ "${FREE_MIB}" -lt "${MIN_FREE_GPU_MIB}" ]; then
+    echo "P1 blocked: GPU ${GPU} free=${FREE_MIB:-?} MiB, required=${MIN_FREE_GPU_MIB} MiB"
+    exit 95
+  fi
+done
+
+SS_REPORT=$("${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["run_identity"]["native_ss_report"])' \
+  "${N9}/shard0_16_26/report.json")
+CACHE=${SOURCE}/cache_dev64_protocol2128_views8_v1/slat_manifest.json
+LIFTING=${SOURCE}/cache_dev64_protocol2128_views8_v1/lifting_manifest.json
+FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+SLAT_CKPT=${SOURCE}/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1/checkpoints/step_010000.pt
+EVAL=${RUN}/dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1
+
+for FILE in "${CACHE}" "${LIFTING}" "${SS_REPORT}" "${FREEZE}" "${SLAT_CKPT}"; do
+  test -s "${FILE}"
+done
+test ! -e "${EVAL}"
+
+STARTS=(16 26 36 46 55)
+ENDS=(26 36 46 55 64)
+for SLOT in 0 1 2 3 4; do
+  UNIT=tracker-proobj-newss-slat10k-mesh5-shard${SLOT}-a72-v1.service
+  if systemctl --user is-active --quiet "${UNIT}"; then
+    echo "P1 blocked: service already active: ${UNIT}"
+    exit 75
+  fi
+done
+
+mkdir -p "${EVAL}" "${RUN}/logs"
+for SLOT in 0 1 2 3 4; do
+  GPU=${GPUS[$SLOT]}
+  START=${STARTS[$SLOT]}
+  END=${ENDS[$SLOT]}
+  OUT=${EVAL}/shard${SLOT}_${START}_${END}
+  LOG=${RUN}/logs/P1_5gpu_dev48_slat10000_shard${SLOT}_gpu${GPU}.log
+  UNIT=tracker-proobj-newss-slat10k-mesh5-shard${SLOT}-a72-v1
+
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=${PROJECT} \
+    --property=StandardOutput=append:${LOG} \
+    --property=StandardError=append:${LOG} \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_proobjaverse_official_native_ss_stock_slat \
+      worker \
+      --cache_manifest "${CACHE}" \
+      --lifting_cache_manifest "${LIFTING}" \
+      --native_ss_report "${SS_REPORT}" \
+      --stock_slat_freeze "${FREEZE}" \
+      --trained_slat_checkpoint "${SLAT_CKPT}" \
+      --trained_slat_weights ema \
+      --expected_trained_slat_step 10000 \
+      --output_dir "${OUT}" \
+      --object_start "${START}" \
+      --object_end "${END}" \
+      --joint_seeds 42,43,44 \
+      --weights ema \
+      --surface_samples 20000 \
+      --amp_dtype bf16
+
+  echo "started Dev48 shard${SLOT} [${START},${END}) on physical GPU ${GPU}: ${UNIT}.service"
+done
+
+echo "P1 launched five workers on ${MESH_GPUS}."
+)
+P1_RC=$?
+set +e
+if [ "${P1_RC}" -eq 0 ]; then
+  echo "P1 PASS: five workers launched."
+else
+  echo "P1 BLOCKED/FAILED rc=${P1_RC}; inspect the message above and do not run P4." >&2
+fi
+echo "current terminal remains open"
+
+
+P2. 监视第二组五个worker
+==========================
+
+set +e
+# `watch`默认经/bin/sh执行，而本段使用Bash数组；`-x bash -c`强制正确解释器。
+watch -n 20 -x -- bash -c '
+date -u
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+EVAL=${RUN}/dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1
+STARTS=(16 26 36 46 55)
+ENDS=(26 36 46 55 64)
+if [ ! -d "${EVAL}" ]; then
+  echo "P1_STATE=NOT_LAUNCHED_OR_BLOCKED output_dir=MISSING"
+fi
+for SLOT in 0 1 2 3 4; do
+  START=${STARTS[$SLOT]}; END=${ENDS[$SLOT]}
+  UNIT=tracker-proobj-newss-slat10k-mesh5-shard${SLOT}-a72-v1.service
+  OUT=${EVAL}/shard${SLOT}_${START}_${END}
+  LOAD=$(systemctl --user show "${UNIT}" -p LoadState --value 2>/dev/null || true)
+  ACTIVE=$(systemctl --user show "${UNIT}" -p ActiveState --value 2>/dev/null || true)
+  LOAD=${LOAD:-not-found}
+  ACTIVE=${ACTIVE:-inactive}
+  SS_PAIRS=$(find "${OUT}/ss_coords" -maxdepth 1 -type f -name "*.json" 2>/dev/null | wc -l)
+  MESH_PAIRS=$(find "${OUT}/mesh_pairs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+  OUT_STATE=MISSING
+  [ -d "${OUT}" ] && OUT_STATE=PRESENT
+  REPORT_STATE=pending
+  if [ -s "${OUT}/report.json" ]; then
+    REPORT_STATE=$(/home/zjr/anaconda3/envs/reconviagen/bin/python -c "import json,sys; r=json.load(open(sys.argv[1],encoding=\"utf-8\")); print(\"complete={} passed={}\".format(r.get(\"complete\"),r.get(\"passed\")))" "${OUT}/report.json" 2>/dev/null || echo INVALID)
+  fi
+  printf "shard%s[%s,%s) unit=%s/%s output=%s ss=%s mesh=%s report=%s\n" \
+    "${SLOT}" "${START}" "${END}" "${LOAD}" "${ACTIVE}" \
+    "${OUT_STATE}" "${SS_PAIRS}" "${MESH_PAIRS}" "${REPORT_STATE}"
+  tail -n 1 "${RUN}/logs/P1_5gpu_dev48_slat10000_shard${SLOT}_gpu"*.log 2>/dev/null || true
+done
+echo "P1 physical GPUs 3,4,5,6,7:"
+nvidia-smi -i 3,4,5,6,7 \
+  --query-gpu=index,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader,nounits
+'
+P2_RC=$?
+set +e
+echo "P2 monitor stopped rc=${P2_RC}（Ctrl-C通常为130，不代表worker失败）"
+echo "current terminal remains open"
+
+
+P3. 第二组中断时：只resume未完成worker
+========================================
+
+仅在P1启动过且部分worker未完成时执行。完整report自动跳过。
+
+# P3在严格子shell中执行；失败不会关闭当前交互终端。
+set +e
+(
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PROJECT=/home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+MESH_GPUS=${MESH_GPUS:-3,4,5,6,7}
+MIN_FREE_GPU_MIB=${MIN_FREE_GPU_MIB:-22000}
+IFS=, read -r -a GPUS <<<"${MESH_GPUS}"
+test "${#GPUS[@]}" -eq 5
+declare -A SEEN_GPUS=()
+for GPU in "${GPUS[@]}"; do
+  if ! [[ "${GPU}" =~ ^[0-9]+$ ]] || [ -n "${SEEN_GPUS[${GPU}]+x}" ]; then
+    echo "P3 blocked: 非法或重复GPU id=${GPU}"
+    exit 2
+  fi
+  SEEN_GPUS[${GPU}]=1
+  FREE_MIB=$(nvidia-smi -i "${GPU}" --query-gpu=memory.free \
+    --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]' || true)
+  if ! [[ "${FREE_MIB}" =~ ^[0-9]+$ ]] || [ "${FREE_MIB}" -lt "${MIN_FREE_GPU_MIB}" ]; then
+    echo "P3 blocked: GPU ${GPU} free=${FREE_MIB:-?} MiB, required=${MIN_FREE_GPU_MIB} MiB"
+    exit 95
+  fi
+done
+
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+N9=${RUN}/dev48_newss2000_stock_and_slat8000_mesh_seed424344_5gpu_v1
+SS_REPORT=$("${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["run_identity"]["native_ss_report"])' \
+  "${N9}/shard0_16_26/report.json")
+CACHE=${SOURCE}/cache_dev64_protocol2128_views8_v1/slat_manifest.json
+LIFTING=${SOURCE}/cache_dev64_protocol2128_views8_v1/lifting_manifest.json
+FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+SLAT_CKPT=${SOURCE}/B_condition_lora_train2000_step10000_seed42_8gpu_a72_v1/checkpoints/step_010000.pt
+EVAL=${RUN}/dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1
+test -d "${EVAL}"
+
+STARTS=(16 26 36 46 55)
+ENDS=(26 36 46 55 64)
+mkdir -p "${RUN}/logs"
+
+for SLOT in 0 1 2 3 4; do
+  GPU=${GPUS[$SLOT]}
+  START=${STARTS[$SLOT]}
+  END=${ENDS[$SLOT]}
+  OUT=${EVAL}/shard${SLOT}_${START}_${END}
+  REPORT=${OUT}/report.json
+  if [ -s "${REPORT}" ]; then
+    echo "skip complete shard${SLOT}: ${REPORT}"
+    continue
+  fi
+  for ACTIVE_UNIT in \
+    tracker-proobj-newss-slat10k-mesh5-shard${SLOT}-a72-v1.service \
+    tracker-proobj-newss-slat10k-mesh5-resume-shard${SLOT}-a72-v1.service
+  do
+    if systemctl --user is-active --quiet "${ACTIVE_UNIT}"; then
+      echo "skip active shard${SLOT}: ${ACTIVE_UNIT}"
+      continue 2
+    fi
+  done
+
+  LOG=${RUN}/logs/P3_resume_5gpu_dev48_slat10000_shard${SLOT}_gpu${GPU}.log
+  UNIT=tracker-proobj-newss-slat10k-mesh5-resume-shard${SLOT}-a72-v1
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=${PROJECT} \
+    --property=StandardOutput=append:${LOG} \
+    --property=StandardError=append:${LOG} \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+      ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_proobjaverse_official_native_ss_stock_slat \
+      worker \
+      --cache_manifest "${CACHE}" \
+      --lifting_cache_manifest "${LIFTING}" \
+      --native_ss_report "${SS_REPORT}" \
+      --stock_slat_freeze "${FREEZE}" \
+      --trained_slat_checkpoint "${SLAT_CKPT}" \
+      --trained_slat_weights ema \
+      --expected_trained_slat_step 10000 \
+      --output_dir "${OUT}" \
+      --object_start "${START}" --object_end "${END}" \
+      --joint_seeds 42,43,44 \
+      --weights ema --surface_samples 20000 --amp_dtype bf16 \
+      --resume
+
+  echo "resumed shard${SLOT} on physical GPU ${GPU}: ${UNIT}.service"
+done
+
+)
+P3_RC=$?
+set +e
+if [ "${P3_RC}" -eq 0 ]; then
+  echo "P3 PASS: incomplete inactive workers were resumed or nothing needed resume."
+else
+  echo "P3 BLOCKED/FAILED rc=${P3_RC}; inspect the message above." >&2
+fi
+echo "current terminal remains open"
+
+
+P4. 第二组五个worker完成后CPU聚合
+===================================
+
+# P4在严格子shell中执行；科学门rc=3仍按原合同保留，程序错误不会关闭终端。
+set +e
+(
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+SOURCE=/data/zjr/proobjaverse_official_slat_train2000_20260813_v1
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+CACHE=${SOURCE}/cache_dev64_protocol2128_views8_v1/slat_manifest.json
+LIFTING=${SOURCE}/cache_dev64_protocol2128_views8_v1/lifting_manifest.json
+EVAL=${RUN}/dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1
+FINAL=${EVAL}/aggregate_v1
+REPORTS="${EVAL}/shard0_16_26/report.json,${EVAL}/shard1_26_36/report.json,${EVAL}/shard2_36_46/report.json,${EVAL}/shard3_46_55/report.json,${EVAL}/shard4_55_64/report.json"
+
+IFS=, read -r -a REPORT_ARRAY <<<"${REPORTS}"
+for REPORT in "${REPORT_ARRAY[@]}"; do test -s "${REPORT}"; done
+test ! -e "${FINAL}"
+
+set +e
+"${PY}" -u -m pose_point_depth_mv.evaluate_proobjaverse_official_native_ss_stock_slat \
+  aggregate \
+  --cache_manifest "${CACHE}" \
+  --lifting_cache_manifest "${LIFTING}" \
+  --shard_reports "${REPORTS}" \
+  --output_dir "${FINAL}" \
+  --object_start 16 \
+  --object_end 64 \
+  --expected_objects 48 \
+  --joint_seeds 42,43,44 \
+  --bootstrap_samples 5000 \
+  --chamfer_win_rate_min 0.55 \
+  --largest_component_delta_min -0.02
+P4_SCIENCE_RC=$?
+set -e
+
+if [ "${P4_SCIENCE_RC}" -ne 0 ] && [ "${P4_SCIENCE_RC}" -ne 3 ]; then
+  echo "P4 failed as a program: rc=${P4_SCIENCE_RC}"
+  exit "${P4_SCIENCE_RC}"
+fi
+
+echo "P4_SCIENCE_RC=${P4_SCIENCE_RC}（0=全部科学门通过；3=至少一项科学门未过，不是程序崩溃）"
+echo "summary: ${FINAL}/summary.txt"
+echo "report: ${FINAL}/report.json"
+)
+P4_RC=$?
+set +e
+if [ "${P4_RC}" -eq 0 ]; then
+  echo "P4 PROGRAM PASS（科学门结论见P4_SCIENCE_RC和report）"
+else
+  echo "P4 BLOCKED/FAILED as a program rc=${P4_RC}; do not run P5/P6." >&2
+fi
+echo "current terminal remains open"
+
+
+P5. 第二组最终只读判读
+======================
+
+# P5在严格子shell中执行；缺报告/合同失败只打印阻断，不关闭终端。
+set +e
+(
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+REPORT=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1/aggregate_v1/report.json
+
+"${PY}" - "${REPORT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+assert r["object_count"] == 48
+assert r["record_count"] == 144
+assert r["integrity"]["object_coverage_exact"] is True
+assert r["integrity"]["ss_records_exact"] is True
+
+# 已知的唯一runtime缺口是同一个support爆炸对象的8个分支超过
+# 80k decoder安全上限。这里精确验证它，不会把任意runtime失败放宽。
+expected_failure_uid = (
+    "596fab654eb289ba89a56eb766d44ae5c139833801b02e0748abab7e3a928300"
+)
+failed = []
+for binding in r["worker_reports"]:
+    worker_path = Path(binding["path"])
+    worker = json.load(open(worker_path, encoding="utf-8"))
+    assert worker["complete"] is True
+    failed.extend(
+        row
+        for row in worker["mesh_branch_records"]
+        if row.get("passed") is not True
+    )
+
+assert r["passed"] is False
+assert r["integrity"]["mesh_pairs_exact"] is False
+assert len(failed) == 8
+assert {str(row["object_uid"]) for row in failed} == {expected_failure_uid}
+assert {
+    (int(row["seed"]), str(row["branch"])) for row in failed
+} == {
+    (42, "stock"), (42, "native"), (42, "native_trained"),
+    (43, "stock"), (43, "native"), (43, "native_trained"),
+    (44, "native"), (44, "native_trained"),
+}
+assert all(
+    "SLat decoder input exceeds safe active-point limit" in row["error"]["message"]
+    and int(row["slat_active_point_limit"]) == 80000
+    for row in failed
+)
+for key in (
+    "stock_slat_mesh_transfer",
+    "trained_slat_end_to_end_transfer",
+    "trained_slat_increment_on_native_support",
+):
+    assert r[key]["summary"]["chamfer_l1_improvement"]["count"] == 47
+
+print(json.dumps({
+    "runtime_integrity_passed": r["passed"],
+    "evaluation_completed": True,
+    "objects": r["object_count"],
+    "object_seed_pairs": r["record_count"],
+    "integrity": r["integrity"],
+    "known_runtime_gap": {
+        "object_uid": expected_failure_uid,
+        "failed_branch_count": len(failed),
+        "reason": "SLat decoder input exceeds audited 80000 active-point limit",
+        "valid_mesh_objects_used_for_metrics": 47,
+    },
+    "B_minus_A__new_ss2000_plus_stock_slat": {
+        "passed": r["stock_slat_mesh_transfer"]["passed"],
+        "summary": r["stock_slat_mesh_transfer"]["summary"],
+        "checks": r["stock_slat_mesh_transfer"]["checks"],
+    },
+    "C_minus_A__new_ss2000_plus_slat10000_end_to_end": {
+        "passed": r["trained_slat_end_to_end_transfer"]["passed"],
+        "summary": r["trained_slat_end_to_end_transfer"]["summary"],
+        "checks": r["trained_slat_end_to_end_transfer"]["checks"],
+    },
+    "C_minus_B__slat10000_increment_on_same_new_ss_support": {
+        "passed": r["trained_slat_increment_on_native_support"]["passed"],
+        "summary": r["trained_slat_increment_on_native_support"]["summary"],
+        "checks": r["trained_slat_increment_on_native_support"]["checks"],
+    },
+    "decision": r["decision"],
+    "scope_guard": r["scope_guard"],
+}, indent=2, ensure_ascii=False))
+PY
+
+cat "$(dirname "${REPORT}")/summary.txt"
+echo "判读顺序：先确认runtime integrity，再看B-A，然后看C-A；C-B只解释trained SLat在同一新SS support上的增量。"
+)
+P5_RC=$?
+set +e
+if [ "${P5_RC}" -eq 0 ]; then
+  echo "P5 AUDIT PASS（评测已完成；runtime/science gate仍为false）"
+else
+  echo "P5 BLOCKED/FAILED rc=${P5_RC}; inspect P4 outputs first." >&2
+fi
+echo "current terminal remains open"
+
+
+P6. 同协议比较step8000与step10000 predicted-support transfer
+===========================================================
+
+如果OLD_ROOT的aggregate尚不存在，先执行旧命令文档中的N10-5 CPU聚合；
+这不会占用五张GPU，也不影响P1优先启动。
+
+# P6在严格子shell中执行；旧/新aggregate缺失或协议不一致时保留终端。
+set +e
+(
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+RUN=/data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1
+OLD_ROOT=${RUN}/dev48_newss2000_stock_and_slat8000_mesh_seed424344_5gpu_v1
+NEW_ROOT=${RUN}/dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1
+
+"${PY}" - \
+  "${OLD_ROOT}/aggregate_v1/report.json" \
+  "${NEW_ROOT}/aggregate_v1/report.json" \
+  "${OLD_ROOT}" \
+  "${NEW_ROOT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+old_agg = json.load(open(sys.argv[1], encoding="utf-8"))
+new_agg = json.load(open(sys.argv[2], encoding="utf-8"))
+old_root = Path(sys.argv[3])
+new_root = Path(sys.argv[4])
+old_workers = [json.load(open(path, encoding="utf-8")) for path in sorted(old_root.glob("shard*/report.json"))]
+new_workers = [json.load(open(path, encoding="utf-8")) for path in sorted(new_root.glob("shard*/report.json"))]
+assert len(old_workers) == len(new_workers) == 5
+old_worker, new_worker = old_workers[0], new_workers[0]
+old_id = old_worker["run_identity"]
+new_id = new_worker["run_identity"]
+invariants = (
+    "cache_manifest_sha256",
+    "lifting_cache_manifest_sha256",
+    "native_ss_report_sha256",
+    "stock_slat_freeze_sha256",
+    "joint_seeds",
+    "weights",
+    "amp_dtype",
+    "surface_samples",
+    "same_ss_initial_noise",
+    "same_slat_condition",
+    "same_coordinate_keyed_slat_noise",
+)
+for key in invariants:
+    assert old_id[key] == new_id[key], (key, old_id[key], new_id[key])
+assert old_agg["object_count"] == new_agg["object_count"] == 48
+assert old_agg["record_count"] == new_agg["record_count"] == 144
+assert old_id["expected_trained_slat_step"] == 8000
+assert new_id["expected_trained_slat_step"] == 10000
+
+def ss_hashes(workers):
+    return {
+        (str(row["object_uid"]), int(row["seed"])): str(row["coords_npz_sha256"])
+        for worker in workers
+        for row in worker["ss_records"]
+    }
+
+old_ss = ss_hashes(old_workers)
+new_ss = ss_hashes(new_workers)
+assert old_ss == new_ss and len(old_ss) == 144
+
+metrics = (
+    "chamfer_l1_improvement",
+    "fscore_0p02_delta",
+    "normal_consistency_delta",
+    "largest_component_ratio_delta",
+)
+
+def compact(report, key):
+    return {
+        metric: {
+            field: report[key]["summary"][metric][field]
+            for field in ("mean", "median", "positive_rate", "bootstrap_mean_95_ci")
+        }
+        for metric in metrics
+    }
+
+def paired_change(key):
+    old_rows = {row["object_uid"]: row for row in old_agg[key]["object_rows"]}
+    new_rows = {row["object_uid"]: row for row in new_agg[key]["object_rows"]}
+    assert set(old_rows) == set(new_rows) and len(old_rows) == 47
+    result = {}
+    for index, metric in enumerate(metrics):
+        values = np.asarray([
+            float(new_rows[uid][metric]) - float(old_rows[uid][metric])
+            for uid in sorted(old_rows)
+        ], dtype=np.float64)
+        generator = np.random.default_rng(20260815 + index)
+        bootstrap = generator.choice(
+            values, size=(5000, len(values)), replace=True
+        ).mean(axis=1)
+        result[metric] = {
+            "mean": float(values.mean()),
+            "median": float(np.median(values)),
+            "positive_rate": float(np.mean(values > 0)),
+            "bootstrap_mean_95_ci": [
+                float(value) for value in np.quantile(bootstrap, [0.025, 0.975])
+            ],
+        }
+    return result
+
+print(json.dumps({
+    "protocol_invariants_exact": True,
+    "native_ss_coordinate_payload_hashes_exact_144_of_144": True,
+    "valid_mesh_objects": 47,
+    "step8000_C_minus_B": compact(old_agg, "trained_slat_increment_on_native_support"),
+    "step10000_C_minus_B": compact(new_agg, "trained_slat_increment_on_native_support"),
+    "step10000_minus_step8000_C_minus_B_paired_change": paired_change(
+        "trained_slat_increment_on_native_support"
+    ),
+    "step10000_minus_step8000_B_minus_A_repeat_drift": paired_change(
+        "stock_slat_mesh_transfer"
+    ),
+    "step10000_minus_step8000_C_minus_A_end_to_end_change": paired_change(
+        "trained_slat_end_to_end_transfer"
+    ),
+}, indent=2, ensure_ascii=False))
+PY
+
+echo "注意：B-A的重复漂移是runtime数值重现噪声对照；C-B的step10000-step8000配对差才隔离SLat checkpoint阶段变化。"
+)
+P6_RC=$?
+set +e
+if [ "${P6_RC}" -eq 0 ]; then
+  echo "P6 PASS"
+else
+  echo "P6 BLOCKED/FAILED rc=${P6_RC}; verify both aggregates and protocol bindings." >&2
+fi
+echo "current terminal remains open"
+
+
+最终完成标志
+============
+
+第一组必须同时存在并满足objects=64、records=192、passed=true：
+
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+    eval_train64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/report.json
+
+  /data/zjr/proobjaverse_official_slat_train2000_20260813_v1/
+    eval_dev64_B_scale_step10000_seed424344_4gpu_a72_v1/aggregate_v1/report.json
+
+第二组必须存在并满足：
+
+  object_count=48
+  record_count=144
+  object_coverage_exact=true
+  ss_records_exact=true
+  passed=false / mesh_pairs_exact=false
+    必须且只能由已冻结UID的8个分支超过80000 active-point安全上限触发
+  三个transfer summary的有效对象数=47
+
+  /data/zjr/proobjaverse_official_native_ss_train2000_20260815_v1/
+    dev48_newss2000_stock_and_slat10000_mesh_seed424344_5gpu_a72_v1/
+      aggregate_v1/report.json
+
+P4退出码3表示冻结composite科学门未全过。本次报告已完整产生，必须保留并判读，
+不能删除或重跑来挑结果；`P5 AUDIT PASS`也不得改写成`science_passed=true`。

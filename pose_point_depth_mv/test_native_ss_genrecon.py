@@ -91,6 +91,46 @@ def test_frustum_projection_and_aggregation_are_view_permutation_invariant() -> 
     torch.testing.assert_close(output, reversed_output, rtol=0.0, atol=1.0e-6)
 
 
+def test_compact_image_size_projection_matches_legacy_depth_shape() -> None:
+    legacy = synthetic_sample()
+    compact = dict(legacy)
+    compact.pop("predicted_depth")
+    compact["image_size"] = (4, 4)
+    indices = torch.tensor([1, 0], dtype=torch.long)
+
+    legacy_projected, legacy_valid, legacy_stats = project_frustum_dino(
+        legacy, device=torch.device("cpu"), view_indices=indices
+    )
+    compact_projected, compact_valid, compact_stats = project_frustum_dino(
+        compact, device=torch.device("cpu"), view_indices=indices
+    )
+
+    torch.testing.assert_close(
+        compact_projected, legacy_projected, rtol=0.0, atol=0.0
+    )
+    assert torch.equal(compact_valid, legacy_valid)
+    assert compact_stats.keys() == legacy_stats.keys()
+    for key in compact_stats:
+        torch.testing.assert_close(
+            compact_stats[key], legacy_stats[key], rtol=0.0, atol=0.0
+        )
+
+
+def test_projection_rejects_missing_depth_and_invalid_compact_image_size() -> None:
+    sample = synthetic_sample()
+    sample.pop("predicted_depth")
+    for image_size in (None, (), (4,), (0, 4), (4, -1)):
+        candidate = dict(sample)
+        if image_size is not None:
+            candidate["image_size"] = image_size
+        try:
+            project_frustum_dino(candidate, device=torch.device("cpu"))
+        except ValueError as error:
+            assert "predicted_depth or a valid image_size" in str(error)
+        else:
+            raise AssertionError(f"invalid image_size was accepted: {image_size!r}")
+
+
 class DummyAdaptedModel(nn.Module):
     def __init__(self):
         super().__init__()

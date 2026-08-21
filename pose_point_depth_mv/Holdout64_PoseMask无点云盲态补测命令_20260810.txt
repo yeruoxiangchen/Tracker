@@ -1,0 +1,99 @@
+Holdout64 Pose+Mask 无点云盲态补测命令（2026-08-10 UTC）
+==========================================================
+
+目的
+----
+M11 原 Point+Mask Holdout64 完成后，不先看任何 Holdout 指标，直接补跑同一模型的
+Pose+Mask/no-point 分支。M11N-M11Q 不读取 GT；M11R 才一次性对六种方法统一量化。
+
+冻结条件：M11C 同一64对象及顺序、同一8视角、seed42、mixed no-VGGT SS/SLat EMA、
+SS checkpoint 采样合同、SLat CFG5/25 steps、20k表面采样。Pose+Mask 仅通过
+O_posemask -> W -> O_reference 变换坐标，不做 GT ICP/scale/translation fit。
+
+禁止在 U1 前打开 M11M/M11R report、旧评测日志、Mesh、截图或排名。`passed=true`
+只表示协议和 Mesh 完整，不表示 Pose+Mask 获胜。
+
+
+B0：验证已冻结的盲态协议（CPU）
+---------------------------------
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PROTOCOL=pose_point_depth_mv/protocols/Holdout64_PoseMask盲态追加协议_20260810.json
+
+${PY} -m pose_point_depth_mv.freeze_holdout64_pose_mask_blind_protocol \
+  verify --contract "${PROTOCOL}"
+
+
+B1：M11 原五路推理完成后，单卡后台运行 M11N-M11R
+--------------------------------------------------
+此命令会先检查 M11H-L 五个 inference manifest 都是完整64xseed42，但不会读取
+M11M 五路指标报告。默认 GPU4；只需修改 HOLDOUT64_POSE_MASK_GPU 即可换卡。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+
+HOLDOUT64_POSE_MASK_GPU=${HOLDOUT64_POSE_MASK_GPU:-4}
+RUN=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  holdout64-pose-mask-blind-addendum \
+  "${RUN}/logs/Holdout64_PoseMask_blind_addendum.log" \
+  "${RUN}/logs/Holdout64_PoseMask_blind_addendum.pid" \
+  env HOLDOUT64_POSE_MASK_GPU="${HOLDOUT64_POSE_MASK_GPU}" \
+  bash pose_point_depth_mv/background_jobs/run_holdout64_pose_mask_blind_addendum.sh
+B1_LAUNCH_RC=$?
+echo "B1_LAUNCH_RC=${B1_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+
+B2：盲态监控（不看指标）
+------------------------
+只查看状态文件即可；M11N-M11R 日志本身也不打印质量指标。
+
+cat /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/Holdout64_PoseMask_blind_addendum.state
+cat /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/Holdout64_PoseMask_blind_addendum.exit_code
+
+PID=$(tr -dc '0-9' < /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/Holdout64_PoseMask_blind_addendum.pid)
+ps -p "${PID}" -o pid,stat,etime,time,pcpu,pmem,cmd
+
+需要排错时才看本补测日志：
+tail -f /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/Holdout64_PoseMask_blind_addendum.log
+
+
+U1：M11R rc=0 后显式一次性解盲（CPU，只读指标并写标记）
+---------------------------------------------------------
+只有 `exit_code` 内容为0时运行。该命令会打印 All64 六路完整统计、Pose+Mask 对
+Point+Mask、两个 Full、ReconViaGen、Pixal3D 的逐对象成对比较，以及可靠/低置信子组。
+
+cd /home/zjr/Tracker
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+PROTOCOL=pose_point_depth_mv/protocols/Holdout64_PoseMask盲态追加协议_20260810.json
+REPORT=${ROOT}/M11R_holdout64_sixway_pose_mask_blind_addendum_v1/report.json
+MARKER=${ROOT}/M11R_holdout64_sixway_pose_mask_blind_addendum_v1/UNBLINDED.json
+
+test "$(cat /data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/logs/Holdout64_PoseMask_blind_addendum.exit_code)" = 0
+${PY} -m pose_point_depth_mv.unblind_holdout64_pose_mask_addendum \
+  --report "${REPORT}" \
+  --blind_protocol_contract "${PROTOCOL}" \
+  --marker "${MARKER}"
+
+
+阶段产物
+--------
+M11N Pose+Mask runtime-O：
+/data/zjr/omni_real_video500_download_20260804_v2/M11N_holdout64_pose_mask_runtime_o_blind_v1/runtime_input_manifest.json
+
+M11O DINO-only model inputs：
+/data/zjr/omni_real_video500_download_20260804_v2/M11O_holdout64_pose_mask_dino_only_blind_v1/model_input_manifest.json
+
+M11P 原 Pose+Mask 坐标推理：
+/data/zjr/omni_real_video500_download_20260804_v2/M11P_holdout64_pose_mask_no_vggt_mixed1244_seed42_blind_v1/inference_manifest.json
+
+M11Q 参考 runtime-O Mesh：
+/data/zjr/omni_real_video500_download_20260804_v2/M11Q_holdout64_pose_mask_reference_o_seed42_blind_v1/inference_manifest.json
+
+M11R 六路统一正式报告：
+/data/zjr/omni_real_video500_download_20260804_v2/M11R_holdout64_sixway_pose_mask_blind_addendum_v1/report.json

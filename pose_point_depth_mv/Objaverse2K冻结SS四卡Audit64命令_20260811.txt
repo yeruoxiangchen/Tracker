@@ -1,0 +1,255 @@
+Objaverse2K 冻结 SS 四卡 Audit64 命令（2026-08-11）
+====================================================
+
+目的
+----
+
+在不重训 SS 的前提下，检查 frozen mixed No-VGGT SS step2000 EMA 在当前
+Objaverse limited-view 8 shards 上产生的 sparse coords 是否仍为非退化 support，决定是否
+允许继续构建 2K SLat cache。
+
+本实验固定：
+
+  - 数据：旧 shard_000--007，当前共 2199 objects / 4137 sequences；
+  - 抽样：每个 source shard 用稳定 SHA256 排名抽 8 objects，每个 object 冻结 1 sequence；
+  - 总量：64 objects；与 frozen SS 的 mixed1244 训练对象强制不重叠；
+  - GPU：物理卡 0、5、6、7，每卡 16 objects；
+  - SS：mixed No-VGGT step2000 EMA，SHA 由旧 M5 passed report 绑定；
+  - 推理：CFG3、25 steps、seeds 42/43/44、correct 与 pose_cyclic1；
+  - 比较：matched Stock SS、同一初始 noise、同一 target coords；
+  - 证据：formal=false、future_slat_training_overlap=true；只作 SLat 前置 support 门。
+
+不要把本报告写成 held-out 泛化、SLat、Mesh 或 ReconViaGen 质量结论。
+
+
+S0. 环境与资源预检
+==================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+WORK=/data/zjr/objaverse5k_direct_dino_cache_shards_20260811_v1
+MERGED=${WORK}/merged_limited8_stage08_v1
+RUN=/data/zjr/objaverse2k_frozen_ss_audit64_20260811_v1
+SELECT=${RUN}/selection
+CKPT=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_mixed_step2000_seed42_1gpu_v1/checkpoints/step_002000.pt
+REFERENCE=/data/zjr/native_no_vggt_mixed_real376_synth868_20260808_v1/ss_eval_synthetic_dev32_fixedcfg3_count125_v3/report.json
+
+test -s "${CKPT}"
+test -s "${REFERENCE}"
+
+READY=$(find "${WORK}/shards" \
+  -path '*/shard_00[0-7]/dino_only/_DINO_ONLY_LIFTING_COMPLETE.json' | wc -l)
+echo "limited DINO shards ready: ${READY}/8"
+test "${READY}" -eq 8
+
+# 训练前 Direct-DINO watcher 必须保持暂停，避免它在GPU 0自动拉起新任务。
+test "$(systemctl --user is-active \
+  tracker-objaverse5k-direct-dino-shards-v1.service || true)" != active
+
+nvidia-smi -i 0,5,6,7 \
+  --query-gpu=index,memory.used,memory.free,utilization.gpu \
+  --format=csv
+
+
+S1. 冻结旧8个DINO shard的合并manifest（CPU/I/O，不吃GPU）
+============================================================
+
+# 该合并器会重新读取并核验所有 sample SHA，可能花数分钟；不得跳过。
+# 即使后续 shard_008--015 完成，--shards 0-7 也保证本轮2K身份不变化。
+
+"${PY}" -u -m \
+  pose_point_depth_mv.dataset_tools.merge_dino_only_lifting_shards \
+    --input_root "${WORK}" \
+    --shards 0-7 \
+    --output_dir "${MERGED}" \
+    --expected_shards 8
+
+test -s "${MERGED}/lifting_manifest.json"
+test -s "${MERGED}/_DINO_ONLY_LIFTING_MERGE_COMPLETE.json"
+
+"${PY}" - "${MERGED}/lifting_manifest.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding="utf-8"))
+assert p["sample_count"] == 4137, p["sample_count"]
+assert p["object_count"] == 2199, p["object_count"]
+assert p["shard_merge"]["source_shard_count"] == 8
+assert p["passed"] is True and p["training_ready"] is True
+print({"samples":p["sample_count"],"objects":p["object_count"],"shards":8})
+PY
+
+
+S2. 冻结每shard 8对象、总计64对象的审计manifest（CPU）
+=====================================================
+
+"${PY}" -u -m pose_point_depth_mv.audit_objaverse2k_ss_support prepare \
+  --source_manifest "${MERGED}/lifting_manifest.json" \
+  --checkpoint "${CKPT}" \
+  --output_dir "${SELECT}" \
+  --expected_shards 8 \
+  --objects_per_shard 8 \
+  --seed 20260811
+
+test -s "${SELECT}/lifting_manifest.json"
+test -s "${SELECT}/selection.json"
+test -s "${SELECT}/_OBJAVERSE2K_SS_AUDIT_SELECTION_COMPLETE.json"
+
+"${PY}" - "${SELECT}/selection.json" <<'PY'
+import collections,json,sys
+p=json.load(open(sys.argv[1],encoding="utf-8"))
+counts=collections.Counter(row["source_shard_position"] for row in p["rows"])
+assert p["formal"] is False
+assert p["object_count"] == 64
+assert len({row["object_uid"] for row in p["rows"]}) == 64
+assert counts == {i:8 for i in range(8)}, counts
+assert p["training_object_disjoint_from_frozen_ss"] is True
+assert p["future_slat_training_overlap"] is True
+print({"objects":64,"per_shard":dict(sorted(counts.items())),"uid_hash":p["object_uid_hash"]})
+PY
+
+
+S3. 在GPU 0、5、6、7启动四个独立worker
+=======================================
+
+# 每个worker内部只看到一张逻辑cuda:0；worker_index决定冻结对象区间。
+# 四个worker分别覆盖selection manifest的[0:16)、[16:32)、[32:48)、[48:64)。
+# S3允许单独复制执行，但必须先确认S2的三个不可变selection文件完整。
+
+test -s "${SELECT}/lifting_manifest.json"
+test -s "${SELECT}/selection.json"
+test -s "${SELECT}/_OBJAVERSE2K_SS_AUDIT_SELECTION_COMPLETE.json"
+
+mkdir -p "${RUN}/logs"
+
+GPUS=(0 5 6 7)
+for WORKER in 0 1 2 3; do
+  GPU=${GPUS[${WORKER}]}
+  UNIT="tracker-objaverse2k-ss-audit64-w${WORKER}-v1"
+  OUT="${RUN}/worker_${WORKER}"
+  LOG="${RUN}/logs/worker_${WORKER}.log"
+
+  if test -s "${OUT}/report.json"; then
+    echo "reuse worker ${WORKER}: ${OUT}/report.json"
+    continue
+  fi
+  test ! -e "${OUT}"
+  if systemctl --user is-active --quiet "${UNIT}.service"; then
+    echo "already active: ${UNIT}.service" >&2
+    exit 90
+  fi
+  systemctl --user reset-failed "${UNIT}.service" >/dev/null 2>&1 || true
+
+  systemd-run --user \
+    --unit="${UNIT}" \
+    --collect \
+    --property=WorkingDirectory=/home/zjr/Tracker \
+    --property="StandardOutput=append:${LOG}" \
+    --property="StandardError=append:${LOG}" \
+    /usr/bin/env \
+      CUDA_VISIBLE_DEVICES="${GPU}" \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      "${PY}" -u -m pose_point_depth_mv.audit_objaverse2k_ss_support worker \
+        --cache_manifest "${SELECT}/lifting_manifest.json" \
+        --checkpoint "${CKPT}" \
+        --reference_report "${REFERENCE}" \
+        --output_dir "${OUT}" \
+        --worker_index "${WORKER}" \
+        --num_workers 4 \
+        --expected_objects 64 \
+        --bootstrap_samples 5000
+
+  echo "started worker=${WORKER} physical_gpu=${GPU} unit=${UNIT}.service"
+done
+
+
+S4. 监视四卡审计
+================
+
+watch -n 20 '
+date -u
+echo "completed reports: $(find /data/zjr/objaverse2k_frozen_ss_audit64_20260811_v1 -path "*/worker_*/report.json" | wc -l)/4"
+systemctl --user --no-pager --plain status \
+  "tracker-objaverse2k-ss-audit64-w*-v1.service" 2>/dev/null | tail -n 32 || true
+for WORKER in 0 1 2 3; do
+  echo "worker ${WORKER}:"
+  tail -n 2 "/data/zjr/objaverse2k_frozen_ss_audit64_20260811_v1/logs/worker_${WORKER}.log" 2>/dev/null || true
+done
+nvidia-smi -i 0,5,6,7 \
+  --query-gpu=index,memory.used,utilization.gpu \
+  --format=csv,noheader,nounits
+'
+
+# 预计四卡总墙钟时间约30--45分钟。运行时每个worker会依次完成correct和pose_cyclic1，
+# 所以日志进度可能在第一路16/16后继续运行，不要提前停止。
+
+
+S5. 四份worker报告完成后，在CPU重新聚合64对象总体门
+==================================================
+
+for WORKER in 0 1 2 3; do
+  test -s "${RUN}/worker_${WORKER}/report.json"
+done
+
+AGG=${RUN}/aggregate_v1
+test ! -e "${AGG}"
+
+AGG_RC=0
+"${PY}" -u -m pose_point_depth_mv.audit_objaverse2k_ss_support aggregate \
+  --cache_manifest "${SELECT}/lifting_manifest.json" \
+  --checkpoint "${CKPT}" \
+  --reference_report "${REFERENCE}" \
+  --shard_report "${RUN}/worker_0/report.json" \
+  --shard_report "${RUN}/worker_1/report.json" \
+  --shard_report "${RUN}/worker_2/report.json" \
+  --shard_report "${RUN}/worker_3/report.json" \
+  --output_dir "${AGG}" \
+  --bootstrap_samples 10000 \
+  --min_absolute_retention 0.80 \
+  --min_count_ratio 0.85 \
+  --max_count_ratio 1.25 \
+  --min_iou_win_rate 0.50 || AGG_RC=$?
+
+test -s "${AGG}/report.json"
+test -s "${AGG}/summary.txt"
+cat "${AGG}/summary.txt"
+echo "aggregate rc=${AGG_RC}; rc=0 means support gate passed, rc=2 means report complete but quality gate failed"
+test "${AGG_RC}" -eq 0
+
+
+S6. 总体通过门及解释
+===================
+
+aggregate只有以下各项同时通过才返回0：
+
+  1. 四worker完整覆盖64 objects / 每路192 records，无重叠、无缺失；
+  2. Full与Stock SS都没有empty support；
+  3. Full绝对IoU/precision/recall至少保留旧M5 dev32均值的80%；
+  4. Full/GT coord-count ratio mean位于[0.75,1.50]；
+  5. Full相对matched Stock的IoU、recall、latent-MSE gain mean均非负；
+  6. IoU对象胜率至少50%；
+  7. Full/Stock coord-count ratio mean位于旧M5门[0.85,1.25]；
+  8. correct pose的IoU mean严格优于pose_cyclic1；
+  9. 四worker的disabled adapter均与Stock bit-exact等价。
+
+通过只解锁“冻结该SS并构建2K SLat cache”。若失败，不删除报告，也不通过改阈值覆盖；先按
+aggregate_v1/report.json中的failed checks定位是绝对support退化、输出膨胀、SS相对Stock退化，
+还是pose条件失效，再决定是否需要2K SS重训。
+
+
+S7. 如需人工停止尚未完成的四个worker
+====================================
+
+for WORKER in 0 1 2 3; do
+  systemctl --user stop \
+    "tracker-objaverse2k-ss-audit64-w${WORKER}-v1.service" || true
+done
+
+# stop只终止运行，不删除任何已有worker目录。若某worker留下不完整目录，必须保留检查，
+# 不要直接覆盖；确认失败原因后使用新的版本化RUN目录重跑。

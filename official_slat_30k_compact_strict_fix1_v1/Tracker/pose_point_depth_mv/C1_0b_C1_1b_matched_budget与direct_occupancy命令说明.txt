@@ -1,0 +1,315 @@
+C1.0b matched-budget 与 C1.1b direct occupancy 命令说明
+日期：2026-07-19
+
+======================================================================
+一、当前模型与实验结构
+======================================================================
+
+C0.3（保持冻结）：
+
+  per-view VGGT/Image visual patch
+  + per-view pose/ray/depth geometry
+  -> gaussian3局部容差（correct与全部control对称）
+  -> frozen ViewCorrespondenceHead
+  -> 16^3 voxel correspondence score
+
+C1.0b（无训练，不加载Flow/decoder）：
+
+  correct ranking
+  reliability ranking
+  pose-corruption ranking
+  depth-corruption ranking
+  visual-corruption ranking
+  spatial-permutation ranking
+
+  每个ranking都接收：
+    correct policy的相同weight histogram
+    相同active support
+    相同nonzero count
+    相同L1 mass
+    相同top 5/10/20% voxel预算
+
+  target仅用于最后的exact / surface-r1审计。
+
+C1.1b（直接局部occupancy监督，仍不加载Flow/decoder）：
+
+  M0_reliability：
+    raw reliability -> linear occupancy probe
+
+  M1_view_geometry：
+    raw reliability
+    + frozen C0 joint per-view token weighted mean
+    + frozen C0 joint per-view token weighted std
+    + fixed-support统计
+    -> MLP occupancy probe
+
+  M2_plus_correspondence：
+    M1 base
+    + histogram-matched correspondence weight residual branch
+    -> occupancy logit
+
+  M1和M2 base初始化完全相同，但参数和optimizer独立。
+  训练只使用correct branch；pose/depth/visual corruption只用于因果评估。
+
+======================================================================
+二、新增或修改的代码
+======================================================================
+
+新增：
+
+  pose_point_depth_mv/c1_matched_budget.py
+    确定性target-independent排序；精确histogram matching；top-K和语义分层指标。
+
+  pose_point_depth_mv/audit_c1_matched_budget.py
+    单seed/split C1.0b审计；exact/surface-r1；2/4/8-view；四类depth语义。
+
+  pose_point_depth_mv/summarize_c1_matched_budget.py
+    N3绑定、三seed Fresh/Holdout汇总和三路线裁决。
+
+  pose_point_depth_mv/c1_direct_occupancy.py
+    frozen C0特征重建、M0/M1/M2、normalization和occupancy指标。
+
+  pose_point_depth_mv/train_c1_direct_occupancy.py
+    三个嵌套模型独立训练和checkpoint保存。
+
+  pose_point_depth_mv/eval_c1_direct_occupancy.py
+    M2-vs-M1及matched pose/depth/visual corruption评估。
+
+  pose_point_depth_mv/summarize_c1_direct_occupancy.py
+    三seed Fresh/Holdout正式C1.1b准入门。
+
+  pose_point_depth_mv/test_c1_matched_direct.py
+    matched histogram、固定预算、nested初始化和finite测试。
+
+  pose_point_depth_mv/run_c1_0b_matched_budget.sh
+  pose_point_depth_mv/run_c1_1b_direct_occupancy.sh
+    前台runner；实时输出；记录exit_code；科学FAIL不会关闭终端。
+
+修改：
+
+  pose_point_depth_mv/c1_occupancy.py
+    修复roc_auc在CUDA输入时创建CPU arange的device错误；指标定义不变。
+
+  pose_point_depth_mv/审计.md
+    追加第37节C1.0b正式结果、C1.1b结构与准入条件。
+
+======================================================================
+三、已经完成的C1.0b结论
+======================================================================
+
+正式汇总：
+
+  pose_point_depth_mv/outputs/
+    c1_0b_matched_budget_multiseed_20260719/report.json
+
+结果：
+
+  integrity：PASS
+  selected policy：hard_admitted
+  route：auxiliary_correspondence_feature_only
+
+含义：
+
+  correct对所有固定pose/depth/visual corruption，在3 seed、Fresh/Holdout、
+  exact/surface-r1和top 5/10/20%上的对象均值方向一致为正；
+
+  但correct持续弱于reliability，且visual corruption的median/win/CI和
+  2-view不够稳定。
+
+因此：
+
+  不允许将correspondence直接作为occupancy gate；
+  允许进入C1.1b，只检验它是否在M1强基线之上提供辅助增量。
+
+======================================================================
+四、13.1 静态检查和单元测试（已通过，可重复运行）
+======================================================================
+
+cd /home/zjr/Tracker || pwd
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+  pose_point_depth_mv/c1_occupancy.py \
+  pose_point_depth_mv/c1_matched_budget.py \
+  pose_point_depth_mv/audit_c1_matched_budget.py \
+  pose_point_depth_mv/summarize_c1_matched_budget.py \
+  pose_point_depth_mv/c1_direct_occupancy.py \
+  pose_point_depth_mv/train_c1_direct_occupancy.py \
+  pose_point_depth_mv/eval_c1_direct_occupancy.py \
+  pose_point_depth_mv/summarize_c1_direct_occupancy.py \
+  pose_point_depth_mv/test_c1_matched_direct.py
+echo "py_compile code=$?"
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+  pose_point_depth_mv.test_c1_matched_direct \
+  pose_point_depth_mv.test_c1_occupancy \
+  pose_point_depth_mv.test_correspondence_head \
+  pose_point_depth_mv.test_view_identity_lifting
+echo "unit-test code=$?"
+
+bash -n \
+  pose_point_depth_mv/run_c1_0b_matched_budget.sh \
+  pose_point_depth_mv/run_c1_1b_direct_occupancy.sh
+echo "bash syntax code=$?"
+
+已验证结果：40 tests PASS。
+
+======================================================================
+五、13.2 C1.0b三seed matched-budget正式审计
+======================================================================
+
+说明：
+
+  该步骤已经完成；再次运行会校验并复用完整report。
+  全程CPU，不训练，不占GPU。
+  runner结尾固定exit 0，科学FAIL只写入JSON和终端，不关闭shell。
+
+cd /home/zjr/Tracker || pwd
+/bin/bash pose_point_depth_mv/run_c1_0b_matched_budget.sh
+echo "C1.0b runner shell code=$?"
+
+查看正式结论：
+
+cd /home/zjr/Tracker || pwd
+
+REPORT=pose_point_depth_mv/outputs/c1_0b_matched_budget_multiseed_20260719/report.json
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("integrity_passed=", r["integrity_passed"])
+print("route=", r["decision"]["route"])
+print("selected_policy=", r["decision"]["selected_policy"])
+print("policy_decisions=")
+print(json.dumps(r["decision"]["policy_decisions"], indent=2))
+print("aggregate=")
+print(json.dumps(r["aggregate"], indent=2))
+' "${REPORT}"
+echo "C1.0b inspect code=$?"
+
+======================================================================
+六、13.3 C1.1b三seed直接局部occupancy监督
+======================================================================
+
+运行前提：
+
+  C1.0b report必须integrity PASS；
+  route必须为：
+    restricted_surface_occupancy_gate_candidate
+    或 auxiliary_correspondence_feature_only。
+
+当前满足auxiliary-only，因此runner会开始训练。
+
+运行特性：
+
+  GPU：CUDA_VISIBLE_DEVICES=1
+  前台实时输出，不使用nohup/后台PID/监视脚本；
+  不使用set -e；
+  每个train/eval写独立.exit_code；
+  科学FAIL不返回非零，不关闭当前终端；
+  不完整输出目录不会覆盖，返回记录码98并继续安全收尾。
+
+预计主要耗时来自每个split重新执行冻结C0的per-view Gaussian3特征提取。
+
+cd /home/zjr/Tracker || pwd
+/bin/bash pose_point_depth_mv/run_c1_1b_direct_occupancy.sh
+echo "C1.1b runner shell code=$?"
+
+训练输出：
+
+  pose_point_depth_mv/outputs/
+    c0_3_gaussian3_train16_s200_seed42_bf16_20260718/
+      c1_1b_direct_occupancy_s400_20260719/
+
+  seed43、seed44同名目录。
+
+每个run包含：
+
+  train_report.json
+  checkpoints/step_000100.pt
+  checkpoints/step_000200.pt
+  checkpoints/step_000300.pt
+  checkpoints/step_000400.pt
+  checkpoints/last.pt
+  eval_fresh48/report.json
+  eval_holdout/report.json
+
+最终汇总：
+
+  pose_point_depth_mv/outputs/
+    c1_1b_direct_occupancy_multiseed_20260719/report.json
+
+======================================================================
+七、13.4 查看C1.1b结果
+======================================================================
+
+cd /home/zjr/Tracker || pwd
+
+REPORT=pose_point_depth_mv/outputs/c1_1b_direct_occupancy_multiseed_20260719/report.json
+
+if [ ! -f "${REPORT}" ]; then
+  echo "C1.1b summary is not ready: ${REPORT}"
+else
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("passed=", r["passed"])
+print("allowed_next_stage=", r["allowed_next_stage"])
+print("checks=")
+print(json.dumps(r["checks"], indent=2))
+print("aggregate=")
+print(json.dumps(r["aggregate"], indent=2))
+' "${REPORT}"
+fi
+
+======================================================================
+八、C1.1b正式裁决
+======================================================================
+
+只有3 seed的Fresh和Holdout全部满足以下条件才进入C1.2：
+
+  M2 correct balanced BCE < M1 correct balanced BCE
+  M2 correct balanced BCE < M2 pose-corruption balanced BCE
+  M2 correct balanced BCE < M2 depth-corruption balanced BCE
+  M2 correct balanced BCE < M2 visual-corruption balanced BCE
+
+每项均要求：
+
+  object mean > 0
+  object median > 0
+  object win rate >= 0.65
+  bootstrap 95% CI lower > 0
+  2-view mean不反向
+
+PASS：
+
+  只允许进入frozen-base C1.2 causal occupancy adapter；
+  仍不自动允许Flow LoRA。
+
+FAIL：
+
+  停止target occupancy方向；
+  不继续增加probe容量或训练步数；
+  C0保留为Pose/Depth/Visual correspondence质量审计器；
+  reliability保留为独立通用几何支持基线。
+
+======================================================================
+九、已完成smoke说明
+======================================================================
+
+已经实际验证：
+
+  C1.0b真实map单样本：PASS
+  C1.0b三seed Fresh/Holdout：完成
+  C1.1b单对象两步训练：PASS
+  C1.1b单对象三corruption评估：工程链PASS
+  frozen C0 score重计算max_abs_diff：0
+
+单对象两步smoke的scientific FAIL不作结论，只证明代码、梯度、checkpoint、
+normalization和因果评估路径可运行。
+

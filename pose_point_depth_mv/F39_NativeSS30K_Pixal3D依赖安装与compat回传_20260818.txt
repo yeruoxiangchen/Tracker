@@ -1,0 +1,190 @@
+F39 Native-SS 30K：Pixal3D + frozen SS encoder 依赖安装与 compat 源码回传
+===============================================================================
+
+一、F39 下载并验证依赖包
+-------------------------------------------------------------------------------
+
+  set +e
+
+  NAME=Pixal3D_official_SS_target_dependencies_20260818_v2
+  WORK=/root/autodl-tmp/bootstrap/${NAME}
+  OSS=oss://yxc814/proobjaverse-transfer/bootstrap
+
+  mkdir -p "${WORK}"
+  cd "${WORK}"
+
+  test ! -e "${NAME}.tar.zst"
+  test ! -e "${NAME}.tar.zst.sha256"
+
+  ossutil cp "${OSS}/${NAME}.tar.zst" "./${NAME}.tar.zst"
+  ossutil cp "${OSS}/${NAME}.tar.zst.sha256" "./${NAME}.tar.zst.sha256"
+
+  sha256sum -c "${NAME}.tar.zst.sha256"
+  zstd -t "${NAME}.tar.zst"
+
+  test ! -e "${NAME}"
+  tar --use-compress-program=zstd -xf "${NAME}.tar.zst"
+
+  (
+    cd "${NAME}"
+    sha256sum -c SHA256SUMS.txt
+    diff -u SYMLINKS.txt \
+      <(find . -type l -printf '%p -> %l\n' | LC_ALL=C sort)
+  )
+
+  echo "DEPENDENCY_BUNDLE_VERIFY_RC=$? (0=PASS)"
+  echo "current terminal remains open"
+
+
+二、将 Pixal3D 源码放入 formal compat tree（不覆盖已有目录）
+-------------------------------------------------------------------------------
+
+  set +e
+
+  NAME=Pixal3D_official_SS_target_dependencies_20260818_v2
+  BUNDLE=/root/autodl-tmp/bootstrap/${NAME}/${NAME}
+  CODE=/root/Tracker_30k_compact_strict_fix1_ss30k_compat_v1/Tracker_Aug16_30k_compact_strict_fix1_ss30k_compat_20260818_v1
+
+  test -d "${BUNDLE}"
+  test -d "${CODE}"
+  test ! -e "${CODE}/Pixal3D"
+
+  bash "${BUNDLE}/install_pixal3d_source_only.sh" "${CODE}"
+
+安装脚本在目标已存在时 fail-closed，不会覆盖 F39 代码。
+
+
+三、CPU-only import + frozen encoder 本地权重 smoke
+-------------------------------------------------------------------------------
+
+  set +e
+  (
+    set -euo pipefail
+
+    source /root/miniconda3/etc/profile.d/conda.sh
+    conda activate reconviagen-bw
+
+    NAME=Pixal3D_official_SS_target_dependencies_20260818_v2
+    BUNDLE=/root/autodl-tmp/bootstrap/${NAME}/${NAME}
+    CODE=/root/Tracker_30k_compact_strict_fix1_ss30k_compat_v1/Tracker_Aug16_30k_compact_strict_fix1_ss30k_compat_20260818_v1
+    ENC_REV=25e0d31ffbebe4b5a97464dd851910efc3002d96
+    ENCODER_PREFIX=${BUNDLE}/huggingface/hub/models--microsoft--TRELLIS-image-large/snapshots/${ENC_REV}/ckpts/ss_enc_conv3d_16l8_fp16
+
+    export CUDA_VISIBLE_DEVICES=
+    export PYTHONDONTWRITEBYTECODE=1
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export PYTHONPATH="${CODE}:${CODE}/Pixal3D:${CODE}/ReconViaGen:${CODE}/ReconViaGen/wheels/vggt"
+
+    sha256sum "${ENCODER_PREFIX}.json" "${ENCODER_PREFIX}.safetensors"
+
+    /root/miniconda3/envs/reconviagen-bw/bin/python - "${ENCODER_PREFIX}" <<'PY'
+import json
+import sys
+import pixal3d.models as models
+
+model = models.from_pretrained(sys.argv[1])
+result = {
+    "passed": type(model).__name__ == "SparseStructureEncoder",
+    "class": type(model).__name__,
+    "parameter_count": sum(p.numel() for p in model.parameters()),
+    "latent_channels": int(model.latent_channels),
+    "use_fp16": bool(model.use_fp16),
+}
+assert result == {
+    "passed": True,
+    "class": "SparseStructureEncoder",
+    "parameter_count": 59298192,
+    "latent_channels": 8,
+    "use_fp16": True,
+}
+print(json.dumps(result, indent=2))
+PY
+
+    /root/miniconda3/envs/reconviagen-bw/bin/python - <<'PY'
+from huggingface_hub import hf_hub_download
+
+repo = "Stable-X/trellis-vggt-v0-2"
+for filename in (
+    "pipeline.json",
+    "ckpts/ss_dec_conv3d_16l8_fp16.json",
+    "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+):
+    path = hf_hub_download(repo, filename, local_files_only=True)
+    print(filename, "->", path)
+PY
+  )
+  DEP_CPU_RC=$?
+  echo "DEP_CPU_RC=${DEP_CPU_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+期望 encoder SHA256：
+
+  config  12efe92a0d7dcd790f251acb94a6950957ea4398268e2838ef7319c3f20b071e
+  weights 107874eeaa0feb82f51b19db5da7db534fb7e7f19e5a122b9ff1bc2e258bfc6d
+
+pilot16 v2 的原命令只需显式增加：
+
+  --ss_encoder_pretrained "${ENCODER_PREFIX}"
+
+不要改变原来的：
+
+  --ss_decoder_pretrained Stable-X/trellis-vggt-v0-2
+
+
+四、将 F39 compact→SS compat 源码回传，供 Codex 完成 A--D 逐行复核
+-------------------------------------------------------------------------------
+
+当前源服务器没有 F39 新增的 compact SS adapter，因此必须先回传以下四个
+正式文件；不要回传 cache、target、checkpoint 或 output。
+
+  set +e
+  (
+    set -euo pipefail
+
+    CODE=/root/Tracker_30k_compact_strict_fix1_ss30k_compat_v1/Tracker_Aug16_30k_compact_strict_fix1_ss30k_compat_20260818_v1
+    OUT=/root/autodl-tmp/bootstrap
+    NAME=F39_SS30K_compact_compat_sources_20260818_v1
+    OSS=oss://yxc814/proobjaverse-transfer/bootstrap
+
+    mkdir -p "${OUT}"
+    test ! -e "${OUT}/${NAME}.tar.zst"
+    test ! -e "${OUT}/${NAME}.tar.zst.sha256"
+
+    for file in \
+      pose_point_depth_mv/proobjaverse_official_ss_compact.py \
+      pose_point_depth_mv/materialize_proobjaverse_official_ss_targets.py \
+      pose_point_depth_mv/train_native_ss_genrecon.py \
+      pose_point_depth_mv/test_proobjaverse_official_ss_compact.py
+    do
+      test -s "${CODE}/${file}"
+    done
+
+    tar --use-compress-program='zstd -T0 -6' \
+      -cf "${OUT}/${NAME}.tar.zst" \
+      -C "${CODE}" \
+      pose_point_depth_mv/proobjaverse_official_ss_compact.py \
+      pose_point_depth_mv/materialize_proobjaverse_official_ss_targets.py \
+      pose_point_depth_mv/train_native_ss_genrecon.py \
+      pose_point_depth_mv/test_proobjaverse_official_ss_compact.py
+
+    (
+      cd "${OUT}"
+      sha256sum "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256"
+      sha256sum -c "${NAME}.tar.zst.sha256"
+    )
+
+    ossutil cp "${OUT}/${NAME}.tar.zst" "${OSS}/${NAME}.tar.zst"
+    ossutil cp "${OUT}/${NAME}.tar.zst.sha256" "${OSS}/${NAME}.tar.zst.sha256"
+  )
+  COMPAT_RETURN_RC=$?
+  echo "COMPAT_RETURN_RC=${COMPAT_RETURN_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+回传完成后把 `COMPAT_RETURN_RC=0` 告诉 Codex。Codex 将下载后完成：
+
+- A：CompactOfficialSSDataset 与 legacy batch 的字段/dtype/shape 对齐；
+- B：materializer 坐标系、threshold、encoder/decoder 数值合同；
+- C：derived manifest source/model/code identity 是否完整；
+- D：dataset dispatch 是否完全保持 legacy 路径；
+- 必要时仅做最小 patch，不重构 shared trainer。

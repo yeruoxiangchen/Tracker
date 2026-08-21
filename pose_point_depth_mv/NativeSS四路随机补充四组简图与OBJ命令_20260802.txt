@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# 从 final32 的四个不同来源/视图桶随机冻结 4 个新对象。
+# 输出以 16 个 OBJ 为主体；每个对象只生成 12 帧、4 视角低成本简图。
+
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PIXAL_PY=/home/zjr/anaconda3/envs/pixal3d/bin/python
+GPU=${GPU:-4}
+MIN_FREE_GPU_MIB=22000
+
+PIXAL_REVISION=0b31f9160aa400719af409098bff7936a932f726
+PIXAL_SNAPSHOT=/home/zjr/.cache/huggingface/hub/models--TencentARC--Pixal3D/snapshots/${PIXAL_REVISION}
+NAF_COMMIT=37f2dfc180f2de53d98bd601109c0da0dd6b0f43
+NAF_ROOT=/data/zjr/models/valeoai_NAF_${NAF_COMMIT}
+NAF_REPO=${NAF_ROOT}/repo
+NAF_CKPT=${NAF_ROOT}/naf_release.pth
+NAF_SOURCE_MANIFEST=${NAF_ROOT}/source_manifest.sha256
+
+T3_REPORT=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/final32_seed424344_exploratory_v1/report.json
+VAL_MANIFEST=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+SPLIT_AUDIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/split_audit.json
+PIXAL_TRANSFORM=/data/zjr/pixal3d_official_final_fix_20260729/pixal3d_official_final_to_direct_canonical_caseisolated_v3.json
+
+OUT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视化Mesh/随机补充四组Mesh与简图_20260802_v1
+PROTOCOL_ROOT=${OUT}/冻结协议与Pixal3D
+PROTOCOL=${PROTOCOL_ROOT}/protocol.json
+RENDER_ROOT=${OUT}/逐例审计
+LOG_ROOT=${OUT}/日志
+PROJECT_TOOLS=/home/zjr/Tracker/pose_point_depth_mv/tools
+
+"${PY}" -u -m pose_point_depth_mv.prepare_native_ss_pixal3d_review \
+  prepare \
+  --t3_report "${T3_REPORT}" \
+  --cache_manifest "${VAL_MANIFEST}" \
+  --split_audit "${SPLIT_AUDIT}" \
+  --output_dir "${PROTOCOL_ROOT}" \
+  --seed 42 \
+  --selection_seed 20260803 \
+  --max_gt_source_mib 128 \
+  --source_view_targets legacy_objaverse:4,gap_objaverse:4,pilot_objaverse:8,omni:2
+
+"${PY}" -u -m pose_point_depth_mv.prepare_native_ss_pixal3d_review \
+  verify --protocol "${PROTOCOL}"
+
+"${PY}" -c \
+  'import json,sys
+p=json.load(open(sys.argv[1])); old={
+"746ee2a21f064c53863156e2ea33ed4e_seq001",
+"objaverse_f6b109eead9f4d369e1509ac2abbbe67_seq001",
+"objaverse_0022445c2ea049ca8c2eefe0e52c5fff_seq001",
+"omni_banana_008_seq001"}
+uids={c["uid"] for c in p["cases"]}; assert len(uids)==4 and old.isdisjoint(uids)
+print("new random cases:")
+for c in p["cases"]: print(c["case_id"],c["uid"])' \
+  "${PROTOCOL}"
+
+mapfile -t CASE_ROWS < <(
+  "${PY}" -c \
+    'import json,sys
+for c in json.load(open(sys.argv[1]))["cases"]:
+ print(c["case_id"]+"|"+c["uid"])' \
+    "${PROTOCOL}"
+)
+
+mkdir -p "${LOG_ROOT}" "${RENDER_ROOT}"
+for case_index in "${!CASE_ROWS[@]}"; do
+  case_row=${CASE_ROWS[${case_index}]}
+  case_id=${case_row%%|*}
+  uid=${case_row#*|}
+  free_mib=$(nvidia-smi -i "${GPU}" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d '[:space:]')
+  if [ "${free_mib}" -lt "${MIN_FREE_GPU_MIB}" ]; then
+    echo "blocked: GPU ${GPU} free=${free_mib} MiB, required=${MIN_FREE_GPU_MIB} MiB"
+    exit 96
+  fi
+
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  ATTN_BACKEND=sdpa \
+  SPARSE_ATTN_BACKEND=sdpa \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PIXAL_PY}" -u -m pose_point_depth_mv.compare_pixal3d_singleview_smoke \
+    infer \
+    --protocol "${PROTOCOL}" \
+    --case_ids "${case_id}" \
+    --model_path "${PIXAL_SNAPSHOT}" \
+    --naf_repo "${NAF_REPO}" \
+    --naf_checkpoint "${NAF_CKPT}" \
+    --naf_source_manifest "${NAF_SOURCE_MANIFEST}" \
+    --device cuda \
+    --low_vram \
+    --skip_rembg \
+    --camera_mode known_crop_fov \
+    --resolution 1024 \
+    --sampling_steps 12 \
+    2>&1 | tee "${LOG_ROOT}/$((case_index + 1))_${case_id}_pixal.log"
+
+  case_out=${RENDER_ROOT}/${case_id}
+  resume_args=()
+  if [ -e "${case_out}" ] && [ ! -s "${case_out}/report.json" ]; then
+    resume_args=(--resume)
+  fi
+  PATH="${PROJECT_TOOLS}:${PATH}" \
+  CUDA_VISIBLE_DEVICES="${GPU}" \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  "${PY}" -u -m pose_point_depth_mv.render_native_ss_pixal3d_fourway \
+    --protocol "${PROTOCOL}" \
+    --pixal_transform "${PIXAL_TRANSFORM}" \
+    --output_dir "${case_out}" \
+    --uid "${uid}" \
+    --seed 42 \
+    --device cuda \
+    --review_modes rigid_pose_gt \
+    --render_frames 12 \
+    --render_resolution 256 \
+    --contact_frames 4 \
+    --fps 8 \
+    --display_margin 0.9 \
+    --alignment_seed 20260803 \
+    --candidate_samples 1000 \
+    --alignment_samples 4000 \
+    --candidate_iterations 8 \
+    --final_iterations 30 \
+    "${resume_args[@]}" \
+    2>&1 | tee "${LOG_ROOT}/$((case_index + 1))_${case_id}_render.log"
+
+  cp -f \
+    "${case_out}/rigid_pose_gt/normal_contact_sheet.png" \
+    "${OUT}/$((case_index + 1))_${case_id}_四路简图.png"
+done
+
+"${PY}" -u -m pose_point_depth_mv.collect_fourway_review_assets \
+  --review_root "${RENDER_ROOT}" \
+  --output_dir "${OUT}/四路OBJ分类" \
+  --review_mode rigid_pose_gt \
+  --expected_cases 4
+
+echo "新增随机四组: ${OUT}"
+echo "16 个分类 OBJ: ${OUT}/四路OBJ分类"
+echo "current terminal remains open"

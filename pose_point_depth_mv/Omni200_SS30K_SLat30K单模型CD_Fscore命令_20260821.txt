@@ -1,0 +1,91 @@
+OmniObject3D 200对象 / 20类别：只评 SS30K + SLat30K
+============================================================
+
+本流程不会加载、不会运行 ReconViaGen 原版模型。
+
+固定模型：
+- no-VGGT SS30K step30000 EMA
+- no-VGGT SLat30K step30000 EMA
+- frozen Stock Mesh decoder
+- seed 42
+
+固定数据：
+- 20类别 × 10对象 = 200对象
+- 每个对象从冻结24视图中随机选择的4视图
+- 精确 synthetic model-O 相机，不重新用 Pose+Mask 估计 O
+- 每个 Mesh 采样100000个表面点
+- CD 与 F-score@0.1
+- 最终数值为200对象算术平均
+
+一、确认渲染数据已经完成
+--------------------------
+
+cd /home/zjr/Tracker
+
+test -s /data/zjr/omniobject3d_reconviagen_style_omni200_20cat_render4_20260821_v1/report.json
+test -s /data/zjr/omniobject3d_reconviagen_style_omni200_20cat_render4_20260821_v1/manifest.json
+
+如果上面两个test尚未通过，且nvidia-smi已经恢复正常，用原路径断点续跑渲染：
+
+tmux new-session -d -s omni200render \
+  "bash -lc 'cd /home/zjr/Tracker && RENDER_GPUS=0,1,2,3,5,6,7 exec bash pose_point_depth_mv/background_jobs/run_reconviagen_omni200_render_7gpu.sh >> /data/zjr/omniobject3d_reconviagen_style_omni200_20cat_render4_20260821_v1/logs/master.resume.log 2>&1'"
+
+监视渲染：
+
+watch -n 10 'bash pose_point_depth_mv/background_jobs/show_reconviagen_omni200_render_progress.sh'
+
+必须等到 objects_complete=200/200 且 final_report 非空，才进入第二步。
+
+二、四卡后台启动
+----------------
+
+cd /home/zjr/Tracker
+
+mkdir -p /data/zjr/omniobject3d_omni200_ss30k_slat30k_step30k_metrics_seed42_20260821_v1
+
+tmux new-session -d -s omni200ss30slat30 \
+  "bash -lc 'cd /home/zjr/Tracker && EVAL_GPUS=0,1,2,3 exec bash pose_point_depth_mv/background_jobs/run_omni200_ss30k_slat30k_metrics_4gpu.sh >> /data/zjr/omniobject3d_omni200_ss30k_slat30k_step30k_metrics_seed42_20260821_v1/master.log 2>&1'"
+
+三、监视总进度
+--------------
+
+cd /home/zjr/Tracker
+
+watch -n 10 'bash pose_point_depth_mv/background_jobs/show_omni200_ss30k_slat30k_metrics_progress.sh'
+
+四、看主日志和各worker日志
+------------------------
+
+tail -F \
+  /data/zjr/omniobject3d_omni200_ss30k_slat30k_step30k_metrics_seed42_20260821_v1/master.log \
+  /data/zjr/omniobject3d_omni200_ss30k_slat30k_step30k_metrics_seed42_20260821_v1/logs/*.log
+
+五、完成后读取结果
+------------------
+
+cat /data/zjr/omniobject3d_omni200_ss30k_slat30k_step30k_metrics_seed42_20260821_v1/aggregate_v1/summary.txt
+
+/home/zjr/anaconda3/envs/reconviagen/bin/python - <<'PY'
+import json
+p = "/data/zjr/omniobject3d_omni200_ss30k_slat30k_step30k_metrics_seed42_20260821_v1/aggregate_v1/report.json"
+r = json.load(open(p, encoding="utf-8"))
+assert r["passed"] is True
+assert r["object_count"] == 200
+assert r["category_count"] == 20
+assert r["reconviagen_model_loaded_or_run"] is False
+print({
+    "objects": r["object_count"],
+    "categories": r["category_count"],
+    "CD_mean": r["chamfer_distance"]["mean"],
+    "CD_median": r["chamfer_distance"]["median"],
+    "Fscore_0p1_mean": r["fscore"]["mean"],
+    "Fscore_0p1_median": r["fscore"]["median"],
+    "ReconViaGen_ran": r["reconviagen_model_loaded_or_run"],
+})
+PY
+
+若要改用别的四张空闲卡，只改 EVAL_GPUS，例如：
+
+EVAL_GPUS=4,5,6,7
+
+输出目录和已有完成对象支持同路径重启；不要删除 partial 输出。

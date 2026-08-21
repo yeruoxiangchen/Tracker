@@ -1,0 +1,154 @@
+说明
+====
+
+本文件按段复制执行，不会启动 Flask/手机服务。
+
+但 S2 复用手机服务实际调用的同一组生产函数和命令：
+
+  手机协议 64 帧 RGB/mask/pose
+  -> finalize_ar_capture(pose_mask, 不消费点云)
+  -> prepare_coarsemodel_real_raw_cache(全部 64 帧)
+  -> prepare_omni_real_runtime_inputs(pose_mask, object azimuth balanced)
+  -> 最终 8 帧 input_quality 硬门
+
+legacy 18 帧选择只作采集质量检查，不会成为模型输入。S2 停在 8 帧
+选择完成处，不加载 DINO、SS、SLat 或 Mesh decoder。S4 才继续完整重建。
+
+
+S0. 静态检查和单元测试
+======================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+${PY} -m py_compile \
+  pose_point_depth_mv/ar_object_reconstruction.py \
+  pose_point_depth_mv/reconstruct_existing_ar_session.py \
+  pose_point_depth_mv/prepare_omni_holdout_ar_replay.py
+
+${PY} -m unittest pose_point_depth_mv.test_ar_object_reconstruction
+
+echo "current terminal remains open"
+
+
+S1. 将 Plant 的 64 个原始候选无损物化成手机上传协议
+=====================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/OmniHoldout64复杂样本真实采集流程回放_20260811_v1
+SESSION=omni_plant_012_replay64_v2
+
+${PY} -u -m pose_point_depth_mv.prepare_omni_holdout_ar_replay \
+  --raw_cache_report /data/zjr/omni_real_video500_download_20260804_v2/M11B_holdout64_raw_cache_v1/raw_cache_report.json \
+  --reference_runtime_manifest /data/zjr/omni_real_video500_download_20260804_v2/M11N_holdout64_pose_mask_runtime_o_blind_v1/runtime_input_manifest.json \
+  --object plant:plant_012 \
+  --output_root "${ROOT}" \
+  --mode uniform \
+  --frame_count 64 \
+  --session_id "${SESSION}"
+
+echo "replay report: ${ROOT}/replay_inputs/${SESSION}/replay_report.json"
+echo "current terminal remains open"
+
+
+S2. 只运行手机同合同 PoseMask 64->8 选帧和最终质量门
+====================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/OmniHoldout64复杂样本真实采集流程回放_20260811_v1
+SESSION=omni_plant_012_replay64_v2
+
+${PY} -u -m pose_point_depth_mv.reconstruct_existing_ar_session \
+  --session_id "${SESSION}" \
+  --output_root "${ROOT}" \
+  --gpu 6 \
+  --selection_only
+
+echo "selection report: ${ROOT}/reconstructions/${SESSION}/phone_frame_selection_report.json"
+echo "selected RGB/mask: ${ROOT}/reconstructions/${SESSION}/02_runtime_o/objects/plant/plant_012/views"
+echo "current terminal remains open"
+
+说明：S2 的 --gpu 只绑定与后续完整重建相同的部署配置；S2 本身不会加载模型，
+也不会占用 GPU 做 SS/SLat 推理。
+
+
+S3. 查看最终 8 帧、对应的原始 Omni 帧和质量门
+===============================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/OmniHoldout64复杂样本真实采集流程回放_20260811_v1
+SESSION=omni_plant_012_replay64_v2
+SELECT=${ROOT}/reconstructions/${SESSION}/phone_frame_selection_report.json
+REPLAY=${ROOT}/replay_inputs/${SESSION}/replay_report.json
+RAW=${ROOT}/reconstructions/${SESSION}/01_raw_cache/raw_cache_report.json
+
+${PY} -c '
+import json,sys
+s=json.load(open(sys.argv[1])); r=json.load(open(sys.argv[2])); raw=json.load(open(sys.argv[3]))
+omni_by_capture={x["runtime_frame_name"]:x["source_frame_name"] for x in r["frame_mapping"]}
+capture_by_frontend={x["frame_name"]:x["source_frame_name"] for x in raw["objects"][0]["cameras"]}
+rows=[]
+for frontend in s["selected_frame_names"]:
+  capture=capture_by_frontend[frontend]
+  rows.append({"frontend":frontend,"capture":capture,"source_omni":omni_by_capture[capture]})
+print(json.dumps({
+  "passed":s["passed"],
+  "geometry_mode":s["geometry_mode"],
+  "point_cloud_consumed":s["point_cloud_consumed"],
+  "candidate_frame_count":s["candidate_frame_count"],
+  "selected_view_count":s["selected_view_count"],
+  "selection_policy":s["view_selection"]["policy"],
+  "selected_frames":rows,
+  "input_quality":s["input_quality"],
+  "stopped_before_model_inference":s["stopped_before_model_inference"],
+},indent=2,ensure_ascii=False))
+' "${SELECT}" "${REPLAY}" "${RAW}"
+
+echo "current terminal remains open"
+
+
+S4. 人工确认 S3 后，可选：复用同一份 8 帧继续完整重建
+=====================================================
+
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+GPU=${GPU:-6}
+ROOT=/home/zjr/Tracker/pose_point_depth_mv/outputs/可视AR/OmniHoldout64复杂样本真实采集流程回放_20260811_v1
+SESSION=omni_plant_012_replay64_v2
+
+CUDA_VISIBLE_DEVICES=${GPU} \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+ATTN_BACKEND=flash_attn \
+SPCONV_ALGO=native \
+MPLCONFIGDIR=/tmp/matplotlib \
+NUMBA_CACHE_DIR=/tmp/numba_cache \
+TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+${PY} -u -m pose_point_depth_mv.reconstruct_existing_ar_session \
+  --session_id "${SESSION}" \
+  --output_root "${ROOT}" \
+  --gpu "${GPU}"
+
+echo "final report: ${ROOT}/reconstructions/${SESSION}/reconstruction_report.json"
+echo "current terminal remains open"
+
+
+判读边界
+========
+
+1. S2/S3 才回答“手机当前 PoseMask 主线从全部候选选了哪 8 帧”。
+2. 选帧使用 mask 中心射线估计物体中心和相机方位，不使用 Omni P_W。
+3. input_quality 必须 formal_input_passed=true；否则不会进入模型推理。
+4. camera roll 在 PoseMask 模式只是诊断项；mask-ray、轨道/重力一致性、方位
+   覆盖和最大方位缺口仍是硬门。
+5. 不要再用 run_plant_pointmask64_current_pipeline.sh 代表手机主线；它是旧的
+   PointMask 离线诊断链，不经过当前手机 PoseMask 最终质量门。

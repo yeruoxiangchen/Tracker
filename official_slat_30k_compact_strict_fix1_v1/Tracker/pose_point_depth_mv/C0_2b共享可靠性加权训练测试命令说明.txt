@@ -1,0 +1,602 @@
+# C0.2b Correct-only共享可靠性加权训练与测试命令
+# 日期：2026-07-17
+#
+# 一、当前模型与本阶段改动
+#
+# 网络结构保持不变：
+#
+#   per-view visual + pose/depth geometry
+#                 |
+#                 v
+#   ViewCorrespondenceHead（同voxel、view-pair pooling）
+#                 |
+#       correct/control voxel_score
+#
+# C0.2b只增加训练loss权重：
+#
+#   correct evidence --detach--> reliability[x]
+#                                  |
+#                                  +--> correct-vs-pose rank
+#                                  +--> correct-vs-depth rank
+#                                  +--> correct-vs-visual rank
+#
+# reliability由以下correct-only量的几何平均组成：
+#
+#   view_support_fraction
+#   pair_support_quality
+#   depth_reliability = sqrt(depth_confidence * depth_consistency)
+#   visibility_agreement
+#
+# 最终：
+#
+#   weight[x] = floor + (1-floor) * raw_weight[x] ** power
+#
+# inactive voxel权重严格为0。权重在进入loss前detach；correct和全部control
+# 使用同一个weight与同一个fixed correct support，control不能通过缩小coverage获益。
+#
+# 以下内容相对C0.2a保持不变：
+#
+#   head参数与checkpoint tensor schema
+#   evidence schema
+#   train16/fresh48对象划分
+#   随机view subset
+#   sample BCE/rank、voxel BCE及其权重
+#   三类training controls
+#   C0.1 v2正式评估门
+#
+# 特别说明：正式评估仍对全部active voxel使用未加权门，不使用reliability
+# 过滤低置信位置。因此C0.2b必须真正提升全coverage，不能靠训练权重修改验收集合。
+#
+# 二、预注册参数
+#
+#   --voxel_reliability_weighting correct_geometry
+#   --voxel_reliability_floor 0.10
+#   --voxel_reliability_power 1.0
+#
+# 其余C0.2a参数完全不变。
+#
+# 三、执行约定
+#
+# 1. 顺序执行V10.1 -> V10.2 -> V10.3 -> V10.4 -> V10.5 -> V10.6。
+# 2. 每个外层命令块最终exit 0，不会因科学FAIL关闭当前终端。
+# 3. 程序状态写入*.exit_code；科学判定写入*.decision_code。
+# 4. 不使用--fail_on_decision。
+# 5. 不覆盖已有目录；若目录不完整，记录98后人工检查或换名。
+# 6. seed42 paired FAIL时停止，不运行seed43/44，不进入C1。
+# 7. fresh48是development split；即使PASS仍需新的未查看holdout。
+
+
+# ========================================================================
+# V10.1 静态编译与回归测试
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OUT=pose_point_depth_mv/outputs/c0_2b_static_20260717
+  mkdir -p "${OUT}"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m py_compile \
+    pose_point_depth_mv/correspondence_head.py \
+    pose_point_depth_mv/train_correspondence_head.py \
+    pose_point_depth_mv/eval_voxel_selfcal_correspondence.py \
+    pose_point_depth_mv/summarize_voxel_selfcal_multiseed.py \
+    pose_point_depth_mv/test_correspondence_head.py \
+    2>&1 | tee "${OUT}/py_compile.log"
+  COMPILE_CODE=${PIPESTATUS[0]}
+  echo "${COMPILE_CODE}" > "${OUT}/py_compile.exit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -m unittest \
+    pose_point_depth_mv.test_correspondence_head \
+    pose_point_depth_mv.test_view_identity_lifting \
+    pose_point_depth_mv.test_pose_point_depth_mv \
+    pose_point_depth_mv.test_local_target_probe \
+    pose_point_depth_mv.test_point_anchor_v2 \
+    pose_point_depth_mv.test_point_anchor_rollout_v2 \
+    2>&1 | tee "${OUT}/unittest.log"
+  TEST_CODE=${PIPESTATUS[0]}
+  echo "${TEST_CODE}" > "${OUT}/unittest.exit_code"
+
+  echo "V10.1 compile/test codes: ${COMPILE_CODE}/${TEST_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V10.2 单卡BF16 s5 smoke + finite/protocol audit
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/c0_2b_reliability_smoke_s5_seed42_bf16_20260717
+
+  if [ -e "${RUN}" ]; then
+    echo "output already exists; no overwrite: ${RUN}"
+    echo 98 > "${RUN}.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=1 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_correspondence_head \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${RUN}" \
+    --indices 0-3 \
+    --max_steps 5 \
+    --save_every 5 \
+    --log_every 1 \
+    --seed 42 \
+    --lr 2e-4 \
+    --weight_decay 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --hidden_dim 64 \
+    --pair_hidden_dim 96 \
+    --min_views 2 \
+    --max_train_views 0 \
+    --train_controls \
+      pose_cyclic1,depth_view_cyclic1,visual_view_cyclic1 \
+    --sample_bce_weight 1.0 \
+    --sample_rank_weight 1.0 \
+    --voxel_bce_weight 0.25 \
+    --hard_negative_weight 0.5 \
+    --rank_margin 0.25 \
+    --voxel_rank_weight 1.0 \
+    --voxel_rank_margin 0.25 \
+    --voxel_rank_temperature 0.10 \
+    --voxel_rank_hard_weight 0.5 \
+    --voxel_reliability_weighting correct_geometry \
+    --voxel_reliability_floor 0.10 \
+    --voxel_reliability_power 1.0 \
+    2>&1 | tee "${RUN}.log"
+  TRAIN_CODE=${PIPESTATUS[0]}
+  echo "${TRAIN_CODE}" > "${RUN}.exit_code"
+
+  if [ "${TRAIN_CODE}" -eq 0 ]; then
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+      reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+      --train_report "${RUN}/train_report.json" \
+      --checkpoint "${RUN}/checkpoints/last.pt" \
+      --expected_updates 5 \
+      --max_nonfinite_attempts 0 \
+      --output "${RUN}/finite_run_audit.json" \
+      2>&1 | tee "${RUN}/finite_run_audit.log"
+    AUDIT_CODE=${PIPESTATUS[0]}
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+protocol = report["model_summary"]["protocol"]
+rows = report["history"]
+checks = (
+    report["model_summary"]["stage"]
+    == "C0.2b reliability-weighted voxel correspondence head",
+    protocol["voxel_reliability_weighting_version"]
+    == "pose_point_depth_mv.correct_voxel_reliability.v1",
+    protocol["voxel_rank_weighting"] == "correct_geometry",
+    protocol["voxel_reliability_source"]
+    == "detached_correct_evidence_only",
+    protocol["voxel_reliability_shared_across_controls"] is True,
+    protocol["voxel_reliability_floor"] == 0.10,
+    protocol["voxel_reliability_power"] == 1.0,
+    all(row.get("voxel_reliability") is not None for row in rows),
+    all(
+        0.10 <= row["voxel_reliability"]["active_weight_min"]
+        <= row["voxel_reliability"]["active_weight_max"] <= 1.0
+        for row in rows
+    ),
+    all(
+        0.0 < row["voxel_reliability"]["effective_fraction"] <= 1.0
+        for row in rows
+    ),
+)
+print("C0.2b smoke protocol checks=", checks)
+raise SystemExit(0 if all(checks) else 2)
+' "${RUN}/train_report.json"
+    PROTOCOL_CODE=$?
+  else
+    AUDIT_CODE=99
+    PROTOCOL_CODE=99
+  fi
+
+  echo "${AUDIT_CODE}" > "${RUN}.audit_code"
+  echo "${PROTOCOL_CODE}" > "${RUN}.protocol_code"
+  echo "V10.2 train/audit/protocol codes: ${TRAIN_CODE}/${AUDIT_CODE}/${PROTOCOL_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V10.3 seed42 train16 s400：相对C0.2a只改变voxel ranking权重
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/c0_2b_reliability_train16_s400_seed42_bf16_20260717
+
+  if [ -e "${RUN}" ]; then
+    echo "output already exists; no overwrite: ${RUN}"
+    echo 98 > "${RUN}.exit_code"
+    exit 0
+  fi
+
+  CUDA_VISIBLE_DEVICES=1 \
+  HF_HUB_OFFLINE=1 \
+  TRANSFORMERS_OFFLINE=1 \
+  ATTN_BACKEND=flash_attn \
+  SPCONV_ALGO=native \
+  MPLCONFIGDIR=/tmp/matplotlib \
+  NUMBA_CACHE_DIR=/tmp/numba_cache \
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+    pose_point_depth_mv.train_correspondence_head \
+    --cache_manifest "${CACHE}/manifest.json" \
+    --output_dir "${RUN}" \
+    --indices 0-15 \
+    --max_steps 400 \
+    --save_every 50 \
+    --log_every 10 \
+    --seed 42 \
+    --lr 2e-4 \
+    --weight_decay 1e-4 \
+    --grad_accum 1 \
+    --grad_clip 1.0 \
+    --amp_dtype bf16 \
+    --nonfinite_policy error \
+    --max_nonfinite_attempts 0 \
+    --hidden_dim 64 \
+    --pair_hidden_dim 96 \
+    --min_views 2 \
+    --max_train_views 0 \
+    --train_controls \
+      pose_cyclic1,depth_view_cyclic1,visual_view_cyclic1 \
+    --sample_bce_weight 1.0 \
+    --sample_rank_weight 1.0 \
+    --voxel_bce_weight 0.25 \
+    --hard_negative_weight 0.5 \
+    --rank_margin 0.25 \
+    --voxel_rank_weight 1.0 \
+    --voxel_rank_margin 0.25 \
+    --voxel_rank_temperature 0.10 \
+    --voxel_rank_hard_weight 0.5 \
+    --voxel_reliability_weighting correct_geometry \
+    --voxel_reliability_floor 0.10 \
+    --voxel_reliability_power 1.0 \
+    2>&1 | tee "${RUN}.log"
+  TRAIN_CODE=${PIPESTATUS[0]}
+  echo "${TRAIN_CODE}" > "${RUN}.exit_code"
+  echo "V10.3 seed42 training code: ${TRAIN_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V10.4 seed42 finite与checkpoint协议审计
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/c0_2b_reliability_train16_s400_seed42_bf16_20260717
+
+  if [ ! -f "${RUN}/train_report.json" ] || \
+     [ ! -f "${RUN}/checkpoints/last.pt" ]; then
+    echo "missing completed training artifacts: ${RUN}"
+    echo 98 > "${RUN}.audit_code"
+    echo 98 > "${RUN}.protocol_code"
+    exit 0
+  fi
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -u \
+    reconvggt_ar_adapter_a/audit_pointpose_training_run.py \
+    --train_report "${RUN}/train_report.json" \
+    --checkpoint "${RUN}/checkpoints/last.pt" \
+    --expected_updates 400 \
+    --max_nonfinite_attempts 0 \
+    --output "${RUN}/finite_run_audit.json" \
+    2>&1 | tee "${RUN}/finite_run_audit.log"
+  AUDIT_CODE=${PIPESTATUS[0]}
+  echo "${AUDIT_CODE}" > "${RUN}.audit_code"
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import sys
+import torch
+from pathlib import Path
+from pose_point_depth_mv.correspondence_head import (
+    CORRESPONDENCE_CHECKPOINT_VERSION,
+    VOXEL_RELIABILITY_WEIGHTING_VERSION,
+    correspondence_protocol_hash,
+)
+
+checkpoint = torch.load(Path(sys.argv[1]), map_location="cpu")
+summary = checkpoint["model_summary"]
+protocol = summary["protocol"]
+checks = (
+    checkpoint.get("format") == CORRESPONDENCE_CHECKPOINT_VERSION,
+    checkpoint.get("step") == 400,
+    summary.get("stage")
+    == "C0.2b reliability-weighted voxel correspondence head",
+    protocol.get("voxel_reliability_weighting_version")
+    == VOXEL_RELIABILITY_WEIGHTING_VERSION,
+    protocol.get("voxel_rank_weighting") == "correct_geometry",
+    protocol.get("voxel_reliability_source")
+    == "detached_correct_evidence_only",
+    protocol.get("voxel_reliability_shared_across_controls") is True,
+    protocol.get("voxel_reliability_floor") == 0.10,
+    protocol.get("voxel_reliability_power") == 1.0,
+    summary.get("protocol_hash") == correspondence_protocol_hash(protocol),
+)
+print("C0.2b checkpoint protocol checks=", checks)
+raise SystemExit(0 if all(checks) else 2)
+' "${RUN}/checkpoints/last.pt"
+  PROTOCOL_CODE=$?
+  echo "${PROTOCOL_CODE}" > "${RUN}.protocol_code"
+
+  echo "V10.4 audit/protocol codes: ${AUDIT_CODE}/${PROTOCOL_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V10.5 seed42 train16/fresh48正式未加权C0.1 v2门
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  CACHE=/data/ar_ss_flow_pose_lifting_overfit64_v1_20260714
+  RUN=pose_point_depth_mv/outputs/c0_2b_reliability_train16_s400_seed42_bf16_20260717
+
+  if [ ! -f "${RUN}.audit_code" ] || \
+     [ ! -f "${RUN}.protocol_code" ] || \
+     [ "$(cat "${RUN}.audit_code")" -ne 0 ] || \
+     [ "$(cat "${RUN}.protocol_code")" -ne 0 ]; then
+    echo "skip V10.5: finite/protocol audit did not pass"
+    exit 0
+  fi
+
+  run_voxel_eval() {
+    local SPLIT=$1
+    local INDICES=$2
+    local OUT=${RUN}/voxel_selfcal_v2_${SPLIT}_t0
+    local RUN_CODE
+    local DECISION_CODE
+
+    if [ -f "${OUT}/report.json" ]; then
+      RUN_CODE=0
+      echo "reuse complete report: ${OUT}/report.json"
+    elif [ -e "${OUT}" ]; then
+      RUN_CODE=98
+      echo "incomplete output exists; no overwrite: ${OUT}"
+    else
+      CUDA_VISIBLE_DEVICES=1 \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      ATTN_BACKEND=flash_attn \
+      SPCONV_ALGO=native \
+      MPLCONFIGDIR=/tmp/matplotlib \
+      NUMBA_CACHE_DIR=/tmp/numba_cache \
+      TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /home/zjr/anaconda3/envs/reconviagen/bin/python -u -m \
+        pose_point_depth_mv.eval_voxel_selfcal_correspondence \
+        --cache_manifest "${CACHE}/manifest.json" \
+        --checkpoint "${RUN}/checkpoints/last.pt" \
+        --output_dir "${OUT}" \
+        --indices "${INDICES}" \
+        --split_name "${SPLIT}" \
+        --max_samples 0 \
+        --device cuda \
+        --threshold 0.0 \
+        --bootstrap_samples 10000 \
+        --min_voxel_positive_ratio 0.60 \
+        --min_per_object_positive_ratio 0.50 \
+        --min_object_local_pass_rate 0.65 \
+        --min_heldout_gate_positive_ratio 0.65 \
+        --min_spatial_control_object_win_rate 0.65 \
+        --min_spatial_control_gate_positive_ratio 0.65 \
+        --min_spatial_std 1e-4 \
+        --max_permutation_diff 1e-5 \
+        --save_maps \
+        2>&1 | tee "${OUT}.log"
+      RUN_CODE=${PIPESTATUS[0]}
+    fi
+    echo "${RUN_CODE}" > "${OUT}.exit_code"
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(98)
+report = json.loads(path.read_text(encoding="utf-8"))
+gate = report.get("gate_protocol", {})
+valid = (
+    report.get("passed") is True
+    and gate.get("scope") == "per_voxel"
+    and gate.get("uses_object_score_as_gate") is False
+    and gate.get("fixed_correct_support") is True
+)
+raise SystemExit(0 if valid else 2)
+' "${OUT}/report.json"
+    DECISION_CODE=$?
+    echo "${DECISION_CODE}" > "${OUT}.decision_code"
+    echo "V10.5 ${SPLIT} run/decision codes: ${RUN_CODE}/${DECISION_CODE}"
+  }
+
+  run_voxel_eval train16 0-15
+  run_voxel_eval fresh48 16-63
+  exit 0
+)
+
+
+# ========================================================================
+# V10.6 C0.2a/C0.2b结果对比与seed42配对裁决
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  OLD_RUN=pose_point_depth_mv/outputs/c0_2a_voxelrank_train16_s400_seed42_bf16_20260717
+  NEW_RUN=pose_point_depth_mv/outputs/c0_2b_reliability_train16_s400_seed42_bf16_20260717
+  OUT=${NEW_RUN}/c0_2a_c0_2b_comparison.txt
+
+  /home/zjr/anaconda3/envs/reconviagen/bin/python -c '
+import json
+import sys
+from pathlib import Path
+
+old_root = Path(sys.argv[1])
+new_root = Path(sys.argv[2])
+all_present = True
+paired_pass = True
+for split in ("train16", "fresh48"):
+    old_path = old_root / f"voxel_selfcal_v2_{split}_t0" / "report.json"
+    new_path = new_root / f"voxel_selfcal_v2_{split}_t0" / "report.json"
+    print("\\n====", split)
+    if not old_path.is_file() or not new_path.is_file():
+        print("MISSING", old_path, new_path)
+        all_present = False
+        paired_pass = False
+        continue
+    for label, path in (("C0.2a", old_path), ("C0.2b", new_path)):
+        report = json.loads(path.read_text(encoding="utf-8"))
+        primary = report["primary"]
+        hard = primary["hard_margin_mean"]
+        print(
+            "{} passed={} mean={:.6f} median={:.6f} ci_low={:.6f} voxel={:.4f} local={:.4f}".format(
+                label,
+                report["passed"],
+                hard["object"]["mean"],
+                hard["object"]["median"],
+                hard["object_bootstrap_95_ci"][0],
+                primary["voxel_positive_ratio"]["object"]["mean"],
+                primary["local_object_pass_rate"],
+            )
+        )
+        if label == "C0.2b":
+            paired_pass = paired_pass and bool(report["passed"])
+print("\\nC0.2b seed42 paired decision=", "PASS" if paired_pass else "FAIL")
+raise SystemExit(0 if all_present and paired_pass else 2)
+' "${OLD_RUN}" "${NEW_RUN}" 2>&1 | tee "${OUT}"
+  DECISION_CODE=${PIPESTATUS[0]}
+  echo "${DECISION_CODE}" > "${NEW_RUN}.voxel_decision_code"
+  echo "V10.6 seed42 paired decision code: ${DECISION_CODE}"
+  exit 0
+)
+
+
+# ========================================================================
+# V10.7 C0.2b step50-400可恢复后台轨迹评估
+# ========================================================================
+# 目标：判定是否存在一个中间checkpoint同时通过Fresh48的CI、60% coverage、
+# 65% local-pass门。该runner复用已有report.json，只补齐缺失项。
+#
+# 当前已完成（2026-07-18中断前）：
+#   step50 train16/fresh48
+#   step100 train16/fresh48
+#   step150 train16/fresh48
+#   step200 train16/fresh48
+#   step250 train16/fresh48
+#   step300 train16
+#
+# 尚余：step300 fresh48、step350 train16/fresh48、step400 train16/fresh48。
+# 运行器会自动跳过以上完整报告，继续缺失任务；不使用--fail_on_decision。
+# nohup保证SSH断开或终端关闭后仍继续运行。命令块本身最终exit 0。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/c0_2b_reliability_train16_s400_seed42_bf16_20260717
+  TRAJ=${RUN}/voxel_selfcal_v2_checkpoint_trajectory_t0
+  SCRIPT=pose_point_depth_mv/run_c0_2b_checkpoint_trajectory.sh
+  PID_FILE=${TRAJ}/runner.pid
+
+  if [ ! -f "${SCRIPT}" ]; then
+    echo "missing trajectory runner: ${SCRIPT}"
+    exit 0
+  fi
+  mkdir -p "${TRAJ}"
+
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    echo "trajectory runner is already active: pid=$(cat "${PID_FILE}")"
+    exit 0
+  fi
+
+  nohup /bin/bash "${SCRIPT}" > "${TRAJ}/runner.log" 2>&1 &
+  PID=$!
+  echo "${PID}" > "${PID_FILE}"
+  echo "V10.7 trajectory runner started: pid=${PID}"
+  echo "log=${TRAJ}/runner.log"
+  exit 0
+)
+
+
+# ========================================================================
+# V10.8 查看轨迹状态和最终摘要（可重复运行）
+# ========================================================================
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker || exit 0
+
+  RUN=pose_point_depth_mv/outputs/c0_2b_reliability_train16_s400_seed42_bf16_20260717
+  TRAJ=${RUN}/voxel_selfcal_v2_checkpoint_trajectory_t0
+  PID_FILE=${TRAJ}/runner.pid
+
+  if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+    echo "trajectory runner status: RUNNING pid=$(cat "${PID_FILE}")"
+  else
+    echo "trajectory runner status: NOT RUNNING"
+  fi
+
+  echo "complete reports:"
+  find "${TRAJ}" -maxdepth 3 -type f -name report.json -printf '%P\n' | sort
+
+  if [ -f "${TRAJ}/runner.exit_code" ]; then
+    printf 'runner runtime code: '
+    cat "${TRAJ}/runner.exit_code"
+  fi
+  if [ -f "${TRAJ}/summary.exit_code" ]; then
+    printf 'summary code: '
+    cat "${TRAJ}/summary.exit_code"
+  fi
+  if [ -f "${TRAJ}/trajectory_summary.log" ]; then
+    cat "${TRAJ}/trajectory_summary.log"
+  else
+    echo "summary not written yet; tail of runner log:"
+    tail -60 "${TRAJ}/runner.log" 2>/dev/null || true
+  fi
+  exit 0
+)
+
+
+# ========================================================================
+# 四、裁决与后续
+# ========================================================================
+#
+# 1. V10.2任一工程码非0：先修工程问题，不运行s400。
+# 2. V10.6 seed42 FAIL：停止seed43/44和C1；评估step50-400轨迹。
+# 3. 若所有checkpoint仍FAIL：C0.2b判负，进入C0.2c signed-depth消融。
+# 4. seed42 PASS：才生成seed43/44命令并复现；不直接进入C1。
+# 5. 三seed在fresh48 PASS后，还必须使用新的未查看object-disjoint holdout。
+# 6. 新holdout也PASS，才允许把gate用于C1局部监督；仍不直接启用Flow LoRA。

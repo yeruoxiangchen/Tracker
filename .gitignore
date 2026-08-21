@@ -19,6 +19,7 @@ conda_env/
 logs/
 runs/
 outputs/
+outputs2/
 output/
 tmp/
 temp/

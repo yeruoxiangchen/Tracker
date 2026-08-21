@@ -1,0 +1,685 @@
+# Native-SLAT v2 Full 真实500域适配：简化后完整命令
+# 2026-08-06 rewrite v2
+#
+# 执行规则：
+#   1. 只按 S0 -> S6 顺序执行；标有 A/B 的子步骤再按字母顺序。
+#   2. 所有块都只结束子 shell，不会关闭当前终端。
+#   3. 中断后重跑同一块；完成 marker 复用，未完成 staging 由 --resume 清理。
+#   4. untouched holdout64 不得用于校准、选 checkpoint 或训练。
+#   5. 旧 F2G/F3 v2-v4 仅作失败证据，新路线不读取它们。
+
+
+###############################################################################
+# S0. 只读前置检查（不重跑下载、Benchmark32 或 F0C）
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  RAW=${ROOT}/F2_train500_raw_cache_v1/raw_cache_report.json
+  F0C=${ROOT}/audit/F0C_REVIEWED1K_RUNTIME_O_COMPATIBILITY_16_FORMAL_GPU_V3.json
+  DEV_RUNTIME=${ROOT}/D9_benchmark32_runtime_o_v2/runtime_input_manifest.json
+  DEV_MODEL=${ROOT}/D12_benchmark32_native_v2_model_inputs_v2/model_input_manifest.json
+  DEV_LABEL=${ROOT}/D11_benchmark32_mesh_o_labels_v2/runtime_o_label_manifest.json
+  SS_PARENT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/checkpoints/step_002000.pt
+  SLAT_PARENT=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/train868_step2000_seed42_2gpu_v1/checkpoints/step_002000.pt
+  SLAT_FREEZE=/data/zjr/native_slat_genrecon_v2_mixed1k_20260802_v1/stock_slat_freeze_v2.json
+
+  for path in "${RAW}" "${F0C}" "${DEV_RUNTIME}" "${DEV_MODEL}" "${DEV_LABEL}" \
+              "${SS_PARENT}" "${SLAT_PARENT}" "${SLAT_FREEZE}"; do
+    test -s "${path}" || { echo "S0 missing: ${path}"; exit 96; }
+  done
+  "${PY}" - "${RAW}" "${F0C}" "${DEV_RUNTIME}" "${DEV_MODEL}" "${DEV_LABEL}" <<'PY'
+import json,sys
+raw,f0c,runtime,model,label=[json.load(open(path)) for path in sys.argv[1:]]
+assert raw["passed"] is True and raw["object_count"]==500
+assert f0c["passed"] is True and f0c["formal_passed"] is True
+assert f0c["gauge_compatibility_passed"] is True
+for payload in (runtime,model,label):
+    assert payload["passed"] is True and payload["completed_object_count"]==32
+print({"passed":True,"raw_candidates":500,"dev_objects":32,"F0C":"passed"})
+PY
+)
+S0_RC=$?
+echo "S0_RC=${S0_RC}; current terminal remains open"
+
+
+###############################################################################
+# S1. 一次扫描全部500对象，构建runtime-O并冻结成功身份集
+###############################################################################
+
+# 硬门是32个mask-supported points。低于硬门只记录为quality_rejection，
+# 不中断批处理。对齐阶段仍使用100点质量门筛选训练标签。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  RAW=${ROOT}/F2_train500_raw_cache_v1/raw_cache_report.json
+  OUT=${ROOT}/S1_train500_runtime_o_batch_v5
+
+  if [ ! -s "${OUT}/runtime_input_manifest.json" ]; then
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_omni_real_runtime_inputs \
+      --raw_cache_report "${RAW}" \
+      --output_dir "${OUT}" \
+      --selected_view_count 8 \
+      --view_selection_policy lexical_even_valid_mask_fallback \
+      --feature_resolution 518 \
+      --foreground_margin 1.10 \
+      --alpha_threshold 0.80 \
+      --min_object_points 32 \
+      --record_quality_rejections \
+      --min_completed_objects 450 \
+      --resume
+  fi
+  "${PY}" - "${OUT}/runtime_input_manifest.json" "${OUT}/eligible_raw_cache_report.json" <<'PY'
+import json,sys
+runtime,raw=[json.load(open(path)) for path in sys.argv[1:]]
+assert runtime["passed"] is True and not runtime["failures"]
+assert runtime["source_selected_object_count"]==500
+assert runtime["completed_object_count"]>=450
+assert runtime["completed_object_count"]==raw["object_count"]==len(raw["objects"])
+assert runtime["selected_object_count"]==len(runtime["objects"])
+assert runtime["raw_cache_report"]==sys.argv[2]
+print({"passed":True,"source":500,"runtime_objects":runtime["completed_object_count"],
+       "quality_rejections":runtime["quality_rejections"]})
+PY
+) 2>&1 | tee /data/zjr/omni_real_video500_download_20260804_v2/logs/S1_train500_runtime_o_batch_v5.log
+S1_RC=${PIPESTATUS[0]}
+echo "S1_RC=${S1_RC}; current terminal remains open"
+
+
+###############################################################################
+# S2. GT mesh粗对齐 + 冻结训练合格对象
+###############################################################################
+
+# runtime-O不读GT；本阶段只为训练label计算Scan->COLMAP_W->O。
+# robust门未通过的对象会在qualified subset中排除，不改写runtime-O。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  RUNTIME=${ROOT}/S1_train500_runtime_o_batch_v5/runtime_input_manifest.json
+  RAW=${ROOT}/S1_train500_runtime_o_batch_v5/eligible_raw_cache_report.json
+  ALIGN_DIR=${ROOT}/S2_train_alignment_v3
+  SOURCE=${ALIGN_DIR}/coarse_alignment_manifest.json
+  ADJ=${ALIGN_DIR}/alignment_adjudicated_v2.json
+  QUALIFIED=${ROOT}/S2_train_qualified_v3
+  N=$("${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["completed_object_count"])' "${RUNTIME}")
+
+  if [ ! -s "${SOURCE}" ]; then
+    set +e
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.align_omni_real_mesh_to_colmap \
+      --raw_cache_report "${RAW}" \
+      --output_dir "${ALIGN_DIR}" \
+      --resume
+    ALIGN_RC=$?
+    set -e
+    if [ "${ALIGN_RC}" -ne 0 ] && [ "${ALIGN_RC}" -ne 2 ]; then exit "${ALIGN_RC}"; fi
+  fi
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); n=int(sys.argv[2]); assert p["completed_object_count"]==n and not p["failures"]' "${SOURCE}" "${N}"
+
+  if [ ! -s "${ADJ}" ]; then
+    set +e
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.adjudicate_omni_real_mesh_alignment \
+      --source_alignment_manifest "${SOURCE}" \
+      --output "${ADJ}" \
+      --expected_objects "${N}"
+    ADJ_RC=$?
+    set -e
+    if [ "${ADJ_RC}" -ne 0 ] && [ "${ADJ_RC}" -ne 2 ]; then exit "${ADJ_RC}"; fi
+  fi
+
+  if [ ! -s "${QUALIFIED}/selection_report.json" ]; then
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.freeze_omni_real_native_training_subset \
+      --runtime_input_manifest "${RUNTIME}" \
+      --alignment_manifest "${ADJ}" \
+      --output_dir "${QUALIFIED}" \
+      --expected_source_objects "${N}" \
+      --min_objects 450
+  fi
+  "${PY}" - "${QUALIFIED}/selection_report.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1]))
+assert p["passed"] is True and p["qualified_object_count"]>=450
+print({"passed":True,"qualified":p["qualified_object_count"],
+       "excluded":p["excluded_object_count"]})
+PY
+) 2>&1 | tee /data/zjr/omni_real_video500_download_20260804_v2/logs/S2_train_alignment_and_freeze_v3.log
+S2_RC=${PIPESTATUS[0]}
+echo "S2_RC=${S2_RC}; current terminal remains open"
+
+
+###############################################################################
+# S3A. 构建Mesh_O标签（CPU）
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  QUALIFIED=${ROOT}/S2_train_qualified_v3
+  OUT=${ROOT}/S3_train_mesh_o_labels_v2
+
+  if [ ! -s "${OUT}/runtime_o_label_manifest.json" ]; then
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_omni_real_label_cache \
+      --runtime_input_manifest "${QUALIFIED}/runtime_input_manifest.json" \
+      --alignment_manifest "${QUALIFIED}/alignment_adjudicated.json" \
+      --output_dir "${OUT}" \
+      --resume
+  fi
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True and not p["failures"]; print({"labels":p["completed_object_count"]})' "${OUT}/runtime_o_label_manifest.json"
+)
+S3A_RC=$?
+echo "S3A_RC=${S3A_RC}; current terminal remains open"
+
+
+###############################################################################
+# S3B. 构建不改结构的Native v2 Full输入特征（GPU）
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  QUALIFIED=${ROOT}/S2_train_qualified_v3
+  OUT=${ROOT}/S3_train_native_v2_model_inputs_v2
+  GPU=${CACHE_GPU:-5}
+
+  if [ ! -s "${OUT}/model_input_manifest.json" ]; then
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_omni_real_model_inputs \
+      --runtime_input_manifest "${QUALIFIED}/runtime_input_manifest.json" \
+      --output_dir "${OUT}" \
+      --device cuda \
+      --resume
+  fi
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True and not p["failures"]; print({"model_inputs":p["completed_object_count"]})' "${OUT}/model_input_manifest.json"
+)
+S3B_RC=$?
+echo "S3B_RC=${S3B_RC}; current terminal remains open"
+
+
+###############################################################################
+# S3C. 构建SS target、SLat target和PoseLifting训练cache（GPU）
+# Mesh_O/SLat的对象级几何质量失败记录后排除，不应终止整批。
+# 哈希、manifest、checkpoint和模型执行失败仍是硬失败。
+###############################################################################
+
+mkdir -p /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+  QUALIFIED=${ROOT}/S2_train_qualified_v3
+  MODEL=${ROOT}/S3_train_native_v2_model_inputs_v2/model_input_manifest.json
+  LABEL=${ROOT}/S3_train_mesh_o_labels_v2/runtime_o_label_manifest.json
+  OUT=${ADAPT}/cache_train_real_runtime_o_v2
+  GPU=${TARGET_GPU:-5}
+  RESUME_ARGS=()
+
+  if [ ! -s "${OUT}/training_cache_manifest.json" ] && [ -e "${OUT}" ]; then
+    RESUME_ARGS=(--resume)
+  fi
+  if [ ! -s "${OUT}/training_cache_manifest.json" ]; then
+    mkdir -p "${ADAPT}/logs"
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_omni_real_native_training_cache \
+      --runtime_input_manifest "${QUALIFIED}/runtime_input_manifest.json" \
+      --model_input_manifest "${MODEL}" \
+      --runtime_o_label_manifest "${LABEL}" \
+      --output_dir "${OUT}" \
+      --device cuda \
+      --allow_target_quality_rejections \
+      --min_completed_objects 350 \
+      "${RESUME_ARGS[@]}"
+  fi
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True and p["native_ss_training_ready"] is True and p["native_slat_target_ready"] is True; assert p["completed_object_count"]>=350 and not p["failures"]; print({"training_cache":p["completed_object_count"],"quality_rejections":p["quality_rejection_count"],"admission":p["admission"]})' "${OUT}/training_cache_manifest.json"
+) 2>&1 | tee -a /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S3C_train_cache.log
+S3C_RC=${PIPESTATUS[0]}
+echo "S3C_RC=${S3C_RC}; current terminal remains open"
+
+
+###############################################################################
+# S4. 构建独立dev32 cache并审计训练入口（GPU）
+# benchmark32的32个对象都保留在评测集身份中，但只有Mesh_O与
+# runtime-O网格兼容的对象才能作为训练目标。对象级几何拒绝应记录并
+# 继续；哈希、manifest、checkpoint和模型执行错误仍是硬失败。
+###############################################################################
+
+mkdir -p /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+  ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+  RUNTIME=${ROOT}/D9_benchmark32_runtime_o_v2/runtime_input_manifest.json
+  MODEL=${ROOT}/D12_benchmark32_native_v2_model_inputs_v2/model_input_manifest.json
+  LABEL=${ROOT}/D11_benchmark32_mesh_o_labels_v2/runtime_o_label_manifest.json
+  DEV=${ADAPT}/cache_dev32_runtime_o_v2
+  TRAIN=${ADAPT}/cache_train_real_runtime_o_v2
+  GPU=${TARGET_GPU:-5}
+  RESUME_ARGS=()
+
+  if [ ! -s "${DEV}/training_cache_manifest.json" ] && [ -e "${DEV}" ]; then
+    RESUME_ARGS=(--resume)
+  fi
+  if [ ! -s "${DEV}/training_cache_manifest.json" ]; then
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native \
+    MPLCONFIGDIR=/tmp/matplotlib NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.dataset_tools.prepare_omni_real_native_training_cache \
+      --runtime_input_manifest "${RUNTIME}" \
+      --model_input_manifest "${MODEL}" \
+      --runtime_o_label_manifest "${LABEL}" \
+      --output_dir "${DEV}" \
+      --device cuda \
+      --allow_target_quality_rejections \
+      --min_completed_objects 16 \
+      "${RESUME_ARGS[@]}"
+  fi
+  "${PY}" - "${TRAIN}" "${DEV}" <<'PY'
+import json,sys
+from ar_ss_flow.local_pose_lifting_flow import PoseLiftingCacheDataset
+train_root,dev_root=sys.argv[1:]
+train=json.load(open(train_root+"/training_cache_manifest.json"))
+dev=json.load(open(dev_root+"/training_cache_manifest.json"))
+train_ds=PoseLiftingCacheDataset(train_root+"/lifting_manifest.json")
+dev_ds=PoseLiftingCacheDataset(dev_root+"/lifting_manifest.json")
+assert train["native_ss_training_ready"] is True and len(train_ds)>=350
+assert dev["passed"] is True and dev["selected_object_count"]==32
+assert dev["completed_object_count"]>=16 and len(dev_ds)==dev["completed_object_count"]
+assert not dev["failures"] and dev["admission"]["passed"] is True
+assert dev["completed_object_count"]+dev["quality_rejection_count"]==32
+assert train_ds.config_hash==dev_ds.config_hash
+train_ids={str(row.get("object_uid",row["uid"])) for row in train_ds.rows}
+dev_ids={str(row.get("object_uid",row["uid"])) for row in dev_ds.rows}
+assert train_ids.isdisjoint(dev_ids)
+sample=train_ds[0]
+assert tuple(sample["target"].shape)==(8,16,16,16)
+assert sample["visual_patch_features"].shape[-1]==3072
+print({"passed":True,"train":len(train_ds),"dev_valid":len(dev_ds),
+       "dev_rejected":dev["quality_rejection_count"],
+       "lifting_config_hash":train_ds.config_hash})
+PY
+) 2>&1 | tee -a /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S4_dev32_cache.log
+S4_RC=${PIPESTATUS[0]}
+echo "S4_RC=${S4_RC}; current terminal remains open"
+
+
+###############################################################################
+# S5A. Native SS 2对象1步smoke + real域1000步适配
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  TORCHRUN=/home/zjr/anaconda3/envs/reconviagen/bin/torchrun
+  GPUS=${TRAIN_GPUS:-4,5}
+  ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+  CACHE=${ADAPT}/cache_train_real_runtime_o_v2/lifting_manifest.json
+  PARENT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1/ss868_sourceholdout_seed42_v1/checkpoints/step_002000.pt
+  SMOKE=${ADAPT}/ss_smoke2_step1_parentema_v2
+  OUT=${ADAPT}/ss_real_step1000_seed42_2gpu_v2
+
+  if [ "$(awk -F, '{print NF}' <<<"${GPUS}")" -ne 2 ]; then exit 96; fi
+  if [ ! -s "${SMOKE}/report.json" ]; then
+    test ! -e "${SMOKE}" || exit 98
+    CUDA_VISIBLE_DEVICES="${GPUS}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${TORCHRUN}" --standalone --nproc_per_node=2 \
+      -m pose_point_depth_mv.train_native_ss_genrecon \
+      --cache_manifest "${CACHE}" --output_dir "${SMOKE}" --indices 0,1 \
+      --init_checkpoint "${PARENT}" --init_weights ema \
+      --max_steps 1 --save_every 1 --log_every 1 --grad_accum 1 \
+      --seed 42 --new_lr 5e-5 --lora_lr 1e-5 \
+      --min_condition_views 1 --max_condition_views 8 \
+      --amp_dtype bf16 --gradient_checkpointing
+  fi
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True and p["step"]==1' "${SMOKE}/report.json"
+
+  START_ARGS=(--init_checkpoint "${PARENT}" --init_weights ema)
+  if [ -s "${OUT}/report.json" ] && [ -s "${OUT}/checkpoints/step_001000.pt" ]; then
+    echo "reuse complete SS training: ${OUT}"
+  elif [ -s "${OUT}/checkpoints/last.pt" ]; then
+    START_ARGS=(--resume "${OUT}/checkpoints/last.pt")
+  elif [ -e "${OUT}" ]; then
+    exit 98
+  fi
+  if [ ! -s "${OUT}/checkpoints/step_001000.pt" ]; then
+    CUDA_VISIBLE_DEVICES="${GPUS}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${TORCHRUN}" --standalone --nproc_per_node=2 \
+      -m pose_point_depth_mv.train_native_ss_genrecon \
+      --cache_manifest "${CACHE}" --output_dir "${OUT}" "${START_ARGS[@]}" \
+      --max_steps 1000 --save_every 250 --log_every 10 --grad_accum 4 \
+      --seed 42 --new_lr 5e-5 --lora_lr 1e-5 \
+      --min_condition_views 1 --max_condition_views 8 \
+      --amp_dtype bf16 --gradient_checkpointing
+  fi
+)
+S5A_RC=$?
+echo "S5A_RC=${S5A_RC}; current terminal remains open"
+
+
+###############################################################################
+# S5B. dev32前16校准CFG，后16独立验证Native SS
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${EVAL_GPU:-5}
+  ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+  CACHE=${ADAPT}/cache_dev32_runtime_o_v2/lifting_manifest.json
+  CKPT=${ADAPT}/ss_real_step1000_seed42_2gpu_v2/checkpoints/step_001000.pt
+  CAL=${ADAPT}/ss_step1000_cal_dev0_16_seed424344_v2
+  EVAL=${ADAPT}/ss_step1000_eval_dev16_32_seed424344_v2
+
+  if [ ! -s "${CAL}/calibration.json" ]; then
+    test ! -e "${CAL}" || exit 98
+    CUDA_VISIBLE_DEVICES="${GPU}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon \
+      --mode calibrate --cache_manifest "${CACHE}" --checkpoint "${CKPT}" \
+      --output_dir "${CAL}" --object_start 0 --object_end 16 \
+      --joint_seeds 42,43,44 --candidate_cfg_strengths 1,3,5 \
+      --steps 25 --cfg_interval 0.5,1.0 --guidance_rescale 0 --rescale_t 3 \
+      --min_iou_gain_mean 0 --min_recall_gain_mean 0 --min_latent_mse_gain_mean 0 \
+      --min_count_ratio 0.50 --max_count_ratio 1.50 --amp_dtype bf16
+  fi
+  "${PY}" -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["passed"] is True' "${CAL}/calibration.json"
+
+  if [ ! -s "${EVAL}/report.json" ]; then
+    test ! -e "${EVAL}" || exit 98
+    CUDA_VISIBLE_DEVICES="${GPU}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn SPCONV_ALGO=native PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_genrecon \
+      --mode evaluate --cache_manifest "${CACHE}" --checkpoint "${CKPT}" \
+      --calibration "${CAL}/calibration.json" --output_dir "${EVAL}" \
+      --object_start 16 --object_end 32 --joint_seeds 42,43,44 \
+      --steps 25 --cfg_interval 0.5,1.0 --guidance_rescale 0 --rescale_t 3 \
+      --min_iou_gain_mean 0 --min_iou_win_rate 0.5 --min_recall_gain_mean 0 \
+      --min_latent_mse_gain_mean 0 --min_count_ratio 0.50 --max_count_ratio 1.50 \
+      --min_pose_control_iou_advantage 0 --amp_dtype bf16
+  fi
+  "${PY}" - "${EVAL}/report.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1])); bad=[key for key,value in p["checks"].items() if not value]
+assert set(bad).issubset({"count_ratio_lower"})
+print({"passed":p["passed"],"allowed_false_checks":bad,"summary":p["correct"]["summary"]})
+PY
+)
+S5B_RC=$?
+echo "S5B_RC=${S5B_RC}; current terminal remains open"
+
+
+###############################################################################
+# S6. 后台恢复 Native-SLAT v2 真实域1000步适配
+###############################################################################
+
+# 当前状态（2026-08-08 UTC）：
+#   - 真实域训练cache已完成：376个对象、1417条记录；不再重建。
+#   - 32对象target decoder审计、1步smoke和训练准入门均已通过。
+#   - 正式训练已保存step_000250.pt和last.pt；本命令从last.pt续训到1000步。
+#   - 使用nohup+setsid脱离SSH；flock和旧进程检查可防止重复启动。
+#
+# 运行前只需把TRAIN_GPUS改成两张空闲卡。命令返回后可直接关闭SSH。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+TRAIN_GPUS=${TRAIN_GPUS:-4,5}
+ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  real-s6-slat-v2 \
+  "${ADAPT}/logs/S6_real_slat_background.log" \
+  "${ADAPT}/logs/S6_real_slat_background.pid" \
+  env TRAIN_GPUS="${TRAIN_GPUS}" \
+  bash pose_point_depth_mv/background_jobs/resume_real_s6_slat_v2.sh
+S6_LAUNCH_RC=$?
+echo "S6_LAUNCH_RC=${S6_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 查看进度；Ctrl-C只会退出tail，不会停止训练：
+# tail -f /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S6_real_slat_background.log
+
+# SSH重连后查看状态和退出码：
+# cat /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S6_real_slat_background.state
+# cat /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S6_real_slat_background.exit_code
+
+# 完成条件必须同时满足：
+#   1. exit_code内容为0；
+#   2. slat_v2_real_step1000_seed42_2gpu_v2/checkpoints/step_001000.pt存在；
+#   3. slat_v2_real_step1000_seed42_2gpu_v2/report.json存在。
+
+
+# 完成语义：
+#   S1: 真实输入runtime-O身份集冻结。
+#   S2: GT粗对齐候选集冻结，应>=450对象。
+#   S3/S4: Mesh_O/SLat最终质量门后应>=350对象，train/dev cache可训练且不重叠。
+#   S5: adapted Native SS通过独立dev门。
+#   S6: 真实数据实际参与v2 Full SS+SLat两阶段域适配。
+#   S7: 在可复用benchmark32上比较适配后/适配前v2 Full及两个冻结base。
+#   S8: 只有S7主Chamfer门通过后，才首次构建并消费untouched holdout64。
+
+
+###############################################################################
+# S7. 后台执行benchmark32训练后四路Mesh测试（开发集，不消费holdout64）
+###############################################################################
+
+# 本步固定比较：
+#   1. 真实域适配后的v2 Full（S5 SS step1000 + S6 SLat step1000）；
+#   2. 适配前的合成mixed1k v2 Full parent；
+#   3. ReconViaGen original；
+#   4. Pixal3D official单参考视图。
+# 四路使用同一benchmark32、同一runtime-O标签、同一seed=42，不执行GT ICP、
+# 尺度、平移或反射拟合。该结果只用于开发门，formal=false。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+REAL_S7_GPU=${REAL_S7_GPU:-5}
+ROOT=/data/zjr/omni_real_video500_download_20260804_v2
+ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  real-s7-benchmark32 \
+  "${ADAPT}/logs/S7_benchmark32_background.log" \
+  "${ADAPT}/logs/S7_benchmark32_background.pid" \
+  env REAL_S7_GPU="${REAL_S7_GPU}" \
+  bash pose_point_depth_mv/background_jobs/run_real_s7_benchmark32.sh
+S7_LAUNCH_RC=$?
+echo "S7_LAUNCH_RC=${S7_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 查看进度；Ctrl-C只退出tail，不停止推理：
+# tail -f /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S7_benchmark32_background.log
+
+# SSH重连后查看状态：
+# cat /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S7_benchmark32_background.state
+# cat /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S7_benchmark32_background.exit_code
+
+
+###############################################################################
+# S7G. 查看benchmark32结论并决定是否解锁holdout64
+###############################################################################
+
+# 判读优先级固定为Chamfer-L1 mean/median/object-win，其次F-score@0.02和normal。
+# primary_passed=false时停止，不运行S8，也不查看holdout64。
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REPORT=/data/zjr/omni_real_video500_download_20260804_v2/S7_benchmark32_fourway_realadapt_step1000_seed42_v1/report.json
+  SUMMARY=$(dirname "${REPORT}")/summary.txt
+
+  "${PY}" - "${REPORT}" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["format"] == "pose_point_depth_mv.omni_real_native_adaptation_benchmark.v1"
+assert report["passed"] is True
+assert report["formal"] is False and report["holdout64_consumed"] is False
+comparison = report["paired_comparisons"][0]
+print(json.dumps({
+    "scope": report["protocol_scope"],
+    "objects": report["object_count"],
+    "adapted_vs_parent": comparison["metrics"],
+    "decision": report["adaptation_decision"],
+}, indent=2, ensure_ascii=False))
+assert report["adaptation_decision"]["primary_passed"] is True
+PY
+  sed -n '1,120p' "${SUMMARY}"
+)
+S7G_RC=$?
+if [ "${S7G_RC}" -eq 0 ]; then
+  echo "S7G passed; untouched holdout64 is unlocked"
+else
+  echo "S7G failed; do not run S8"
+fi
+echo "S7G_RC=${S7G_RC}; current terminal remains open"
+
+
+###############################################################################
+# S8. 后台构建并正式评测untouched holdout64（只在S7G通过后运行一次）
+###############################################################################
+
+# 本步首次消费冻结holdout64，并顺序执行：
+#   S8A-S8F: extraction inventory -> raw cache -> runtime-O -> mesh alignment
+#             -> Mesh_O label -> 原版v2 Full model input；
+#   S8G-S8J: 适配后v2 Full、适配前parent、ReconViaGen、Pixal3D四路推理；
+#   S8K:     四路同seed=42直接runtime-O Mesh正式评测。
+#
+# 任务会自动断点复用已有对象，并通过nohup+setsid脱离SSH。Pixal3D按每对象
+# 独立子进程运行以释放CUDA workspace。S8启动后holdout64已被消费；不得依据
+# S8结果调CFG、选checkpoint或改阈值后重新宣称同一holdout为首次正式测试。
+
+set +e
+set +u
+set +o pipefail
+cd /home/zjr/Tracker
+REAL_S8_GPU=${REAL_S8_GPU:-5}
+ADAPT=/data/zjr/native_v2_real500_domain_adapt_20260806_v2
+
+bash pose_point_depth_mv/background_jobs/launch_detached.sh \
+  real-s8-holdout64 \
+  "${ADAPT}/logs/S8_holdout64_background.log" \
+  "${ADAPT}/logs/S8_holdout64_background.pid" \
+  env REAL_S8_GPU="${REAL_S8_GPU}" \
+  bash pose_point_depth_mv/background_jobs/run_real_s8_holdout64.sh
+S8_LAUNCH_RC=$?
+echo "S8_LAUNCH_RC=${S8_LAUNCH_RC}; 后台任务不依赖当前终端"
+echo "current terminal remains open"
+
+# 查看进度；Ctrl-C只退出tail，不停止任务：
+# tail -f /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S8_holdout64_background.log
+
+# SSH重连后查看状态：
+# cat /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S8_holdout64_background.state
+# cat /data/zjr/native_v2_real500_domain_adapt_20260806_v2/logs/S8_holdout64_background.exit_code
+
+# S8完成条件必须同时满足：
+#   1. exit_code内容为0；
+#   2. S8K_holdout64_fourway_realadapt_step1000_seed42_v1/report.json存在；
+#   3. report formal=true、holdout64_consumed=true、passed=true；
+#   4. adaptation_decision是科学结论；即使primary_passed=false，协议运行仍可成功。
+
+
+###############################################################################
+# S8R. 打印正式holdout64结果（不改变任何决策）
+###############################################################################
+
+set +e
+set +u
+set +o pipefail
+(
+  set -euo pipefail
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REPORT=/data/zjr/omni_real_video500_download_20260804_v2/S8K_holdout64_fourway_realadapt_step1000_seed42_v1/report.json
+  "${PY}" - "${REPORT}" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["passed"] is True and report["formal"] is True
+assert report["holdout64_consumed"] is True
+assert report["formal_holdout_binding"]["passed"] is True
+print(json.dumps({
+    "formal": True,
+    "objects": report["object_count"],
+    "summary": report["summary"],
+    "paired_comparisons": report["paired_comparisons"],
+    "adaptation_decision": report["adaptation_decision"],
+}, indent=2, ensure_ascii=False))
+PY
+  sed -n '1,160p' "$(dirname "${REPORT}")/summary.txt"
+)
+S8R_RC=$?
+echo "S8R_RC=${S8R_RC}; current terminal remains open"

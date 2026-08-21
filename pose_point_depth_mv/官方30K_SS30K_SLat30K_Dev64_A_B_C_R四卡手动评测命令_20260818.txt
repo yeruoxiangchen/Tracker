@@ -1,0 +1,779 @@
+official 30K：SS30K + SLat30K 在冻结 Dev64 上的 A/B/C/R 四卡手动评测
+================================================================================
+
+最简执行顺序
+--------------------------------------------------------------------------------
+
+  1. F39 只回传一次 frozen protocol 小包（P0-F39）。
+  2. 源服务器下载并做路径 relocation（P0-SOURCE、P1）。
+  3. 三卡（GPU 4/5/7）构建 bridge32、Dev64 compact cache（P2、P3）。
+  4. 物化 official SS targets；bridge32 固定 CFG5；四卡做SS30K Dev64测试（P4--P6）。
+  5. 四卡跑 Dev64 A/B/C（P7）。
+  6. 四卡跑 strict ReconViaGen R，并直接复用 A/B/C 的精确 target NPZ（P8）。
+  7. CPU 汇总 B-A、C-B、C-R（P9）。
+
+本文件不提供自动串行长队列。每个 P 都是独立阶段；确认上一个阶段的程序与身份
+完整后，再手动执行下一个阶段。P6 的科学门允许明确 FAIL 后继续候选端点评测，
+但程序/对象矩阵/hash 不完整时不能继续。
+
+默认使用物理 GPU 4,5,6,7。需要换卡时，在每个阶段 source 环境文件之前先写：
+
+  export EVAL_GPUS=0,1,2,3
+
+环境文件兼容三卡或四卡。P2/P3保留原有分片；P6/P7/P8在各自命令中显式
+覆盖为GPU 4/5/6/7四卡，避免继承旧的三卡默认值。
+
+
+一、科学定义
+--------------------------------------------------------------------------------
+
+本轮只测 SS30K checkpoint step30000 和 SLat30K checkpoint step30000；
+不测 SS10K，不测 Train64，不测 GT-support SLat。
+四条路线都从输入图像自行预测 sparse support；GT 只作为最终 Mesh 指标 target，
+不会作为 SS/SLat 推理输入。
+
+  A = posed-DINO 当前接口 -> Stock SS -> Stock SLat -> Stock Mesh decoder
+  B = posed-DINO 当前接口 -> SS30K EMA -> Stock SLat -> Stock Mesh decoder
+  C = posed-DINO 当前接口 -> SS30K EMA -> SLat30K EMA -> Stock Mesh decoder
+  R = strict ReconViaGen：VGGT -> Stock SS -> Stock SLat -> Stock Mesh decoder
+
+  B-A：SS30K 的组件增量（接口、Stock SLat、noise、decoder、target 固定）。
+  C-B：SLat30K 的组件增量（SS30K support、noise、decoder、target 固定）。
+  C-R：当前完整端点相对 strict ReconViaGen 的端到端收益；这是最重要结果。
+
+C-R 同时改变输入接口、SS 和 SLat，不能把它解释成某一个组件的纯收益。
+
+冻结协议：
+
+  protocol SHA256
+  86235b8039130c5c9e50f463e022142b967cf9d6d51089f049f434476e1218c6
+
+  bridge32：与 train/dev/decoder-audit 均不重叠，只用于预注册 CFG5。
+  Dev64：与 frozen train29872、实际 usable train29861 均不重叠。
+
+  decoder_audit32 不进入本轮指标。它是训练前验证 frozen Stock decoder 与
+  official target 合同的独立保留集；predicted_support_bridge32 才用于固定 SS
+  部署超参数。最终 A/B/C/R 都只在同一 Dev64 上计分。
+
+因此 Dev64 是完整 held-out development set；不是最终 untouched test set。
+
+
+P0-F39：回传 exact frozen protocol 小包（只执行一次）
+--------------------------------------------------------------------------------
+
+在 F39 执行：
+
+  set +e
+  (
+    set -euo pipefail
+
+    SRC=/root/autodl-tmp/proobjaverse_official_slat_protocol30k_seed20260813_v1
+    OUT=/root/autodl-tmp/bootstrap
+    NAME=ProObjaverse_30K_protocol_seed20260813_F39_20260818_v1
+    OSS=oss://yxc814/proobjaverse-transfer/bootstrap
+
+    test -s "${SRC}/protocol.json"
+    test -s "${SRC}/predicted_support_bridge.json"
+    test -s "${SRC}/dev.json"
+    test -s "${SRC}/train.json"
+    mkdir -p "${OUT}"
+    test ! -e "${OUT}/${NAME}.tar.zst"
+    test ! -e "${OUT}/${NAME}.tar.zst.sha256"
+
+    /root/miniconda3/envs/reconviagen-bw/bin/python - "${SRC}" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+p = json.load(open(root / "protocol.json", encoding="utf-8"))
+assert p["protocol_sha256"] == "86235b8039130c5c9e50f463e022142b967cf9d6d51089f049f434476e1218c6"
+for name, count in (("predicted_support_bridge", 32), ("dev", 64), ("train", 29872)):
+    s = json.load(open(root / f"{name}.json", encoding="utf-8"))
+    assert s["protocol_sha256"] == p["protocol_sha256"]
+    assert s["name"] == name and s["count"] == count and len(s["rows"]) == count
+print({"passed": True, "protocol_sha256": p["protocol_sha256"]})
+PY
+
+    tar --use-compress-program='zstd -T0 -6' \
+      -cf "${OUT}/${NAME}.tar.zst" \
+      -C /root/autodl-tmp \
+      proobjaverse_official_slat_protocol30k_seed20260813_v1
+
+    (
+      cd "${OUT}"
+      sha256sum "${NAME}.tar.zst" > "${NAME}.tar.zst.sha256"
+      sha256sum -c "${NAME}.tar.zst.sha256"
+      zstd -t "${NAME}.tar.zst"
+    )
+
+    ossutil -e oss-accelerate.aliyuncs.com cp \
+      "${OUT}/${NAME}.tar.zst" "${OSS}/${NAME}.tar.zst"
+    ossutil -e oss-accelerate.aliyuncs.com cp \
+      "${OUT}/${NAME}.tar.zst.sha256" "${OSS}/${NAME}.tar.zst.sha256"
+  )
+  P0_F39_RC=$?
+  echo "P0_F39_RC=${P0_F39_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+
+P0-SOURCE：下载 exact protocol 到源服务器
+--------------------------------------------------------------------------------
+
+在源服务器执行：
+
+  set +e
+  (
+    set -euo pipefail
+    NAME=ProObjaverse_30K_protocol_seed20260813_F39_20260818_v1
+    OSS=oss://yxc814/proobjaverse-transfer/bootstrap
+    DL=/data/zjr/proobjaverse_official_30k_protocol_archives
+    DEST=/data/zjr/proobjaverse_official_slat_protocol30k_seed20260813_f39_frozen_v1
+
+    mkdir -p "${DL}"
+    test ! -e "${DL}/${NAME}.tar.zst"
+    test ! -e "${DL}/${NAME}.tar.zst.sha256"
+    test ! -e "${DEST}"
+
+    ossutil -e oss-accelerate.aliyuncs.com cp \
+      "${OSS}/${NAME}.tar.zst" "${DL}/${NAME}.tar.zst"
+    ossutil -e oss-accelerate.aliyuncs.com cp \
+      "${OSS}/${NAME}.tar.zst.sha256" "${DL}/${NAME}.tar.zst.sha256"
+    (
+      cd "${DL}"
+      sha256sum -c "${NAME}.tar.zst.sha256"
+      zstd -t "${NAME}.tar.zst"
+    )
+
+    mkdir -p "${DEST}"
+    tar --use-compress-program=zstd \
+      --strip-components=1 \
+      -xf "${DL}/${NAME}.tar.zst" \
+      -C "${DEST}"
+
+    /home/zjr/anaconda3/envs/reconviagen/bin/python - "${DEST}" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+p = json.load(open(root / "protocol.json", encoding="utf-8"))
+assert p["protocol_sha256"] == "86235b8039130c5c9e50f463e022142b967cf9d6d51089f049f434476e1218c6"
+assert json.load(open(root / "predicted_support_bridge.json"))["count"] == 32
+assert json.load(open(root / "dev.json"))["count"] == 64
+assert json.load(open(root / "train.json"))["count"] == 29872
+print({"passed": True, "protocol_sha256": p["protocol_sha256"]})
+PY
+  )
+  P0_SOURCE_RC=$?
+  echo "P0_SOURCE_RC=${P0_SOURCE_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+
+P1：把 F39 split 的绝对路径严格 relocation 到源服务器 raw tree
+--------------------------------------------------------------------------------
+
+这里只改变绝对文件路径，不改变 UID、顺序或 protocol SHA。
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    mkdir -p "${RELOCATED_PROTOCOL_DIR}"
+
+    "${PY}" -u -m pose_point_depth_mv.relocate_proobjaverse_official_slat_split \
+      --source_split "${F39_PROTOCOL_DIR}/predicted_support_bridge.json" \
+      --selection "${SELECTION30K}" \
+      --data_root "${RAW30K}" \
+      --protocol_manifest "${F39_PROTOCOL_DIR}/protocol.json" \
+      --expected_protocol_sha256 "${PROTOCOL_SHA}" \
+      --expected_name predicted_support_bridge \
+      --output "${RELOCATED_PROTOCOL_DIR}/predicted_support_bridge.json"
+
+    "${PY}" -u -m pose_point_depth_mv.relocate_proobjaverse_official_slat_split \
+      --source_split "${F39_PROTOCOL_DIR}/dev.json" \
+      --selection "${SELECTION30K}" \
+      --data_root "${RAW30K}" \
+      --protocol_manifest "${F39_PROTOCOL_DIR}/protocol.json" \
+      --expected_protocol_sha256 "${PROTOCOL_SHA}" \
+      --expected_name dev \
+      --output "${RELOCATED_PROTOCOL_DIR}/dev.json"
+
+    "${PY}" - "${F39_PROTOCOL_DIR}" "${RELOCATED_PROTOCOL_DIR}" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+f39, relocated = map(Path, sys.argv[1:])
+def load(path): return json.load(open(path, encoding="utf-8"))
+def uid_hash(rows):
+    return hashlib.sha256(json.dumps([r["uid"] for r in rows], sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+bridge = load(relocated / "predicted_support_bridge.json")
+dev = load(relocated / "dev.json")
+train = load(f39 / "train.json")
+assert bridge["protocol_sha256"] == dev["protocol_sha256"] == train["protocol_sha256"]
+assert (len(bridge["rows"]), len(dev["rows"]), len(train["rows"])) == (32, 64, 29872)
+assert uid_hash(bridge["rows"]) == "df0be6ac817efd98d829abb3b730939bebf2cb2ffeca07f171297ad7c8088a16"
+assert uid_hash(dev["rows"]) == "d60751d4100c97c6944f05cce18723546613e16e54e83b36753bd02de1ba39dc"
+assert uid_hash(train["rows"]) == "fe0e1cc4fb9970f1fb624fef2fbacbe091c319fda8ab4172b41d9e038e85ec04"
+sets = [{r["uid"] for r in x["rows"]} for x in (bridge, dev, train)]
+assert not sets[0] & sets[1] and not sets[0] & sets[2] and not sets[1] & sets[2]
+assert all(Path(r["render_tar"]).is_file() and Path(r["slat_npz"]).is_file()
+           for x in (bridge, dev) for r in x["rows"])
+print({"passed": True, "bridge": 32, "dev": 64, "train": 29872,
+       "all_disjoint": True})
+PY
+  )
+  P1_RC=$?
+  echo "P1_RC=${P1_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+
+P1b：checkpoint 与本地模型资产 preflight
+--------------------------------------------------------------------------------
+
+必须先把 SS30K checkpoint 下载回来。SLat30K 已有旧的单独回传路径时，环境脚本会
+自动使用它。若 checkpoint 放在其他位置，先 export SS30K_CHECKPOINT / SLAT30K_CHECKPOINT。
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test -s "${SS30K_CHECKPOINT}"
+    test -s "${SLAT30K_CHECKPOINT}"
+    test -s "${ENCODER_RUNTIME}.json"
+    test -s "${ENCODER_RUNTIME}.safetensors"
+    test -s "${DECODER_SNAPSHOT}/pipeline.json"
+    test -s "${DECODER_SNAPSHOT}/ckpts/ss_dec_conv3d_16l8_fp16.json"
+    test -s "${DECODER_SNAPSHOT}/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+    test "$(cat /home/zjr/.cache/huggingface/hub/models--Stable-X--trellis-vggt-v0-2/refs/main)" = \
+      647659a5ad5fbf67e22793e7b5e2cee4b30c5d13
+
+    sha256sum \
+      "${ENCODER_RUNTIME}.json" \
+      "${ENCODER_RUNTIME}.safetensors" \
+      "${DECODER_SNAPSHOT}/pipeline.json" \
+      "${DECODER_SNAPSHOT}/ckpts/ss_dec_conv3d_16l8_fp16.json" \
+      "${DECODER_SNAPSHOT}/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
+    test "$(sha256sum "${ENCODER_RUNTIME}.json" | awk '{print $1}')" = \
+      12efe92a0d7dcd790f251acb94a6950957ea4398268e2838ef7319c3f20b071e
+    test "$(sha256sum "${ENCODER_RUNTIME}.safetensors" | awk '{print $1}')" = \
+      107874eeaa0feb82f51b19db5da7db534fb7e7f19e5a122b9ff1bc2e258bfc6d
+    test "$(sha256sum "${DECODER_SNAPSHOT}/pipeline.json" | awk '{print $1}')" = \
+      8d9f97870d1ea0b1c1de890183929b952d623495695dd590105b3b6b4a49d2eb
+    test "$(sha256sum "${DECODER_SNAPSHOT}/ckpts/ss_dec_conv3d_16l8_fp16.json" | awk '{print $1}')" = \
+      646781293f1cda74720de85d1cef50a957fb4aebd9a4bd014e454e32f2330ac5
+    test "$(sha256sum "${DECODER_SNAPSHOT}/ckpts/ss_dec_conv3d_16l8_fp16.safetensors" | awk '{print $1}')" = \
+      1c76d4a40519aa2d711cc263a8404105231ac26db31d946bed48b84fee79009a
+
+    "${PY}" - "${SS30K_CHECKPOINT}" "${SLAT30K_CHECKPOINT}" "${PROTOCOL_SHA}" <<'PY'
+import json, sys, torch
+ss_path, slat_path, protocol = sys.argv[1:]
+ss = torch.load(ss_path, map_location="cpu")
+slat = torch.load(slat_path, map_location="cpu")
+assert int(ss["step"]) == 30000 and int(slat["step"]) == 30000
+ssi = ss["data_identity"]
+domain = ssi["feature_contract"]["official_ss_targets"]["domain_contract"]
+assert domain["official_slat_protocol_sha256"] == protocol
+assert int(ssi["object_count"]) == 29861
+assert int(slat["data_identity"]["object_count"]) == 29861
+assert slat["data_identity"]["target_decoder_audit"]["protocol_sha256"] == protocol
+print(json.dumps({
+  "passed": True,
+  "ss_step": ss["step"],
+  "slat_step": slat["step"],
+  "train_objects": 29861,
+  "ss_encoder_identity": domain["ss_encoder_pretrained"],
+  "ss_decoder_identity": domain["ss_decoder_pretrained"],
+}, indent=2))
+PY
+  )
+  P1B_RC=$?
+  echo "P1B_RC=${P1B_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+
+P2：三卡构建 bridge32 compact-v2 cache（GPU 4/5/7）
+--------------------------------------------------------------------------------
+
+P2a 启动三个独立 worker（GPU 4/5/7）：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test ! -e "${BRIDGE_COMPACT}"
+    mkdir -p "${BRIDGE_COMPACT}/logs"
+    IFS=, read -r -a GPUS <<<"${EVAL_GPUS}"
+    test "${#GPUS[@]}" -eq 3
+    for I in 0 1 2; do
+      SESSION=ss30k_bridge_cache_${I}
+      LOG=${BRIDGE_COMPACT}/logs/worker_${I}_gpu${GPUS[$I]}.log
+      ! tmux has-session -t "${SESSION}" 2>/dev/null
+      tmux new-session -d -s "${SESSION}" \
+        "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${GPUS[$I]} ${PY} -u -m pose_point_depth_mv.prepare_proobjaverse_official_slat_compact_cache --split_manifest ${RELOCATED_PROTOCOL_DIR}/predicted_support_bridge.json --native_ss_report ${TRAINING_SS_EVIDENCE} --stock_slat_freeze ${STOCK_SLAT_FREEZE} --output_dir ${BRIDGE_COMPACT} --selected_views 8 --worker_index ${I} --worker_count 3 --materialize_only >> ${LOG} 2>&1'"
+    done
+    echo "P2 three workers launched; this command does not start P2b."
+  )
+  P2_LAUNCH_RC=$?
+  echo "P2_LAUNCH_RC=${P2_LAUNCH_RC} (0=三个 worker 已启动)"
+  echo "current terminal remains open"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/cache_bridge32_compact_v2/logs/*.log
+
+P2b 三个 worker 都结束后，手动 finalize：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    for I in 0 1 2; do
+      test -s "${BRIDGE_COMPACT}/worker_$(printf '%03d' ${I})_of_003.json"
+    done
+    CUDA_VISIBLE_DEVICES= "${PY}" -u -m \
+      pose_point_depth_mv.prepare_proobjaverse_official_slat_compact_cache \
+      --split_manifest "${RELOCATED_PROTOCOL_DIR}/predicted_support_bridge.json" \
+      --native_ss_report "${TRAINING_SS_EVIDENCE}" \
+      --stock_slat_freeze "${STOCK_SLAT_FREEZE}" \
+      --output_dir "${BRIDGE_COMPACT}" \
+      --selected_views 8 \
+      --worker_index 0 \
+      --worker_count 3 \
+      --finalize_only
+    test -s "${BRIDGE_COMPACT}/report.json"
+  )
+  P2_FINALIZE_RC=$?
+  echo "P2_FINALIZE_RC=${P2_FINALIZE_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+
+P3：三卡构建 Dev64 compact-v2 cache（GPU 4/5/7）
+--------------------------------------------------------------------------------
+
+P3a 启动三个独立 worker：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test ! -e "${DEV_COMPACT}"
+    mkdir -p "${DEV_COMPACT}/logs"
+    IFS=, read -r -a GPUS <<<"${EVAL_GPUS}"
+    test "${#GPUS[@]}" -eq 3
+    for I in 0 1 2; do
+      SESSION=ss30k_dev_cache_${I}
+      LOG=${DEV_COMPACT}/logs/worker_${I}_gpu${GPUS[$I]}.log
+      ! tmux has-session -t "${SESSION}" 2>/dev/null
+      tmux new-session -d -s "${SESSION}" \
+        "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${GPUS[$I]} ${PY} -u -m pose_point_depth_mv.prepare_proobjaverse_official_slat_compact_cache --split_manifest ${RELOCATED_PROTOCOL_DIR}/dev.json --native_ss_report ${TRAINING_SS_EVIDENCE} --stock_slat_freeze ${STOCK_SLAT_FREEZE} --output_dir ${DEV_COMPACT} --selected_views 8 --worker_index ${I} --worker_count 3 --materialize_only >> ${LOG} 2>&1'"
+    done
+    echo "P3 workers launched; this command does not start P3b."
+  )
+  P3_LAUNCH_RC=$?
+  echo "P3_LAUNCH_RC=${P3_LAUNCH_RC}"
+  echo "current terminal remains open"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/cache_dev64_compact_v2/logs/*.log
+
+P3b 手动 finalize：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    for I in 0 1 2; do
+      test -s "${DEV_COMPACT}/worker_$(printf '%03d' ${I})_of_003.json"
+    done
+    CUDA_VISIBLE_DEVICES= "${PY}" -u -m \
+      pose_point_depth_mv.prepare_proobjaverse_official_slat_compact_cache \
+      --split_manifest "${RELOCATED_PROTOCOL_DIR}/dev.json" \
+      --native_ss_report "${TRAINING_SS_EVIDENCE}" \
+      --stock_slat_freeze "${STOCK_SLAT_FREEZE}" \
+      --output_dir "${DEV_COMPACT}" \
+      --selected_views 8 \
+      --worker_index 0 \
+      --worker_count 3 \
+      --finalize_only
+    test -s "${DEV_COMPACT}/report.json"
+  )
+  P3_FINALIZE_RC=$?
+  echo "P3_FINALIZE_RC=${P3_FINALIZE_RC} (0=PASS)"
+  echo "current terminal remains open"
+
+
+P4：物化 bridge32 / Dev64 official SS targets（两个独立后台任务）
+--------------------------------------------------------------------------------
+
+这一步不重新跑 DINO。它只执行 frozen SS encoder/decoder roundtrip，并把 compact
+condition 与 official SS target 严格绑定。
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test -s "${SS30K_CHECKPOINT}"
+    test -s "${BRIDGE_COMPACT}/slat_manifest.json"
+    test -s "${DEV_COMPACT}/slat_manifest.json"
+    test ! -e "${BRIDGE_SS_TARGETS}"
+    test ! -e "${DEV_SS_TARGETS}"
+    ! tmux has-session -t ss30k_target_bridge 2>/dev/null
+    ! tmux has-session -t ss30k_target_dev 2>/dev/null
+
+    ENCODER_IDENTITY=$("${PY}" - "${SS30K_CHECKPOINT}" <<'PY'
+import sys, torch
+c = torch.load(sys.argv[1], map_location="cpu")
+print(c["data_identity"]["feature_contract"]["official_ss_targets"]
+       ["domain_contract"]["ss_encoder_pretrained"])
+PY
+)
+    DECODER_IDENTITY=$("${PY}" - "${SS30K_CHECKPOINT}" <<'PY'
+import sys, torch
+c = torch.load(sys.argv[1], map_location="cpu")
+print(c["data_identity"]["feature_contract"]["official_ss_targets"]
+       ["domain_contract"]["ss_decoder_pretrained"])
+PY
+)
+
+    mkdir -p "${EVAL30K_ROOT}/logs"
+    tmux new-session -d -s ss30k_target_bridge \
+      "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${EVAL_GPU0} ${PY} -u -m pose_point_depth_mv.materialize_proobjaverse_official_ss_targets --slat_manifest ${BRIDGE_COMPACT}/slat_manifest.json --lifting_manifest ${BRIDGE_COMPACT}/lifting_manifest.json --output_dir ${BRIDGE_SS_TARGETS} --ss_encoder_pretrained ${ENCODER_RUNTIME} --ss_encoder_identity ${ENCODER_IDENTITY} --ss_decoder_pretrained Stable-X/trellis-vggt-v0-2 --ss_decoder_identity ${DECODER_IDENTITY} --latent_dtype float16 --min_roundtrip_iou 0.90 --device cuda --log_every 4 >> ${EVAL30K_ROOT}/logs/P4_bridge_targets_gpu${EVAL_GPU0}.log 2>&1'"
+
+    tmux new-session -d -s ss30k_target_dev \
+      "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${EVAL_GPU1} ${PY} -u -m pose_point_depth_mv.materialize_proobjaverse_official_ss_targets --slat_manifest ${DEV_COMPACT}/slat_manifest.json --lifting_manifest ${DEV_COMPACT}/lifting_manifest.json --output_dir ${DEV_SS_TARGETS} --ss_encoder_pretrained ${ENCODER_RUNTIME} --ss_encoder_identity ${ENCODER_IDENTITY} --ss_decoder_pretrained Stable-X/trellis-vggt-v0-2 --ss_decoder_identity ${DECODER_IDENTITY} --latent_dtype float16 --min_roundtrip_iou 0.90 --device cuda --log_every 4 >> ${EVAL30K_ROOT}/logs/P4_dev_targets_gpu${EVAL_GPU1}.log 2>&1'"
+    echo "P4 two target jobs launched; no calibration/evaluation was started."
+  )
+  P4_LAUNCH_RC=$?
+  echo "P4_LAUNCH_RC=${P4_LAUNCH_RC}"
+  echo "current terminal remains open"
+
+监视：
+
+  tail -F \
+    /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/logs/P4_bridge_targets_gpu*.log \
+    /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/logs/P4_dev_targets_gpu*.log
+
+P4 完成门：
+
+  source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+  test -s "${BRIDGE_SS_TARGETS}/lifting_manifest.json" \
+    && test -s "${DEV_SS_TARGETS}/lifting_manifest.json" \
+    && echo "P4 TARGETS PASS"
+
+
+P5：bridge32 上预注册固定 CFG5（单卡；不使用 Dev64 选 CFG）
+--------------------------------------------------------------------------------
+
+这里只给一个候选值 5，因此不会根据 bridge32 在 1/3/5 中事后挑选。
+首次P5曾因源服务器推理投影仍要求compact-v2已省略的全零predicted_depth而在
+首个样本失败；该失败目录 `ss30k_cfg5_bridge32` 永久保留。修复后只从冻结
+`image_size`恢复完全相同的H/W，正式重跑输出使用
+`ss30k_cfg5_bridge32_compact_image_size_fix1_v2`，不覆盖失败证据。
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test ! -e "${SS_CALIBRATION}"
+    ! tmux has-session -t ss30k_cfg5_bridge_fix1_v2 2>/dev/null
+    mkdir -p "${EVAL30K_ROOT}/logs"
+    tmux new-session -d -s ss30k_cfg5_bridge_fix1_v2 \
+      "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${EVAL_GPU0} ${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_native_ss_no_vggt --mode calibrate --cache_manifest ${BRIDGE_SS_TARGETS}/lifting_manifest.json --checkpoint ${SS30K_CHECKPOINT} --output_dir ${SS_CALIBRATION} --object_start 0 --object_end 32 --joint_seeds 42,43,44 --candidate_cfg_strengths 5 --weights ema --steps 25 --cfg_interval 0.5,1.0 --guidance_rescale 0.0 --rescale_t 3.0 --amp_dtype bf16 --bootstrap_samples 5000 >> ${EVAL30K_ROOT}/logs/P5_ss30k_cfg5_bridge_compact_image_size_fix1_v2_gpu${EVAL_GPU0}.log 2>&1'"
+    echo "P5 launched; wait for calibration.json before P6."
+  )
+  P5_LAUNCH_RC=$?
+  echo "P5_LAUNCH_RC=${P5_LAUNCH_RC}"
+  echo "current terminal remains open"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/logs/P5_ss30k_cfg5_bridge_compact_image_size_fix1_v2_gpu*.log
+
+
+P6：四卡 SS30K held-out Dev64（GPU 4/5/6/7；只测 SS）
+--------------------------------------------------------------------------------
+
+P6a 启动四个16-object shard：
+
+P5运行期间可用以下已登记holder占住空闲GPU5/6/7。P6 launcher会在确认
+calibration.json存在后自动释放这三个精确tmux holder，再启动四卡worker：
+
+  cd /home/zjr/Tracker
+  bash pose_point_depth_mv/background_jobs/run_proobjaverse_30k_p5_spare_holds_gpu567.sh
+
+建议P6直接使用带释放门的launcher：
+
+  cd /home/zjr/Tracker
+  bash pose_point_depth_mv/background_jobs/run_proobjaverse_30k_p6_ss_dev64_4gpu4567.sh
+
+下面保留等价的展开命令供审计：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    export EVAL_GPUS=4,5,6,7
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test -s "${SS_CALIBRATION}/calibration.json"
+    test ! -e "${SS_DEV_SHARDS}"
+    mkdir -p "${SS_DEV_SHARDS}/logs"
+    IFS=, read -r -a GPUS <<<"${EVAL_GPUS}"
+    test "${#GPUS[@]}" -eq 4
+    STARTS=(0 16 32 48)
+    ENDS=(16 32 48 64)
+    for I in 0 1 2 3; do
+      OUT=${SS_DEV_SHARDS}/shard${I}_${STARTS[$I]}_${ENDS[$I]}
+      LOG=${SS_DEV_SHARDS}/logs/shard${I}_gpu${GPUS[$I]}.log
+      SESSION=ss30k_dev64_${I}
+      ! tmux has-session -t "${SESSION}" 2>/dev/null
+      tmux new-session -d -s "${SESSION}" \
+        "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${GPUS[$I]} ${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_native_ss_no_vggt --mode evaluate --allow_cross_manifest_calibration --cache_manifest ${DEV_SS_TARGETS}/lifting_manifest.json --checkpoint ${SS30K_CHECKPOINT} --calibration ${SS_CALIBRATION}/calibration.json --output_dir ${OUT} --object_start ${STARTS[$I]} --object_end ${ENDS[$I]} --joint_seeds 42,43,44 --weights ema --steps 25 --cfg_interval 0.5,1.0 --guidance_rescale 0.0 --rescale_t 3.0 --amp_dtype bf16 --bootstrap_samples 5000 >> ${LOG} 2>&1'"
+    done
+    echo "P6 four SS workers launched; no aggregate was started."
+  )
+  P6_LAUNCH_RC=$?
+  echo "P6_LAUNCH_RC=${P6_LAUNCH_RC}"
+  echo "current terminal remains open"
+
+监视：
+
+  tail -F /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/ss30k_dev64_shards/logs/*.log
+
+P6b 四份 report 完成后手动 aggregate：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    export EVAL_GPUS=4,5,6,7
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    REPORTS=${SS_DEV_SHARDS}/shard0_0_16/report.json,${SS_DEV_SHARDS}/shard1_16_32/report.json,${SS_DEV_SHARDS}/shard2_32_48/report.json,${SS_DEV_SHARDS}/shard3_48_64/report.json
+    IFS=, read -r -a ARRAY <<<"${REPORTS}"
+    for P in "${ARRAY[@]}"; do test -s "${P}"; done
+    test ! -e "${SS_DEV_AGGREGATE}"
+
+    "${PY}" -u -m pose_point_depth_mv.aggregate_proobjaverse_official_native_ss_eval \
+      --shard_reports "${REPORTS}" \
+      --output_dir "${SS_DEV_AGGREGATE}" \
+      --expected_objects 64 \
+      --bootstrap_samples 5000
+  )
+  P6_AGG_RC=$?
+  echo "P6_AGG_RC=${P6_AGG_RC} (0=registered SS gates PASS)"
+  echo "current terminal remains open"
+
+P6_AGG_RC=3 表示 SS30K 至少一个预注册科学门没有通过，不是程序崩溃。为了避免
+“只有 SS 指标好才继续测完整端点”的选择偏差，P7 使用显式 candidate-evaluation
+模式：只要 report 的对象/seed 矩阵、hash、checkpoint、CFG 和 target domain 完整，
+仍然继续 A/B/C；失败门会写入 `native_ss_binding.false_checks`，绝不伪造成 PASS。
+
+
+P7：四卡 Dev64 A/B/C
+--------------------------------------------------------------------------------
+
+P7a 启动四个 shard（每卡16 objects）：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    export EVAL_GPUS=4,5,6,7
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test -s "${SS_DEV_AGGREGATE}/report.json"
+    test -s "${SLAT30K_CHECKPOINT}"
+    test ! -e "${ABC_ROOT}"
+    mkdir -p "${ABC_ROOT}/logs"
+    IFS=, read -r -a GPUS <<<"${EVAL_GPUS}"
+    test "${#GPUS[@]}" -eq 4
+    STARTS=(0 16 32 48)
+    ENDS=(16 32 48 64)
+    for I in 0 1 2 3; do
+      OUT=${ABC_ROOT}/shard${I}_${STARTS[$I]}_${ENDS[$I]}
+      LOG=${ABC_ROOT}/logs/shard${I}_gpu${GPUS[$I]}.log
+      SESSION=abc30k_dev64_${I}
+      ! tmux has-session -t "${SESSION}" 2>/dev/null
+      tmux new-session -d -s "${SESSION}" \
+        "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${GPUS[$I]} ${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_native_ss_stock_slat worker --cache_manifest ${DEV_COMPACT}/slat_manifest.json --lifting_cache_manifest ${DEV_COMPACT}/lifting_manifest.json --native_ss_report ${SS_DEV_AGGREGATE}/report.json --allow_native_ss_science_failed --stock_slat_freeze ${STOCK_SLAT_FREEZE} --trained_slat_checkpoint ${SLAT30K_CHECKPOINT} --trained_slat_weights ema --expected_trained_slat_step 30000 --expected_checkpoint_training_membership all_disjoint --output_dir ${OUT} --weights ema --joint_seeds 42,43,44 --object_start ${STARTS[$I]} --object_end ${ENDS[$I]} --surface_samples 20000 --amp_dtype bf16 --resume >> ${LOG} 2>&1'"
+    done
+    echo "P7 four A/B/C workers launched; strict R was NOT started."
+  )
+  P7_LAUNCH_RC=$?
+  echo "P7_LAUNCH_RC=${P7_LAUNCH_RC}"
+  echo "current terminal remains open"
+
+监视 A/B/C：
+
+  tail -F /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/abc_dev64/logs/*.log
+
+进度：
+
+  watch -n 10 'ROOT=/data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/abc_dev64; date -u; printf "ss coordinate pairs: "; find "$ROOT" -type f -path "*/ss_coords/*.json" 2>/dev/null | wc -l; printf "mesh object-seed pairs: "; find "$ROOT" -type f -name pair_record.json 2>/dev/null | wc -l; printf "worker reports: "; find "$ROOT" -mindepth 2 -maxdepth 2 -name report.json -type f 2>/dev/null | wc -l'
+
+P7b 完成门。注意：registered active-point/mesh failure 可以令 worker rc 非0，
+但 report 必须 complete=true、内部 hash 正确；程序异常则不能继续。
+
+  cd /home/zjr/Tracker
+  source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+  "${PY}" - "${ABC_ROOT}" <<'PY'
+import json, sys
+from pathlib import Path
+from pose_point_depth_mv.proobjaverse_official_slat_protocol import canonical_sha256
+root = Path(sys.argv[1])
+paths = [root / f"shard{i}_{a}_{b}" / "report.json"
+         for i, (a, b) in enumerate(((0,16),(16,32),(32,48),(48,64)))]
+for p in paths:
+    r = json.load(open(p, encoding="utf-8"))
+    body = dict(r); saved = body.pop("report_sha256")
+    assert canonical_sha256(body) == saved
+    assert r["complete"] is True
+print({"passed": True, "complete_worker_reports": 4,
+       "runtime_pass_flags": [json.load(open(p))["passed"] for p in paths]})
+PY
+
+
+P8：四卡 strict ReconViaGen R；复用 P7 的全部 64 个精确 target NPZ
+--------------------------------------------------------------------------------
+
+P8a 启动四个 strict R worker（GPU 4/5/6/7，每卡16 objects）：
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    export EVAL_GPUS=4,5,6,7
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    test ! -e "${R_ROOT}"
+    mkdir -p "${R_ROOT}/logs"
+    TARGETS=${ABC_ROOT}/shard0_0_16/target_mesh_cache,${ABC_ROOT}/shard1_16_32/target_mesh_cache,${ABC_ROOT}/shard2_32_48/target_mesh_cache,${ABC_ROOT}/shard3_48_64/target_mesh_cache
+    IFS=, read -r -a GPUS <<<"${EVAL_GPUS}"
+    test "${#GPUS[@]}" -eq 4
+    for I in 0 1 2 3; do
+      OUT=${R_ROOT}/worker_$(printf '%02d' ${I})_of_04
+      LOG=${R_ROOT}/logs/worker_${I}_gpu${GPUS[$I]}.log
+      SESSION=r30k_dev64_${I}
+      ! tmux has-session -t "${SESSION}" 2>/dev/null
+      tmux new-session -d -s "${SESSION}" \
+        "bash -lc 'cd ${PROJECT_ROOT} && CUDA_VISIBLE_DEVICES=${GPUS[$I]} ${PY} -u -m pose_point_depth_mv.evaluate_proobjaverse_official_reconviagen worker --dev_split ${RELOCATED_PROTOCOL_DIR}/dev.json --cache_report ${DEV_COMPACT}/report.json --paired_target_cache_roots ${TARGETS} --paired_targets_cover_all_objects --output_dir ${OUT} --pretrained Stable-X/trellis-vggt-v0-2 --seeds 42,43,44 --device cuda --ss_steps 30 --ss_guidance 7.5 --ss_guidance_rescale 0.7 --ss_rescale_t 5.0 --slat_steps 12 --slat_guidance 7.5 --slat_guidance_rescale 0.5 --slat_rescale_t 3.0 --multiimage_algo multidiffusion --surface_samples 20000 --worker_index ${I} --num_workers 4 --resume >> ${LOG} 2>&1'"
+    done
+    echo "P8 four strict R workers launched; final aggregate was NOT started."
+  )
+  P8_LAUNCH_RC=$?
+  echo "P8_LAUNCH_RC=${P8_LAUNCH_RC}"
+  echo "current terminal remains open"
+
+监视 strict R：
+
+  tail -F /data/zjr/proobjaverse_official_30k_heldout_dev64_ss30k_slat30k_20260818_v1/strict_reconviagen_dev64/logs/*.log
+
+完成门：
+
+  source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+  for I in 0 1 2 3; do
+    test -s "${R_ROOT}/worker_$(printf '%02d' ${I})_of_04/report.json"
+  done && echo "P8 FOUR REPORTS PRESENT"
+
+
+P9：CPU 汇总 A/B/C/R，输出最重要的 C-R
+--------------------------------------------------------------------------------
+
+  cd /home/zjr/Tracker
+  set +e
+  (
+    set -euo pipefail
+    source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+    CURRENT=${ABC_ROOT}/shard0_0_16/report.json,${ABC_ROOT}/shard1_16_32/report.json,${ABC_ROOT}/shard2_32_48/report.json,${ABC_ROOT}/shard3_48_64/report.json
+    RECON=${R_ROOT}/worker_00_of_04/report.json,${R_ROOT}/worker_01_of_04/report.json,${R_ROOT}/worker_02_of_04/report.json,${R_ROOT}/worker_03_of_04/report.json
+    TARGETS=${ABC_ROOT}/shard0_0_16/target_mesh_cache,${ABC_ROOT}/shard1_16_32/target_mesh_cache,${ABC_ROOT}/shard2_32_48/target_mesh_cache,${ABC_ROOT}/shard3_48_64/target_mesh_cache
+    SLAT_SHA=$(sha256sum "${SLAT30K_CHECKPOINT}" | awk '{print $1}')
+    test ! -e "${FINAL_ROOT}"
+
+    "${PY}" -u -m \
+      pose_point_depth_mv.aggregate_proobjaverse_official_ss_slat_vs_reconviagen \
+      --dev_split "${RELOCATED_PROTOCOL_DIR}/dev.json" \
+      --cache_report "${DEV_COMPACT}/report.json" \
+      --paired_target_cache_roots "${TARGETS}" \
+      --paired_targets_cover_all_objects \
+      --recon_reports "${RECON}" \
+      --current_reports "${CURRENT}" \
+      --expected_native_ss_step 30000 \
+      --allow_native_ss_science_failed \
+      --expected_current_step 30000 \
+      --expected_current_sha256 "${SLAT_SHA}" \
+      --object_start 0 \
+      --object_end 64 \
+      --require_all_disjoint_membership \
+      --require_exact_shared_target_sha256 \
+      --evaluation_membership_scope heldout \
+      --bootstrap_samples 5000 \
+      --output_dir "${FINAL_ROOT}"
+  )
+  P9_RC=$?
+  echo "P9_RC=${P9_RC} (0=runtime/identity aggregate PASS)"
+  echo "current terminal remains open"
+
+
+P10：只打印核心结论
+--------------------------------------------------------------------------------
+
+  cd /home/zjr/Tracker
+  source pose_point_depth_mv/background_jobs/source_proobjaverse_30k_dev64_abc_r_env.sh
+  cat "${FINAL_ROOT}/summary.txt"
+
+或打印 JSON 中三个核心 paired comparison：
+
+  "${PY}" - "${FINAL_ROOT}/report.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+print("Native-SS science passed:", r["native_ss_science_passed"])
+print("Native-SS false checks:", r["native_ss_binding"]["false_checks"])
+for key, label in (
+    ("current_ss_vs_stock_ss_same_current_interface", "B-A：SS30K组件增量"),
+    ("current_slat_vs_stock_slat_same_current_ss", "C-B：SLat30K组件增量"),
+    ("current_full_vs_strict_reconviagen", "C-R：完整端点相对ReconViaGen（最重要）"),
+):
+    row = r["comparisons"][key]
+    print("\n" + label)
+    print("common objects:", row["object_count"])
+    for metric, value in row["metric_deltas"].items():
+        print(metric, "mean=", value["mean"], "median=", value["median"],
+              "win=", value["positive_rate"],
+              "CI=", value["object_bootstrap_mean_95_ci"])
+PY
+
+
+停止/恢复原则
+--------------------------------------------------------------------------------
+
+本流程没有跨 P 自动调度器。停止某个阶段时，只 kill 对应 tmux session，例如：
+
+  tmux kill-session -t abc30k_dev64_2
+
+P2/P3 compact worker 与 P7/P8 worker 都提供内容绑定的复用能力；恢复时只重新执行
+相同 worker 命令，并保留 `--resume` 的阶段不得换 output path 或 scientific 参数。
+
+P5/P6 official SS evaluator不是逐记录 resume 设计。若某个 SS shard 程序异常中断，
+保留失败目录作证据，并换一个明确的新版本 output root 重跑；不要把不完整目录伪装成
+完成结果。
+
+
+最终允许写的结论
+--------------------------------------------------------------------------------
+
+P9 完成后可以写：
+
+  “在冻结 official 30K 协议、与 29,861 usable train objects 完全不重叠的
+  Dev64、相同 object/seed/target/metric 合同下，比较 A/B/C/R；C-R 表示当前
+  SS30K+SLat30K 完整端点相对 strict ReconViaGen 的端到端差值。”
+
+不能写：
+
+  - final test / untouched benchmark；
+  - C-R 是纯 SS 或纯 SLat 收益；
+  - 忽略 decoder/active-point failure 后仍称 64/64；
+  - SS30K/SLat30K 在 P9 前已经优于 ReconViaGen。

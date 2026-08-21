@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+#
+# 目的
+# ====
+# 在同一冻结 GT/相机协议、同一 canonical 坐标、同一 surface sampler 下量化：
+#
+#   Native Full | Stock | Pixal3D official-final | official GenRecon
+#
+# 当前只有按来源/视图数、与性能无关冻结的 4 个对象，因此本命令是
+# exploratory smoke，不是正式 SOTA 结论。正式结论仍需重新冻结未被 T3/T4
+# 使用过的 source-balanced holdout。
+#
+# 公平性边界
+# ==========
+# - Native Full、Stock、official GenRecon 使用该对象全部 posed views（2/4/8）。
+# - Pixal3D 是单图方法，使用协议冻结的最大 mask 单视图。
+# - 主指标禁止逐方法 ICP、缩放或镜像；只允许固定、score-independent 轴变换。
+# - official GenRecon 是场景级模型，在中心化单物体上的结果属于跨域诊断。
+# - GenReCon-inspired Native SS 与 official GenRecon 是两个不同方法名，禁止混写。
+#
+# GPU
+# ===
+# Pixal3D 与 GenRecon 串行运行，最多占用 1 张项目 GPU。例如：
+#
+#   export BENCH_GPU=5
+#
+# official GenRecon 第一次运行可能需要从 microsoft/TRELLIS.2-4B 获取官方
+# decoder runtime assets；几何量化所需的 SS/Shape 两个 GenRecon flow
+# checkpoint 已是本地文件。Texture-SLAT 不改变 Mesh 几何，故不加载。完成首次
+# runtime 缓存后可设置 GENRECON_HF_OFFLINE=1。DINOv3 使用本地 ViT-L/16
+# snapshot 并在结果中绑定哈希；未宣称其 SHA 已与受限的 facebook 上游核对。
+
+set -euo pipefail
+cd /home/zjr/Tracker
+
+PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+PIXAL_PY=/home/zjr/anaconda3/envs/pixal3d/bin/python
+GENRECON_PY=/home/zjr/anaconda3/envs/genrecon/bin/python
+BENCH_GPU=${BENCH_GPU:-5}
+MIN_FREE_GPU_MIB=${MIN_FREE_GPU_MIB:-22000}
+GENRECON_HF_OFFLINE=${GENRECON_HF_OFFLINE:-0}
+
+WORK=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/human_review_gt_native_stock_pixal3d_random4_v1
+PROTOCOL_ROOT=${WORK}/protocol_official_pixal_v1
+PROTOCOL=${PROTOCOL_ROOT}/protocol.json
+PIXAL_LOG_ROOT=${WORK}/logs/pixal_official_caseisolated
+GENRECON_OUTPUT=${WORK}/official_genrecon_object_ood_v1
+GENRECON_LOG_ROOT=${WORK}/logs/official_genrecon_object_ood_v1
+SCORE_OUT=${WORK}/unified_native_stock_pixal_genrecon_geometry4_v1
+
+PIXAL_REVISION=0b31f9160aa400719af409098bff7936a932f726
+PIXAL_SNAPSHOT=/home/zjr/.cache/huggingface/hub/models--TencentARC--Pixal3D/snapshots/${PIXAL_REVISION}
+NAF_COMMIT=37f2dfc180f2de53d98bd601109c0da0dd6b0f43
+NAF_ROOT=/data/zjr/models/valeoai_NAF_${NAF_COMMIT}
+NAF_REPO=${NAF_ROOT}/repo
+NAF_CKPT=${NAF_ROOT}/naf_release.pth
+NAF_SOURCE_MANIFEST=${NAF_ROOT}/source_manifest.sha256
+PIXAL_TRANSFORM=/data/zjr/pixal3d_official_final_fix_20260729/pixal3d_official_final_to_direct_canonical_caseisolated_v3.json
+
+GENRECON_ROOT=/home/zjr/Tracker/GenRecon
+GENRECON_CONFIG=${GENRECON_ROOT}/configs/pipelines/original.json
+GENRECON_SS=${GENRECON_ROOT}/checkpoints/sparse_structure.pt
+GENRECON_SHAPE=${GENRECON_ROOT}/checkpoints/shape_slat.pt
+GENRECON_DINO=/home/zjr/.cache/huggingface/hub/models--camenduru--dinov3-vitl16-pretrain-lvd1689m/snapshots/3c276edd87d6f6e569ff0c4400e086807d0f3881
+
+run_logged() {
+  local log_path=$1
+  shift
+  mkdir -p "$(dirname "${log_path}")"
+  set +e
+  "$@" 2>&1 | tee "${log_path}"
+  local command_rc=${PIPESTATUS[0]}
+  set -e
+  printf '%s\n' "${command_rc}" > "${log_path}.exit_code"
+  return "${command_rc}"
+}
+
+require_gpu_memory() {
+  local label=$1
+  local free_mib
+  free_mib=$(
+    nvidia-smi -i "${BENCH_GPU}" \
+      --query-gpu=memory.free \
+      --format=csv,noheader,nounits | tr -d '[:space:]'
+  )
+  if ! [[ "${free_mib}" =~ ^[0-9]+$ ]]; then
+    echo "${label} blocked: cannot read GPU ${BENCH_GPU} free memory"
+    return 95
+  fi
+  if [ "${free_mib}" -lt "${MIN_FREE_GPU_MIB}" ]; then
+    echo "${label} blocked: GPU ${BENCH_GPU} free=${free_mib} MiB, required=${MIN_FREE_GPU_MIB} MiB"
+    return 96
+  fi
+  echo "${label} memory gate passed: GPU ${BENCH_GPU}, free=${free_mib} MiB"
+}
+
+
+###############################################################################
+# Q0. CPU 静态检查、测试和冻结协议检查
+###############################################################################
+
+"${PY}" -m py_compile \
+  pose_point_depth_mv/infer_official_genrecon_objects.py \
+  pose_point_depth_mv/evaluate_native_ss_pixal_genrecon.py
+
+"${PY}" -m unittest pose_point_depth_mv.test_native_ss_pixal_genrecon
+
+test -x "${PIXAL_PY}"
+test -x "${GENRECON_PY}"
+test -s "${PROTOCOL}"
+test -s "${PIXAL_TRANSFORM}"
+test -s "${PIXAL_SNAPSHOT}/pipeline.json"
+test -s "${NAF_REPO}/hubconf.py"
+test -s "${NAF_CKPT}"
+test -s "${NAF_SOURCE_MANIFEST}"
+test -s "${GENRECON_CONFIG}"
+test -s "${GENRECON_SS}"
+test -s "${GENRECON_SHAPE}"
+test -s "${GENRECON_DINO}/config.json"
+test -s "${GENRECON_DINO}/model.safetensors"
+
+"${PY}" -u -m pose_point_depth_mv.prepare_native_ss_pixal3d_review \
+  verify --protocol "${PROTOCOL}"
+
+mapfile -t CASE_IDS < <(
+  "${PY}" -c \
+    'import json,sys
+p=json.load(open(sys.argv[1]))
+assert len(p["cases"])==4
+for case in p["cases"]: print(case["case_id"])' \
+    "${PROTOCOL}"
+)
+
+echo "Q0_RC=0"
+echo "current terminal remains open"
+
+
+###############################################################################
+# Q1. Pixal3D official-final（每 case 新进程；已有完整结果会由程序复用）
+###############################################################################
+
+case_index=0
+for case_id in "${CASE_IDS[@]}"; do
+  case_index=$((case_index + 1))
+  case "${case_id}" in
+    *[!A-Za-z0-9._-]*) echo "unsafe frozen case ID: ${case_id}"; exit 97 ;;
+  esac
+  require_gpu_memory "Pixal3D ${case_id}"
+  printf -v case_number '%02d' "${case_index}"
+  run_logged "${PIXAL_LOG_ROOT}/${case_number}_${case_id}.log" env \
+    CUDA_VISIBLE_DEVICES="${BENCH_GPU}" \
+    ATTN_BACKEND=sdpa \
+    SPARSE_ATTN_BACKEND=sdpa \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${PIXAL_PY}" -u -m pose_point_depth_mv.compare_pixal3d_singleview_smoke \
+      infer \
+      --protocol "${PROTOCOL}" \
+      --case_ids "${case_id}" \
+      --model_path "${PIXAL_SNAPSHOT}" \
+      --naf_repo "${NAF_REPO}" \
+      --naf_checkpoint "${NAF_CKPT}" \
+      --naf_source_manifest "${NAF_SOURCE_MANIFEST}" \
+      --device cuda \
+      --low_vram \
+      --skip_rembg \
+      --camera_mode known_crop_fov \
+      --resolution 1024 \
+      --sampling_steps 12
+done
+
+echo "Q1_RC=0"
+echo "current terminal remains open"
+
+
+###############################################################################
+# Q2. official GenRecon 512 geometry pipeline（每 case 新进程；全 posed views）
+###############################################################################
+
+GENRECON_HF_ENV=()
+if [ "${GENRECON_HF_OFFLINE}" = 1 ]; then
+  GENRECON_HF_ENV=(HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1)
+else
+  # Override an inherited offline shell when the official TRELLIS.2 decoder
+  # assets still need to be populated on the first run.
+  GENRECON_HF_ENV=(HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0)
+fi
+
+case_index=0
+for case_id in "${CASE_IDS[@]}"; do
+  case_index=$((case_index + 1))
+  require_gpu_memory "official GenRecon ${case_id}"
+  printf -v case_number '%02d' "${case_index}"
+  run_logged "${GENRECON_LOG_ROOT}/${case_number}_${case_id}.log" env \
+    CUDA_VISIBLE_DEVICES="${BENCH_GPU}" \
+    PYTHONPATH="${GENRECON_ROOT}:/home/zjr/Tracker" \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${GENRECON_HF_ENV[@]}" \
+    "${GENRECON_PY}" -u -m pose_point_depth_mv.infer_official_genrecon_objects \
+      --protocol "${PROTOCOL}" \
+      --case_id "${case_id}" \
+      --output_root "${GENRECON_OUTPUT}" \
+      --genrecon_root "${GENRECON_ROOT}" \
+      --pipeline_config "${GENRECON_CONFIG}" \
+      --ss_checkpoint "${GENRECON_SS}" \
+      --shape_checkpoint "${GENRECON_SHAPE}" \
+      --dino_model "${GENRECON_DINO}" \
+      --device cuda \
+      --seed 42 \
+      --occ_threshold -1.0 \
+      --proj_batch_voxels 4096
+done
+
+echo "Q2_RC=0"
+echo "current terminal remains open"
+
+
+###############################################################################
+# Q3. 统一 canonical 几何评分（CPU；不复用历史异构指标）
+###############################################################################
+
+if [ -s "${SCORE_OUT}/report.json" ] && [ -s "${SCORE_OUT}/summary.txt" ]; then
+  echo "reuse immutable unified score: ${SCORE_OUT}"
+elif [ -e "${SCORE_OUT}" ]; then
+  echo "Q3 blocked: partial score output exists; preserve and inspect: ${SCORE_OUT}"
+  exit 98
+else
+  "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_pixal_genrecon \
+    --protocol "${PROTOCOL}" \
+    --pixal_transform "${PIXAL_TRANSFORM}" \
+    --genrecon_output_root "${GENRECON_OUTPUT}" \
+    --output_dir "${SCORE_OUT}" \
+    --surface_samples 20000 \
+    --bootstrap_samples 10000 \
+    --seed 20260802
+fi
+
+echo "Q3_RC=0"
+echo "current terminal remains open"
+
+
+###############################################################################
+# Q4. 完整性复核和摘要
+###############################################################################
+
+"${PY}" -c \
+  'import json,sys
+from pose_point_depth_mv.compare_pixal3d_singleview_smoke import canonical_sha256
+p=sys.argv[1]; r=json.load(open(p)); body=dict(r); saved=body.pop("report_sha256")
+assert canonical_sha256(body)==saved
+assert r["passed"] is True and r["formal"] is False
+assert r["object_count"]==4
+assert r["methods"]==["native_full","stock","pixal3d_official","genrecon_official"]
+print(json.dumps({
+ "passed":True,
+ "formal":r["formal"],
+ "objects":r["object_count"],
+ "methods":r["methods"],
+ "summary":r["summary"],
+ "scope_guard":r["scope_guard"],
+ "cross_domain_guard":r["cross_domain_guard"],
+},indent=2,ensure_ascii=False))' \
+  "${SCORE_OUT}/report.json"
+
+sed -n '1,160p' "${SCORE_OUT}/summary.txt"
+echo "report: ${SCORE_OUT}/report.json"
+echo "current terminal remains open"

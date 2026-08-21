@@ -1,0 +1,331 @@
+# Native SS + frozen Stock SLAT same-noise Mesh传递测试命令
+# 日期：2026-08-02 UTC
+#
+# 目标：只隔离验证Native SS support能否被原版Stock SLAT与Mesh decoder消费。
+# 本阶段不训练SLAT，不加载Direct-SLAT checkpoint，不修改Native SS checkpoint。
+#
+# Control: Stock SS  -> frozen Stock SLAT -> frozen Mesh decoder
+# Full:    Native SS -> 同一Stock SLAT    -> 同一Mesh decoder
+#
+# 固定Native SS部署合同来自V4 report：step2000 EMA、CFG=5、25-step、post-CFG cap=false。
+# 两分支共享：图像/相机、SLAT condition、64^3 master noise field、sampler、decoder、GT frame。
+# 对公共support coordinate，SLAT初始噪声必须bit-exact相同。
+#
+# 注意：当前final32已经用于SS事后诊断，因此T1-T3都是exploratory transfer evidence。
+# 正式结论必须使用T5中新的未触碰source-balanced holdout。
+
+
+# C0：静态编译、单元测试和CLI检查。CPU执行。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+
+  "${PY}" -m py_compile \
+    pose_point_depth_mv/evaluate_native_ss_stock_slat_mesh.py \
+    pose_point_depth_mv/test_native_ss_stock_slat_mesh.py
+  "${PY}" -m unittest pose_point_depth_mv.test_native_ss_stock_slat_mesh
+  "${PY}" -m pose_point_depth_mv.evaluate_native_ss_stock_slat_mesh --help >/dev/null
+  echo 'C0 PASS'
+)
+
+
+# C1：V4绑定与输入完整性检查。CPU执行，不产生模型输出。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  SS_REPORT=${RUN}/final_sourcebalanced32_seed424344_v1/report.json
+  CKPT=${RUN}/checkpoints/step_002000.pt
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/split_audit.json
+
+  test -s "${SS_REPORT}" || exit 96
+  test -s "${CKPT}" || exit 96
+  test -s "${VAL}" || exit 96
+  test -s "${SPLIT}" || exit 96
+  "${PY}" - "${SS_REPORT}" "${CKPT}" "${SPLIT}" "${VAL}" <<'PY'
+from collections import Counter
+import hashlib, json, pathlib, sys
+report = json.load(open(sys.argv[1]))
+checkpoint = pathlib.Path(sys.argv[2])
+split = json.load(open(sys.argv[3]))
+val_path = pathlib.Path(sys.argv[4])
+val = json.load(open(val_path))
+sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+assert report['protocol']['checkpoint_sha256'] == sha
+assert report['protocol']['checkpoint_step'] == 2000
+assert report['protocol']['weights'] == 'ema'
+assert report['calibrated_parameters']['cfg_strength'] == 5.0
+assert report['calibrated_parameters']['post_cfg_cap'] is False
+false_checks = {k for k, v in report['checks'].items() if v is not True}
+assert false_checks == {'count_ratio_lower'}, false_checks
+assert len(split['phases']['final']) == 32
+assert split['phase_contract']['final']['source'] == {
+    'legacy_objaverse': 8,
+    'gap_objaverse': 8,
+    'pilot_objaverse': 8,
+    'omni': 8,
+}
+assert split['output']['val_manifest_sha256'] == hashlib.sha256(val_path.read_bytes()).hexdigest()
+final_by_object = {row['object_uid']: row for row in split['phases']['final']}
+t2_indices = [32, 35, 42, 45, 48, 53, 56, 59]
+t2_rows = [final_by_object[val['samples'][index]['object_uid']] for index in t2_indices]
+t2_sources = Counter(row['source'] for row in t2_rows)
+t2_views = Counter(int(row['view_count']) for row in t2_rows)
+assert t2_sources == {
+    'legacy_objaverse': 2,
+    'gap_objaverse': 2,
+    'pilot_objaverse': 2,
+    'omni': 2,
+}, t2_sources
+assert t2_views == {2: 3, 4: 3, 8: 2}, t2_views
+print({
+    'checkpoint_sha256': sha,
+    'false_checks': sorted(false_checks),
+    'final_objects': 32,
+    'T2_sources': dict(t2_sources),
+    'T2_views': dict(t2_views),
+})
+PY
+  echo 'C1 PASS'
+)
+
+
+# T1：1对象/1 seed工程smoke。1 GPU；只检查完整SS->SLAT->Mesh路径和可恢复输出。
+# 默认GPU=2；运行前用nvidia-smi确认空闲。已有partial输出时加--resume继续。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${GPU:-2}
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  SS_REPORT=${RUN}/final_sourcebalanced32_seed424344_v1/report.json
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/split_audit.json
+  OUT=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/smoke1_seed42_v1
+  LOG=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/logs/T1_smoke1_seed42.log
+
+  mkdir -p "$(dirname "${LOG}")"
+  EXTRA=()
+  if [ -e "${OUT}" ]; then EXTRA+=(--resume); fi
+  env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYOPENGL_PLATFORM=egl \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_stock_slat_mesh \
+      --cache_manifest "${VAL}" \
+      --ss_report "${SS_REPORT}" \
+      --output_dir "${OUT}" \
+      --indices 32-63 \
+      --max_objects 1 \
+      --joint_seeds 42 \
+      --split_audit "${SPLIT}" \
+      --split_phase final \
+      --amp_dtype bf16 \
+      --slat_steps 25 \
+      --slat_cfg_strength 5 \
+      --slat_cfg_interval 0.5,1.0 \
+      --slat_rescale_t 3 \
+      --surface_samples 5000 \
+      --bootstrap_samples 500 \
+      "${EXTRA[@]}" \
+      2>&1 | tee "${LOG}"
+  test -s "${OUT}/report.json" || exit 96
+  "${PY}" -c "import json; p=json.load(open('${OUT}/report.json')); assert p['runtime_passed'] is True; print({'runtime_passed':p['runtime_passed'],'transfer_checks_passed':p['transfer_checks_passed']})"
+  echo 'T1 PASS; only engineering smoke, not a science decision'
+)
+
+
+# T1监视命令（另一个终端）：
+tail -f /data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/logs/T1_smoke1_seed42.log
+
+
+# T2：四来源均衡8对象/seed42诊断。每来源2对象，view分布为2/4/8-view=3/3/2。
+# 仍属于exploratory；T1通过后再执行。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${GPU:-2}
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  SS_REPORT=${RUN}/final_sourcebalanced32_seed424344_v1/report.json
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/split_audit.json
+  OUT=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/sourcebalanced8_seed42_v1
+  LOG=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/logs/T2_sourcebalanced8_seed42.log
+
+  mkdir -p "$(dirname "${LOG}")"
+  EXTRA=()
+  if [ -e "${OUT}" ]; then EXTRA+=(--resume); fi
+  set +e
+  env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYOPENGL_PLATFORM=egl \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_stock_slat_mesh \
+      --cache_manifest "${VAL}" \
+      --ss_report "${SS_REPORT}" \
+      --output_dir "${OUT}" \
+      --indices 32,35,42,45,48,53,56,59 \
+      --max_objects 8 \
+      --joint_seeds 42 \
+      --split_audit "${SPLIT}" \
+      --split_phase final \
+      --amp_dtype bf16 \
+      --slat_steps 25 \
+      --slat_cfg_strength 5 \
+      --slat_cfg_interval 0.5,1.0 \
+      --slat_rescale_t 3 \
+      --surface_samples 10000 \
+      --bootstrap_samples 1000 \
+      "${EXTRA[@]}" \
+      2>&1 | tee "${LOG}"
+  RC=${PIPESTATUS[0]}
+  set -e
+  echo "T2_RC=${RC}"
+  if [ "${RC}" -ne 0 ] && [ "${RC}" -ne 2 ]; then exit "${RC}"; fi
+  test -s "${OUT}/report.json" || exit 96
+  "${PY}" -c "import json; p=json.load(open('${OUT}/report.json')); assert p['runtime_passed'] is True; print(json.dumps({'transfer_checks_passed':p['transfer_checks_passed'],'summary':p['transfer']['summary'],'checks':p['transfer']['checks']},indent=2))"
+)
+
+
+# T2监视命令：
+tail -f /data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/logs/T2_sourcebalanced8_seed42.log
+
+
+# T3：已消费final32上的三seed完整exploratory transfer。
+# T2没有空Mesh/非有限/严重连通性问题后执行；结果不能改写为新的formal blind。
+(
+  set -uo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  GPU=${GPU:-2}
+  ROOT=/data/zjr/native3d_condition_ss_mixed1k_20260801_v1
+  RUN=${ROOT}/ss868_sourceholdout_seed42_v1
+  SS_REPORT=${RUN}/final_sourcebalanced32_seed424344_v1/report.json
+  VAL=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/val64_sourcebalanced_manifest.json
+  SPLIT=/data/zjr/native3d_condition_reviewed1k_inputs_20260731_v4/native_ss_sourcebalanced_split_seed20260801_v1/split_audit.json
+  OUT=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/final32_seed424344_exploratory_v1
+  LOG=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/logs/T3_final32_seed424344.log
+
+  mkdir -p "$(dirname "${LOG}")"
+  EXTRA=()
+  if [ -e "${OUT}" ]; then EXTRA+=(--resume); fi
+  set +e
+  env \
+    CUDA_VISIBLE_DEVICES="${GPU}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    ATTN_BACKEND=flash_attn \
+    SPCONV_ALGO=native \
+    PYOPENGL_PLATFORM=egl \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    TORCH_EXTENSIONS_DIR=/tmp/torch_extensions \
+    "${PY}" -u -m pose_point_depth_mv.evaluate_native_ss_stock_slat_mesh \
+      --cache_manifest "${VAL}" \
+      --ss_report "${SS_REPORT}" \
+      --output_dir "${OUT}" \
+      --indices 32-63 \
+      --joint_seeds 42,43,44 \
+      --split_audit "${SPLIT}" \
+      --split_phase final \
+      --amp_dtype bf16 \
+      --slat_steps 25 \
+      --slat_cfg_strength 5 \
+      --slat_cfg_interval 0.5,1.0 \
+      --slat_rescale_t 3 \
+      --surface_samples 20000 \
+      --fscore_thresholds 0.01,0.02,0.05 \
+      --bootstrap_samples 5000 \
+      --chamfer_win_rate_min 0.55 \
+      --largest_component_delta_min -0.02 \
+      "${EXTRA[@]}" \
+      2>&1 | tee "${LOG}"
+  RC=${PIPESTATUS[0]}
+  set -e
+  echo "T3_RC=${RC}"
+  if [ "${RC}" -ne 0 ] && [ "${RC}" -ne 2 ]; then exit "${RC}"; fi
+  test -s "${OUT}/report.json" || exit 96
+  exit "${RC}"
+)
+
+
+# T3监视命令：
+tail -f /data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/logs/T3_final32_seed424344.log
+
+
+# T4：T3结果摘要。T3_RC=2时也可以执行，用于定位失败指标和来源/view分层。
+(
+  set -euo pipefail
+  cd /home/zjr/Tracker
+  PY=/home/zjr/anaconda3/envs/reconviagen/bin/python
+  REPORT=/data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/final32_seed424344_exploratory_v1/report.json
+  test -s "${REPORT}" || exit 96
+  "${PY}" - "${REPORT}" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+t = p['transfer']
+summary = {
+    'scope': p['scope'],
+    'exploratory': p['exploratory'],
+    'runtime_passed': p['runtime_passed'],
+    'transfer_checks_passed': p['transfer_checks_passed'],
+    'summary': t['summary'],
+    'checks': t['checks'],
+    'by_source': t['by_source'],
+    'by_view_count': t['by_view_count'],
+    'invalid_pairs': t['invalid_pairs'],
+}
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+PY
+)
+
+
+# T5：新未触碰holdout正式复核模板。不要直接运行占位路径。
+# 前置条件：NEW_VAL/NEW_SPLIT已冻结，训练868对象、dev16、CFG16、final32均不在NEW_VAL中；
+# 新split phase的source/view配额和Mesh门必须在看结果前写入审计。
+#
+# export NEW_VAL=/data/zjr/.../new_native_ss_mesh_holdout_manifest.json
+# export NEW_SPLIT=/data/zjr/.../new_native_ss_mesh_holdout_split_audit.json
+# export NEW_PHASE=mesh_final
+# export GPU=2
+#
+# 然后复制T3，仅修改：
+#   --cache_manifest "${NEW_VAL}"
+#   --split_audit "${NEW_SPLIT}"
+#   --split_phase "${NEW_PHASE}"
+#   --indices all
+#   --output_dir /data/zjr/native_ss_stock_slat_mesh_transfer_20260802_v1/new_holdout_formal_v1
+#
+# 当前脚本会把V4的count-only false check记录为exploratory来源绑定；正式论文裁决还需在
+# 新协议中明确允许该历史绑定，并以新holdout的Mesh transfer checks作为主判定。
+
+
+# 判读：
+# 1. T1 runtime失败：修工程路径，不运行T2/T3。
+# 2. T2出现空Mesh、nonfinite或明显LCR下降：先查SS support/SLAT坐标接口，不运行T3。
+# 3. T3 transfer_checks通过：当前Native SS优势可被Stock SLAT消费；先做T5，不必重训SLAT。
+# 4. T3 Chamfer/F-score失败但SS仍强正向：定位Stock SLAT对Native support的分布兼容性，
+#    确认瓶颈后才设计Native SLAT训练。
+# 5. 不得根据T2/T3结果回选SS checkpoint、raw/EMA或CFG并在同一final32上重新宣称formal。
