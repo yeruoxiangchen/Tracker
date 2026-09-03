@@ -1,0 +1,8 @@
+#!/home/zjr/anaconda3/envs/reconviagen/bin/python
+"""Console entry point for the installed Python ninja package."""
+
+from ninja import ninja
+
+
+if __name__ == "__main__":
+    ninja()
