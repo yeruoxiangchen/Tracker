@@ -104,6 +104,13 @@ uniform timestep sampling, all-view stock cross-attention, warmup 3,000, and
 gradient checkpointing. Both original runs used eight processes, gradient
 accumulation 1, and seed 42.
 
+## Research audit trail
+
+The complete 30,912-line research record is preserved as [`审计.md`](审计.md).
+The curated [`audits/`](audits/) index also contains the eight original failed-
+experiment reports, their cross-experiment review, and two earlier master-audit
+snapshots. These documents retain their original wording and historical paths.
+
 ## Tests
 
 No third-party test runner is required:
