@@ -1,3 +1,0 @@
-11.21 18:33：
-不知道为什么omniglue的环境跑centroids, cluster_ids, centroid_distances = cluster_util.kmeans
-会报不接受torch而foundpose的环境是接受的

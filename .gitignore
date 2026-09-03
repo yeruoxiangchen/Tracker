@@ -70,6 +70,9 @@ Thumbs.db
 *.rar
 *.7z
 
+# Local full-history snapshots (may contain generated datasets and outputs)
+/archive/
+
 # ===== 3D / dataset large assets =====
 *.obj
 *.ply
