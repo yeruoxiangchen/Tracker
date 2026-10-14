@@ -1,0 +1,200 @@
+diff --git a/lavis/models/base_model.py b/lavis/models/base_model.py
+index 86d4f0e..48df5e2 100644
+--- a/lavis/models/base_model.py
++++ b/lavis/models/base_model.py
+@@ -7,6 +7,7 @@
+ 
+ import logging
+ import os
++import json
+ 
+ import numpy as np
+ import torch
+@@ -16,6 +17,88 @@ from lavis.common.utils import get_abs_path, is_url, get_cache_path
+ from omegaconf import OmegaConf
+ 
+ 
++_LEGACY_FINAL_NORM = "llm_model.transformer.final_h.32norm.weight"
++_CURRENT_FINAL_NORM = "llm_model.transformer.ln_f.weight"
++
++
++def _load_sharded_safetensors(model, index_path):
++    """Copy an indexed safetensors checkpoint into ``model`` one shard at a time.
++
++    Unlike ``torch.load`` followed by ``load_state_dict``, this never materializes
++    the complete checkpoint beside the already constructed model on CPU.
++    """
++    from safetensors import safe_open
++    from torch.nn.modules.module import _IncompatibleKeys
++
++    with open(index_path, "r", encoding="utf-8") as handle:
++        index = json.load(handle)
++    weight_map = index.get("weight_map")
++    if not isinstance(weight_map, dict) or not weight_map:
++        raise RuntimeError(f"invalid safetensors index: {index_path}")
++
++    model_state = model.state_dict()
++    model_keys = set(model_state)
++    source_keys = set(weight_map)
++    effective_keys = set(source_keys)
++    remapped_keys = {}
++    if _LEGACY_FINAL_NORM in source_keys and _CURRENT_FINAL_NORM not in source_keys:
++        effective_keys.remove(_LEGACY_FINAL_NORM)
++        effective_keys.add(_CURRENT_FINAL_NORM)
++        remapped_keys[_LEGACY_FINAL_NORM] = _CURRENT_FINAL_NORM
++
++    shard_names = list(dict.fromkeys(weight_map.values()))
++    loaded_keys = set()
++    unexpected_keys = []
++    index_dir = os.path.dirname(os.path.abspath(index_path))
++    with torch.no_grad():
++        for shard_number, shard_name in enumerate(shard_names, 1):
++            shard_path = os.path.join(index_dir, shard_name)
++            if not os.path.isfile(shard_path):
++                raise RuntimeError(f"checkpoint shard is missing: {shard_path}")
++            print(
++                f"Loading MPP checkpoint shard {shard_number}/{len(shard_names)}: {shard_name}",
++                flush=True,
++            )
++            with safe_open(shard_path, framework="pt", device="cpu") as shard:
++                for source_key in shard.keys():
++                    target_key = remapped_keys.get(source_key, source_key)
++                    if weight_map.get(source_key) != shard_name:
++                        raise RuntimeError(
++                            f"checkpoint index mismatch for {source_key}: "
++                            f"{weight_map.get(source_key)} vs {shard_name}"
++                        )
++                    if target_key not in model_state:
++                        unexpected_keys.append(target_key)
++                        continue
++                    source = shard.get_tensor(source_key)
++                    target = model_state[target_key]
++                    if source.shape != target.shape:
++                        raise RuntimeError(
++                            f"checkpoint shape mismatch for {target_key}: "
++                            f"{tuple(source.shape)} vs {tuple(target.shape)}"
++                        )
++                    target.copy_(source.to(dtype=target.dtype))
++                    loaded_keys.add(target_key)
++                    del source
++
++    missing_keys = sorted(model_keys - loaded_keys)
++    unexpected_keys = sorted(set(unexpected_keys) | (effective_keys - model_keys))
++    report = {
++        "path": os.path.abspath(index_path),
++        "format": "sharded_safetensors",
++        "shard_count": len(shard_names),
++        "checkpoint_key_count": len(effective_keys),
++        "model_key_count": len(model_keys),
++        "matched_key_count": len(loaded_keys),
++        "missing_key_count": len(missing_keys),
++        "unexpected_key_count": len(unexpected_keys),
++        "missing_keys": missing_keys,
++        "unexpected_keys": unexpected_keys,
++        "remapped_keys": remapped_keys,
++    }
++    return _IncompatibleKeys(missing_keys, unexpected_keys), report
++
++
+ class BaseModel(nn.Module):
+     """Base class for models."""
+ 
+@@ -33,7 +116,21 @@ class BaseModel(nn.Module):
+         This should expect no mismatch in the model keys and the checkpoint keys.
+         """
+         print(f"Checkpoint: {url_or_filename}")
+-        if is_url(url_or_filename):
++        if os.path.isdir(url_or_filename):
++            index_path = os.path.join(url_or_filename, "model.safetensors.index.json")
++            if not os.path.isfile(index_path):
++                raise RuntimeError(f"no model.safetensors.index.json in {url_or_filename}")
++            msg, report = _load_sharded_safetensors(self, index_path)
++            self._last_checkpoint_report = report
++            logging.info("Missing keys {}".format(msg.missing_keys))
++            logging.info("load sharded checkpoint from %s" % index_path)
++            print(
++                "Finished loading %d MPP checkpoint tensors from %d shards."
++                % (report["matched_key_count"], report["shard_count"]),
++                flush=True,
++            )
++            return msg
++        elif is_url(url_or_filename):
+             cached_file = download_cached_file(
+                 url_or_filename, check_hash=False, progress=True
+             )
+@@ -48,7 +145,29 @@ class BaseModel(nn.Module):
+         else:
+             state_dict = checkpoint
+ 
++        model_keys = set(self.state_dict().keys())
++        remapped_keys = {}
++        legacy_final_norm = _LEGACY_FINAL_NORM
++        current_final_norm = _CURRENT_FINAL_NORM
++        if legacy_final_norm in state_dict and current_final_norm not in state_dict:
++            if (current_final_norm in model_keys and
++                    state_dict[legacy_final_norm].shape == self.state_dict()[current_final_norm].shape):
++                state_dict = dict(state_dict)
++                state_dict[current_final_norm] = state_dict.pop(legacy_final_norm)
++                remapped_keys[legacy_final_norm] = current_final_norm
++        checkpoint_keys = set(state_dict.keys())
+         msg = self.load_state_dict(state_dict, strict=False)
++        self._last_checkpoint_report = {
++            "path": os.path.abspath(url_or_filename),
++            "checkpoint_key_count": len(checkpoint_keys),
++            "model_key_count": len(model_keys),
++            "matched_key_count": len(model_keys & checkpoint_keys),
++            "missing_key_count": len(msg.missing_keys),
++            "unexpected_key_count": len(msg.unexpected_keys),
++            "missing_keys": list(msg.missing_keys),
++            "unexpected_keys": list(msg.unexpected_keys),
++            "remapped_keys": remapped_keys,
++        }
+ 
+         logging.info("Missing keys {}".format(msg.missing_keys))
+         logging.info("load checkpoint from %s" % url_or_filename)
+@@ -160,4 +279,4 @@ class BaseModel(nn.Module):
+             else:
+                 return "{:.1f}K".format(tot / 1e3)
+         else:
+-            return tot
+\ No newline at end of file
++            return tot
+diff --git a/lavis/models/minigpt4qwen_models/minigpt4qwen.py b/lavis/models/minigpt4qwen_models/minigpt4qwen.py
+index ca66a82..8c5b36b 100644
+--- a/lavis/models/minigpt4qwen_models/minigpt4qwen.py
++++ b/lavis/models/minigpt4qwen_models/minigpt4qwen.py
+@@ -320,7 +320,18 @@ class Minigpt4Qwen(Blip2Base):
+ 
+         replace_image_idxs = torch.where(llm_tokens == self.replace_image_token_id)
+         inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens) # B, L, C
++        # Project SFT patch: embedding lookup is a leaf requiring gradients
++        # when LoRA is trained. Clone before inserting visual embeddings;
++        # in-place writes on the leaf are rejected by modern PyTorch.
++        inputs_embeds = inputs_embeds.clone()
+         _,_,channels = inputs_embeds.shape
++        replacement_count = int(replace_image_idxs[0].numel())
++        visual_count = int(inputs_llm.numel() // channels)
++        if replacement_count != visual_count:
++            raise RuntimeError(
++                f"visual placeholder mismatch: prompt has {replacement_count} replacement "
++                f"tokens but encoder produced {visual_count} visual embeddings"
++            )
+         inputs_embeds[replace_image_idxs[0],replace_image_idxs[1]] = inputs_llm.view(-1,channels).to(inputs_embeds.dtype)
+         outputs = self.llm_model(
+             inputs_embeds=inputs_embeds,
+@@ -387,7 +398,15 @@ class Minigpt4Qwen(Blip2Base):
+ 
+         replace_image_idxs = torch.where(llm_tokens.input_ids == self.replace_image_token_id)
+         inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids) # B, L, C
++        inputs_embeds = inputs_embeds.clone()
+         _,_,channels = inputs_embeds.shape
++        replacement_count = int(replace_image_idxs[0].numel())
++        visual_count = int(inputs_llm.numel() // channels)
++        if replacement_count != visual_count:
++            raise RuntimeError(
++                f"visual placeholder mismatch: prompt has {replacement_count} replacement "
++                f"tokens but encoder produced {visual_count} visual embeddings"
++            )
+         inputs_embeds[replace_image_idxs[0],replace_image_idxs[1]] = inputs_llm.view(-1,channels).to(inputs_embeds.dtype)
+ 
+         outputs = self.llm_model.generate(

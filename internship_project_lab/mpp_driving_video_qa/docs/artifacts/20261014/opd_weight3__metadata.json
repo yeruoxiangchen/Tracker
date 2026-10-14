@@ -1,0 +1,113 @@
+{
+  "identity": {
+    "feedback_protocol": "full5_reference_only_feedback_opd_v2",
+    "data_sha256": "d885dc2f2c59e2a8ad4c01a8240e471ed3d04e4602e887dd7ef680febb770712",
+    "initialization": {
+      "adapter": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector": "2866220b844ab296ac3133958ad977fdcac768a7d7f0738cd580ada7122fc960",
+      "qformer": "709bed56ee90cf6127e4aeceb4d08b161cdb12b6b9b522dc71641c1ea3b73b53"
+    },
+    "base_checkpoint_sha256": "d07763b731423b40bb2baed40097fd49565a2a17c8ed9768583cbc1eed257e8d",
+    "checkpoint_root": "/tmp/zjr_mpp_fast/checkpoints",
+    "bridge_init_sha256": "b3da45645213d838799ad5302b228c5a7ec369faee9cb1db67dd0eb0d3480a51",
+    "cache_dir": "/tmp/zjr_mpp_fast/cache/lingoqa_5f_eva_v1",
+    "precision_protocol": "fp32_trainables_v1",
+    "qformer_mode": "full",
+    "dtype": "bf16",
+    "task_instruction_version": "legacy_v1",
+    "max_txt_len": 1536,
+    "max_new_tokens": 96,
+    "judge_model": "wayveai/Lingo-Judge",
+    "judge_device": "cpu",
+    "seed": 44,
+    "dropout": 0.0,
+    "rollout_distribution": "temperature=1,top_p=1,top_k=0,dropout=0",
+    "teacher_mode": "reference_only",
+    "training_mode": "feedback_opd",
+    "records": 40000,
+    "world_size": 3,
+    "epochs": 2,
+    "grad_accumulation": 6,
+    "total_steps": 5000,
+    "lr": 2.5e-06,
+    "projector_lr": 2.5e-06,
+    "qformer_lr": 5e-06,
+    "ce_weight": 1.0,
+    "opd_weight": 3.0,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.03,
+    "gradient_checkpointing": true,
+    "qformer_gradient_checkpointing": true,
+    "probe_report_sha256": "328bf4986c265a38f2f0e5a8ca1362e459369a5b4bcf566ea9a8cf4f12670794",
+    "chunk_tokens": 8,
+    "objective": "jsd",
+    "feature_stage": "eva",
+    "checkpoint_steps": [
+      1000,
+      2500
+    ],
+    "global_batch_size": 16,
+    "global_batch_protocol": "exact_global_batch_v1"
+  },
+  "optimizer_steps": 2500,
+  "micro_steps": 15000,
+  "next_epoch": 1,
+  "next_batch": 0,
+  "cumulative_metrics": [
+    17450.196258544922,
+    1077.4448574590497,
+    40000.0,
+    40000.0,
+    18347.0,
+    20860.0,
+    0.0,
+    19140.0,
+    19140.0,
+    18347.0,
+    798692.0,
+    388171.0,
+    0.0,
+    25800.0,
+    14200.0,
+    12373.0,
+    5974.0,
+    14479.0,
+    4661.0,
+    320.0
+  ],
+  "scheduler": {
+    "base_lrs": [
+      2.5e-06,
+      2.5e-06,
+      5e-06
+    ],
+    "last_epoch": 2500,
+    "verbose": false,
+    "_step_count": 2501,
+    "_get_lr_called_within_step": false,
+    "_last_lr": [
+      1.3107027776430607e-06,
+      1.3107027776430607e-06,
+      2.6214055552861213e-06
+    ],
+    "lr_lambdas": [
+      {},
+      {},
+      {}
+    ]
+  },
+  "runtime": {
+    "protocol": "feedback_opd_execution_v1",
+    "answer_only_logits": true,
+    "gradient_bucket_mb": 25.0,
+    "profile_every": 50,
+    "teacher_gate_cache_dir": "/tmp/zjr_mpp_fast/cache/feedback_teacher_gate_v2",
+    "judge_device": "local",
+    "judge_boundary_margin": 0.05,
+    "judge_equivalence_report_sha256": "c103369964bc4f3418dc3af8aff3de567b2b548398aa3a6cfb6139e0f943eb07",
+    "log_flush_every": 4,
+    "world_size": 3,
+    "grad_accumulation": 6,
+    "effective_global_batch_size": 16
+  }
+}

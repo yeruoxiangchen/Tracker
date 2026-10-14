@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpp-driving-video-qa"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = ["numpy", "pillow", "torch"]
+
+[project.optional-dependencies]
+data = ["pandas", "pyarrow"]
+model = ["transformers==4.39.2", "peft", "accelerate"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["mpp_video_qa"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

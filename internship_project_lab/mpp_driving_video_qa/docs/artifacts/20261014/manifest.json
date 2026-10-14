@@ -1,0 +1,394 @@
+{
+  "protocol": "mpp_resume_experiment_archive_v1",
+  "exported_utc": "2026-10-14T12:47:07.231980+00:00",
+  "source_root": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa",
+  "files": [
+    {
+      "source": "outputs/mpp_lingoqa_qformer_all_1epoch_v1/run_config.json",
+      "published": "sft_parent__run_config.json",
+      "bytes": 2565,
+      "sha256": "2d4d529f86c924ff956008d6f49a70d10d0e8e5774f1da9adc50ca164d7a4e87"
+    },
+    {
+      "source": "outputs/mpp_lingoqa_qformer_all_1epoch_v1/summary.json",
+      "published": "sft_parent__summary.json",
+      "bytes": 1395,
+      "sha256": "44c7b89623766dabd55487e4ebc876ee365f7932a2d26d7e80745d348c4acf22"
+    },
+    {
+      "source": "outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_adapter/adapter_config.json",
+      "published": "sft_parent__adapter_config.json",
+      "bytes": 658,
+      "sha256": "90b4cb5b144414e924df592b4a4e0e2ed47e0cebceffc4b500e9849d82a581a4"
+    },
+    {
+      "source": "outputs/mpp_feedback_sft_control_40k_2epoch_v2/run_config.json",
+      "published": "retained_sft__run_config.json",
+      "bytes": 1691,
+      "sha256": "4f177dda19007852f5f17737406b35940708ab9e1aac01a4be1c83ed7b1f946f"
+    },
+    {
+      "source": "outputs/mpp_feedback_sft_control_40k_2epoch_v2/summary.json",
+      "published": "retained_sft__summary.json",
+      "bytes": 1497,
+      "sha256": "08ff8d586688c7dc5cc34d2bced99064e85dbc2351786e0b551ada3b780d2a4f"
+    },
+    {
+      "source": "outputs/mpp_feedback_sft_control_40k_2epoch_v2/final/metadata.json",
+      "published": "retained_sft__metadata.json",
+      "bytes": 2415,
+      "sha256": "77f6ea49d5f86a8f917f841db38c12fcbf650392221d247bbadf762e3d79c781"
+    },
+    {
+      "source": "outputs/mpp_feedback_sft_control_40k_2epoch_v2/final/adapter/adapter_config.json",
+      "published": "retained_sft__adapter_config.json",
+      "bytes": 658,
+      "sha256": "90b4cb5b144414e924df592b4a4e0e2ed47e0cebceffc4b500e9849d82a581a4"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_40k_2epoch_v2/run_config.json",
+      "published": "resume_opd__run_config.json",
+      "bytes": 1692,
+      "sha256": "8f1d2ab28a42d4e0a7c8a6dd524b55e3e58ae5e737464c946af704dfed849d83"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_40k_2epoch_v2/summary.json",
+      "published": "resume_opd__summary.json",
+      "bytes": 1740,
+      "sha256": "cf7507b89e3f233fd82642d0c4131e0d1fb151fe03056e69f4acaad172385a11"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_40k_2epoch_v2/final/metadata.json",
+      "published": "resume_opd__metadata.json",
+      "bytes": 2961,
+      "sha256": "334371cca3d357605f90ea190a79ca86cf34a2a8cbb74fd1321fd459a940dc92"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_40k_2epoch_v2/final/adapter/adapter_config.json",
+      "published": "resume_opd__adapter_config.json",
+      "bytes": 658,
+      "sha256": "90b4cb5b144414e924df592b4a4e0e2ed47e0cebceffc4b500e9849d82a581a4"
+    },
+    {
+      "source": "outputs/mpp_language_lora_decoder_40k_2epoch_v1/run_config.json",
+      "published": "expanded_language_lora__run_config.json",
+      "bytes": 1973,
+      "sha256": "ccfd105a98bb5ee5a91fcfca4ec8f4f23b521e0bb1760a491ae9844f9c3db3dd"
+    },
+    {
+      "source": "outputs/mpp_language_lora_decoder_40k_2epoch_v1/summary.json",
+      "published": "expanded_language_lora__summary.json",
+      "bytes": 2190,
+      "sha256": "c49c89db5b9fee10fdbc6db702cef2f7b658c83bff22a07380e02a88bd1a725f"
+    },
+    {
+      "source": "outputs/mpp_language_lora_decoder_40k_2epoch_v1/final/metadata.json",
+      "published": "expanded_language_lora__metadata.json",
+      "bytes": 3091,
+      "sha256": "82cd7f33533bb8517a251745e39816d4f8ba83b57e6c95ac2dbfabe8c82883d5"
+    },
+    {
+      "source": "outputs/mpp_language_lora_decoder_40k_2epoch_v1/final/adapter/adapter_config.json",
+      "published": "expanded_language_lora__adapter_config.json",
+      "bytes": 691,
+      "sha256": "a84055e28a5fe7e999443a78f7f6f8ae5afa890881367a17d8abe7216eb0f496"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/run_config.json",
+      "published": "opd_weight3__run_config.json",
+      "bytes": 1771,
+      "sha256": "f0c81f1cc2b7fb0047e6daa164c755e4d9d75427c2d3e3294845fdfd90c18739"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/summary.json",
+      "published": "opd_weight3__summary.json",
+      "bytes": 1826,
+      "sha256": "e0ecb61077d4132e54ea3b82325be0c948152eb2907bf901e63c7fef60dcc59e"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500/metadata.json",
+      "published": "opd_weight3__metadata.json",
+      "bytes": 3168,
+      "sha256": "b604c281470d25f8f5c09520ec4347c3179d81c862ddd5315f6e4d86f34db437"
+    },
+    {
+      "source": "outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500/adapter/adapter_config.json",
+      "published": "opd_weight3__adapter_config.json",
+      "bytes": 658,
+      "sha256": "90b4cb5b144414e924df592b4a4e0e2ed47e0cebceffc4b500e9849d82a581a4"
+    },
+    {
+      "source": "outputs/full_qformer_scale_eval_v1/report.json",
+      "published": "full_qformer_scale_eval_v1__report.json",
+      "bytes": 9927,
+      "sha256": "d5e6752a7a00b8e520aa111e87bf8285dfb24dc2f93fd942c77f67d24df14308"
+    },
+    {
+      "source": "outputs/full_qformer_scale_eval_v1/report.md",
+      "published": "full_qformer_scale_eval_v1__report.md",
+      "bytes": 1708,
+      "sha256": "041aaac153d0f753870668717fcc80ec51c54de1344b1c2a93b8421c3fd1f643"
+    },
+    {
+      "source": "outputs/full_qformer_scale_eval_v1/official_report.json",
+      "published": "full_qformer_scale_eval_v1__official_report.json",
+      "bytes": 6762,
+      "sha256": "7fc1c11f8555186956f2932e552ea923a02f820d4724d9d9e0fe102435d1f428"
+    },
+    {
+      "source": "outputs/full_qformer_scale_eval_v1/official_report.md",
+      "published": "full_qformer_scale_eval_v1__official_report.md",
+      "bytes": 710,
+      "sha256": "b1616eb3360725c2bd37e68bd6b45faf7c399f28ccdbd76682d8e48ee71c5d70"
+    },
+    {
+      "source": "outputs/full_qformer_continue_eval_v1/report.json",
+      "published": "full_qformer_continue_eval_v1__report.json",
+      "bytes": 18132,
+      "sha256": "c6791c1af472c85ecede66c978bdb0adba2fc1a4d0dab365d12428fbac0ad01f"
+    },
+    {
+      "source": "outputs/full_qformer_continue_eval_v1/report.md",
+      "published": "full_qformer_continue_eval_v1__report.md",
+      "bytes": 3496,
+      "sha256": "269058cbbfa67e3bdb737e81b2a84e64bd57cfd55626045d66fd74c1c636d909"
+    },
+    {
+      "source": "outputs/full_qformer_continue_eval_v1/official_report.json",
+      "published": "full_qformer_continue_eval_v1__official_report.json",
+      "bytes": 7807,
+      "sha256": "306f8b732a124c127a41c73a208b7e3fdc32b4b3792afce43489a50d083565b5"
+    },
+    {
+      "source": "outputs/full_qformer_continue_eval_v1/official_report.md",
+      "published": "full_qformer_continue_eval_v1__official_report.md",
+      "bytes": 581,
+      "sha256": "758fe9b22e0a65a8381a16574dc35e4dbdbf0ccc2ce607c93e25b6da74360f71"
+    },
+    {
+      "source": "outputs/feedback_opd_eval_v2/report.json",
+      "published": "feedback_opd_eval_v2__report.json",
+      "bytes": 19594,
+      "sha256": "57833123f7ba004f3923ec615c95b8e2b33742c775a5bc04ecb2e1d2e9525a75"
+    },
+    {
+      "source": "outputs/feedback_opd_eval_v2/report.md",
+      "published": "feedback_opd_eval_v2__report.md",
+      "bytes": 2512,
+      "sha256": "3ea33f8318fd4d0ea328e9ab9473a15313ec69bc7bf47975d87c3d300b18caac"
+    },
+    {
+      "source": "outputs/feedback_opd_eval_v2/official_report.json",
+      "published": "feedback_opd_eval_v2__official_report.json",
+      "bytes": 9106,
+      "sha256": "3cfd10bbaa54af63b7188c1f6d8304aad0b285ec6573bc1cf76c052183855618"
+    },
+    {
+      "source": "outputs/feedback_opd_eval_v2/official_report.md",
+      "published": "feedback_opd_eval_v2__official_report.md",
+      "bytes": 987,
+      "sha256": "5b28325afd122810a0610a41adbb32ea47a0f1ff8fa577c94dafe75cbd3fa76b"
+    },
+    {
+      "source": "outputs/language_lora_eval_v1/report.json",
+      "published": "language_lora_eval_v1__report.json",
+      "bytes": 16429,
+      "sha256": "6b1e9a6761488bf52029bbdd2f5a76223501a1e32c36912aff6525ffbaaba594"
+    },
+    {
+      "source": "outputs/language_lora_eval_v1/report.md",
+      "published": "language_lora_eval_v1__report.md",
+      "bytes": 2306,
+      "sha256": "bfa07c35815395b4e2104888b0525407b1bbd74e83b9485ab4702e0b519d503b"
+    },
+    {
+      "source": "outputs/language_lora_eval_v1/official_report.json",
+      "published": "language_lora_eval_v1__official_report.json",
+      "bytes": 10190,
+      "sha256": "a041e065db6e2c80278d681a26527fa4106b8ebb6fddd2a73d96ac8cbdcb7d57"
+    },
+    {
+      "source": "outputs/language_lora_eval_v1/official_report.md",
+      "published": "language_lora_eval_v1__official_report.md",
+      "bytes": 891,
+      "sha256": "bb26b38e172d7315ad148876c09ff4702e3aef7b6fc98bae6017695c3c5c4395"
+    },
+    {
+      "source": "outputs/feedback_opd_weight_eval_v1/report.json",
+      "published": "feedback_opd_weight_eval_v1__report.json",
+      "bytes": 47399,
+      "sha256": "634934578892f6ac686857c5054a7923dbd51c98957d3f3e3e3d92cec57bf2b5"
+    },
+    {
+      "source": "outputs/feedback_opd_weight_eval_v1/report.md",
+      "published": "feedback_opd_weight_eval_v1__report.md",
+      "bytes": 4342,
+      "sha256": "1c73c47693c372f4de80f9e80b20e2c2845bbb0eadb7a1365344f7352a9569ad"
+    },
+    {
+      "source": "outputs/feedback_opd_weight_eval_v1/official_report.json",
+      "published": "feedback_opd_weight_eval_v1__official_report.json",
+      "bytes": 29725,
+      "sha256": "943a18e31b29ce1b5620d59f77b7ca5ecaf6eca511fbbcf1ef207d2f55537f2b"
+    },
+    {
+      "source": "outputs/feedback_opd_weight_eval_v1/official_report.md",
+      "published": "feedback_opd_weight_eval_v1__official_report.md",
+      "bytes": 1794,
+      "sha256": "969ef3022d3e413ee283f9d6b114a416bea36d23d07a41fef6a935bb8e99bd57"
+    }
+  ],
+  "checkpoints": {
+    "sft_parent": {
+      "run": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1",
+      "selected_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1",
+      "files": [
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_adapter/adapter_model.safetensors",
+          "role": "language_lora",
+          "present": true,
+          "bytes": 33562824
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_projector.pt",
+          "role": "projector",
+          "present": true,
+          "bytes": 12600455
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_qformer_adapter.pt",
+          "role": "complete_qformer",
+          "present": true,
+          "bytes": 420739869
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/training_state.pt",
+          "role": "optimizer_scheduler_and_rank_rng",
+          "present": false,
+          "bytes": null
+        }
+      ]
+    },
+    "retained_sft": {
+      "run": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2",
+      "selected_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final",
+      "files": [
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final/adapter/adapter_model.safetensors",
+          "role": "language_lora",
+          "present": true,
+          "bytes": 33562824
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final/projector.pt",
+          "role": "projector",
+          "present": true,
+          "bytes": 12600431
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final/qformer_adapter.pt",
+          "role": "complete_qformer",
+          "present": true,
+          "bytes": 420738321
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final/training_state.pt",
+          "role": "optimizer_scheduler_and_rank_rng",
+          "present": true,
+          "bytes": 933922054
+        }
+      ]
+    },
+    "resume_opd": {
+      "run": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_40k_2epoch_v2",
+      "selected_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_40k_2epoch_v2/final",
+      "files": [
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_40k_2epoch_v2/final/adapter/adapter_model.safetensors",
+          "role": "language_lora",
+          "present": true,
+          "bytes": 33562824
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_40k_2epoch_v2/final/projector.pt",
+          "role": "projector",
+          "present": true,
+          "bytes": 12600431
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_40k_2epoch_v2/final/qformer_adapter.pt",
+          "role": "complete_qformer",
+          "present": true,
+          "bytes": 420738321
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_40k_2epoch_v2/final/training_state.pt",
+          "role": "optimizer_scheduler_and_rank_rng",
+          "present": true,
+          "bytes": 933922630
+        }
+      ]
+    },
+    "expanded_language_lora": {
+      "run": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1",
+      "selected_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final",
+      "files": [
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final/adapter/adapter_model.safetensors",
+          "role": "language_lora",
+          "present": true,
+          "bytes": 143172048
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final/projector.pt",
+          "role": "projector",
+          "present": true,
+          "bytes": 12600431
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final/qformer_adapter.pt",
+          "role": "complete_qformer",
+          "present": true,
+          "bytes": 420738321
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final/training_state.pt",
+          "role": "optimizer_scheduler_and_rank_rng",
+          "present": true,
+          "bytes": 1153296169
+        }
+      ]
+    },
+    "opd_weight3": {
+      "run": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1",
+      "selected_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500",
+      "files": [
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500/adapter/adapter_model.safetensors",
+          "role": "language_lora",
+          "present": true,
+          "bytes": 33562824
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500/projector.pt",
+          "role": "projector",
+          "present": true,
+          "bytes": 12600431
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500/qformer_adapter.pt",
+          "role": "complete_qformer",
+          "present": true,
+          "bytes": 420738321
+        },
+        {
+          "path": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/checkpoint-002500/training_state.pt",
+          "role": "optimizer_scheduler_and_rank_rng",
+          "present": true,
+          "bytes": 933912508
+        }
+      ]
+    }
+  },
+  "note": "No weights, optimizer/RNG tensors, images, caches or per-question predictions are published. Reported weight identities remain in the original reports; inventory below uses file sizes, not newly computed tensor hashes."
+}

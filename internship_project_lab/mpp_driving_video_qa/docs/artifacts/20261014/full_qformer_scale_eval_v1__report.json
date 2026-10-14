@@ -1,0 +1,333 @@
+{
+  "created_utc": "2026-10-04T12:40:42.563157+00:00",
+  "judge_protocol": "official_lower_strip_maxref_logit_gt0_maxlength128_v1",
+  "selection_split": "dev",
+  "models": {
+    "joint": {
+      "adapter_identity": "f753072958d16519dcbac2c9be61a1d40f1c5b0ed2234543c70363e82e098c01",
+      "projector_identity": "28491589845697fdbb0fdd9289e7af8cc6ec052a607f7d87d8e08c15181d1bbc",
+      "qformer_adapter_sha256": null
+    },
+    "qformer100k": {
+      "adapter_identity": "1b0951ca042a8414a90f78c27e7844534d84a12556b6d49c4075bf95c2a51e32",
+      "projector_identity": "126b5bcfcb373e21794c948e7a695d43e3bf20fee8515f15ce4746651574eca7",
+      "qformer_adapter_sha256": "00b7b4aa6b6e3f39e0df0070607d5587c9553d2431ff20b0d62da640f0f6aedf"
+    },
+    "full": {
+      "adapter_identity": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector_identity": "daf714e1111c6e21a574bb87c52510ba4918b33ab6f385b35b7e5b1a541f5360",
+      "qformer_adapter_sha256": "0be4e26eecad1af7727a64b7b5f8b83f627a6766737f0c12bac5e047d37ffc8e"
+    }
+  },
+  "splits": {
+    "action": {
+      "models": {
+        "joint": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5131410256410256,
+          "token_f1": 0.642318341647711,
+          "normalized_exact": 0.08685897435897436
+        },
+        "qformer100k": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5448717948717948,
+          "token_f1": 0.6585104260640782,
+          "normalized_exact": 0.09423076923076923
+        },
+        "full": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5858974358974359,
+          "token_f1": 0.6727572938685249,
+          "normalized_exact": 0.10384615384615385
+        }
+      },
+      "paired": {
+        "joint_vs_qformer100k": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 296,
+            "regressed": 197,
+            "net_change_mean": 0.03173076923076923
+          },
+          "token_f1": {
+            "fixed": 848,
+            "regressed": 711,
+            "net_change_mean": 0.016192084416366187
+          },
+          "normalized_exact": {
+            "fixed": 85,
+            "regressed": 62,
+            "net_change_mean": 0.007371794871794872
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.014906438312718047,
+            0.04931862426995458
+          ]
+        },
+        "joint_vs_full": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 413,
+            "regressed": 186,
+            "net_change_mean": 0.07275641025641026
+          },
+          "token_f1": {
+            "fixed": 963,
+            "regressed": 630,
+            "net_change_mean": 0.030438952220812082
+          },
+          "normalized_exact": {
+            "fixed": 103,
+            "regressed": 50,
+            "net_change_mean": 0.016987179487179486
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.05040957781978576,
+            0.09411384217335059
+          ]
+        },
+        "qformer100k_vs_full": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 267,
+            "regressed": 139,
+            "net_change_mean": 0.041025641025641026
+          },
+          "token_f1": {
+            "fixed": 757,
+            "regressed": 571,
+            "net_change_mean": 0.014246867804445944
+          },
+          "normalized_exact": {
+            "fixed": 83,
+            "regressed": 53,
+            "net_change_mean": 0.009615384615384616
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.026500638569604086,
+            0.056695992179863146
+          ]
+        }
+      }
+    },
+    "scenery": {
+      "models": {
+        "joint": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6058333333333333,
+          "token_f1": 0.5824502373842193,
+          "normalized_exact": 0.11416666666666667
+        },
+        "qformer100k": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6433333333333333,
+          "token_f1": 0.5881910590606027,
+          "normalized_exact": 0.12333333333333334
+        },
+        "full": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6383333333333333,
+          "token_f1": 0.5910428472582332,
+          "normalized_exact": 0.12
+        }
+      },
+      "paired": {
+        "joint_vs_qformer100k": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 91,
+            "regressed": 46,
+            "net_change_mean": 0.0375
+          },
+          "token_f1": {
+            "fixed": 282,
+            "regressed": 236,
+            "net_change_mean": 0.005740821676383575
+          },
+          "normalized_exact": {
+            "fixed": 22,
+            "regressed": 11,
+            "net_change_mean": 0.009166666666666667
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.018333333333333333,
+            0.0575
+          ]
+        },
+        "joint_vs_full": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 94,
+            "regressed": 55,
+            "net_change_mean": 0.0325
+          },
+          "token_f1": {
+            "fixed": 292,
+            "regressed": 243,
+            "net_change_mean": 0.008592609874013876
+          },
+          "normalized_exact": {
+            "fixed": 18,
+            "regressed": 11,
+            "net_change_mean": 0.005833333333333334
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.0125,
+            0.0525
+          ]
+        },
+        "qformer100k_vs_full": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 53,
+            "regressed": 59,
+            "net_change_mean": -0.005
+          },
+          "token_f1": {
+            "fixed": 221,
+            "regressed": 219,
+            "net_change_mean": 0.0028517881976303132
+          },
+          "normalized_exact": {
+            "fixed": 13,
+            "regressed": 17,
+            "net_change_mean": -0.0033333333333333335
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            -0.023333333333333334,
+            0.0125
+          ]
+        }
+      }
+    }
+  },
+  "dev_combined": {
+    "models": {
+      "joint": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.5388888888888889,
+        "token_f1": 0.6256883126856293,
+        "normalized_exact": 0.09444444444444444
+      },
+      "qformer100k": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.5722222222222222,
+        "token_f1": 0.6389772685631109,
+        "normalized_exact": 0.10231481481481482
+      },
+      "full": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.600462962962963,
+        "token_f1": 0.6500588364767766,
+        "normalized_exact": 0.10833333333333334
+      }
+    },
+    "paired": {
+      "joint_vs_qformer100k": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 387,
+          "regressed": 243,
+          "net_change_mean": 0.03333333333333333
+        },
+        "token_f1": {
+          "fixed": 1130,
+          "regressed": 947,
+          "net_change_mean": 0.013288955877482135
+        },
+        "normalized_exact": {
+          "fixed": 107,
+          "regressed": 73,
+          "net_change_mean": 0.00787037037037037
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.020876347786189492,
+          0.04669260700389105
+        ]
+      },
+      "joint_vs_full": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 507,
+          "regressed": 241,
+          "net_change_mean": 0.06157407407407407
+        },
+        "token_f1": {
+          "fixed": 1255,
+          "regressed": 873,
+          "net_change_mean": 0.024370523791145904
+        },
+        "normalized_exact": {
+          "fixed": 121,
+          "regressed": 61,
+          "net_change_mean": 0.013888888888888888
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.04630060493252676,
+          0.07791609036422315
+        ]
+      },
+      "qformer100k_vs_full": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 320,
+          "regressed": 198,
+          "net_change_mean": 0.02824074074074074
+        },
+        "token_f1": {
+          "fixed": 978,
+          "regressed": 790,
+          "net_change_mean": 0.011081567913663827
+        },
+        "normalized_exact": {
+          "fixed": 96,
+          "regressed": 70,
+          "net_change_mean": 0.0060185185185185185
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.01652513197154005,
+          0.040725047080979286
+        ]
+      }
+    }
+  },
+  "selected_model": "full",
+  "selection_note": "Dev Judge point estimate; ties retain qformer100k. Official evaluation never selects weights.",
+  "full_gain_supported_by_video_bootstrap": true,
+  "interpretation": "Scale changes both unique QA coverage and total updates; this does not isolate either causal contribution.",
+  "training": {
+    "full_training_config_present": true,
+    "records": 406212,
+    "optimizer_steps_total": 25389,
+    "reference_records": 100000,
+    "reference_optimizer_steps_total": 12500,
+    "same_initialization_and_training_recipe": true
+  }
+}

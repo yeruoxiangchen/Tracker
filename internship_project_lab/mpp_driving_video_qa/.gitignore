@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+datasets/cache/
+datasets/processed/
+outputs/
+logs/
+

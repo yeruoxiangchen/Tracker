@@ -1,0 +1,29 @@
+{
+  "completed": true,
+  "optimizer_steps": 25389,
+  "micro_steps": 101553,
+  "elapsed_seconds": 37490.8561398983,
+  "tracked_lora_max_abs_delta": 0.002109241671860218,
+  "tracked_projector_max_abs_delta": 0.0028941750060766935,
+  "gradient_checkpointing": true,
+  "gpu_memory_rank0": {
+    "allocated_gib": 16.14740753173828,
+    "reserved_gib": 21.337890625,
+    "max_allocated_gib": 16.945374488830566,
+    "max_reserved_gib": 22.232421875,
+    "device_free_gib": 0.96588134765625,
+    "device_total_gib": 23.56072998046875
+  },
+  "feature_stage": "eva",
+  "train_projector": true,
+  "train_qformer": true,
+  "qformer_mode": "full",
+  "precision_protocol": "fp32_trainables_v1",
+  "max_parameter_checksum_spread": 0.0,
+  "tracked_bridge_parameter": "backbone.visual_bridge.Qformer.bert.encoder.layer.0.attention.self.query.weight",
+  "tracked_bridge_max_abs_delta": 0.003169560804963112,
+  "tracked_queries_max_abs_delta": 0.0029174350202083588,
+  "final_qformer_adapter": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_qformer_adapter.pt",
+  "final_adapter": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_adapter",
+  "final_projector": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1/final_projector.pt"
+}

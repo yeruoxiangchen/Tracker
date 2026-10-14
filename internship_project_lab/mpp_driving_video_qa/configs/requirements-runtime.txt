@@ -1,0 +1,40 @@
+# Match the versions declared by upstream MPP-LLaVA. Torch is installed
+# separately from the CUDA 11.8 PyTorch wheel index.
+contexttimer
+decord
+diffusers<=0.16.0
+einops>=0.4.1
+fairscale==0.4.4
+ftfy
+iopath
+ipython
+omegaconf
+opencv-python-headless==4.5.5.64
+packaging
+pandas
+plotly
+pycocoevalcap
+pycocotools
+python-magic
+scikit-image
+sentencepiece
+spacy==3.7.*
+timm==0.4.12
+tqdm
+transformers==4.39.2
+webdataset
+accelerate
+peft
+tiktoken==0.5.1
+transformers_stream_generator
+deepspeed==0.13.5
+gradio==3.50.2
+moviepy
+wandb==0.17.0
+protobuf==3.19.1
+
+
+# Versions verified in the driving experiment environment.
+peft==0.13.2
+pyarrow==14.0.2
+numpy==1.24.4

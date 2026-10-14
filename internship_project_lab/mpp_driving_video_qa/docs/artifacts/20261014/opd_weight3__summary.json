@@ -1,0 +1,58 @@
+{
+  "completed": true,
+  "optimizer_steps": 5000,
+  "optimizer_steps_total": 5000,
+  "records": 40000,
+  "teacher_mode": "reference_only",
+  "world_size": 3,
+  "grad_accumulation": 6,
+  "effective_global_batch_size": 16,
+  "micro_steps_per_rank": 30000,
+  "training_mode": "feedback_opd",
+  "final_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_opd_weight3_40k_2epoch_v1/final",
+  "elapsed_seconds_this_run": 56117.08673477173,
+  "cumulative_metrics": {
+    "ce_sum": 34252.77230834961,
+    "jsd_sum": 2077.055317789782,
+    "examples": 80000.0,
+    "rollouts": 80000.0,
+    "eligible": 35702.0,
+    "student_correct": 42734.0,
+    "student_truncated": 0.0,
+    "teacher_attempts": 37266.0,
+    "teacher_finished": 37266.0,
+    "teacher_correct": 35702.0,
+    "completion_tokens": 1597674.0,
+    "distilled_tokens": 758515.0,
+    "context_skips": 0.0,
+    "action_examples": 51600.0,
+    "scenery_examples": 28400.0,
+    "action_eligible": 24226.0,
+    "scenery_eligible": 11476.0,
+    "teacher_cache_hits": 30364.0,
+    "teacher_generations": 6902.0,
+    "judge_cpu_fallbacks": 617.0
+  },
+  "tracked_parameter_delta_this_run": {
+    "language": 0.0004724161699414253,
+    "projector": 0.0005102790892124176,
+    "qformer": 0.0010696568060666323
+  },
+  "teacher_tracked_parameter_deltas": {
+    "qformer": 0.0,
+    "projector": 0.0,
+    "language": 0.0
+  },
+  "gpu_memory_rank0": {
+    "allocated_gib": 16.86553430557251,
+    "reserved_gib": 19.203125,
+    "max_allocated_gib": 18.098310470581055,
+    "max_reserved_gib": 19.203125,
+    "device_free_gib": 3.3011474609375,
+    "device_total_gib": 23.56072998046875
+  },
+  "eligible_rollout_rate": 0.446275,
+  "teacher_finished_correction_rate": 0.9580314495787045,
+  "actual_rollouts": 80000,
+  "actual_distilled_tokens": 758515
+}

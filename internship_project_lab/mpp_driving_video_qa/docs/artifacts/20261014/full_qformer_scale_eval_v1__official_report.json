@@ -1,0 +1,233 @@
+{
+  "created_utc": "2026-10-04T12:48:52.942385+00:00",
+  "judge_protocol": "official_lower_strip_maxref_logit_gt0_maxlength128_v1",
+  "selection_split": "dev",
+  "models": {
+    "joint": {
+      "adapter_identity": "f753072958d16519dcbac2c9be61a1d40f1c5b0ed2234543c70363e82e098c01",
+      "projector_identity": "28491589845697fdbb0fdd9289e7af8cc6ec052a607f7d87d8e08c15181d1bbc",
+      "qformer_adapter_sha256": null
+    },
+    "qformer100k": {
+      "adapter_identity": "1b0951ca042a8414a90f78c27e7844534d84a12556b6d49c4075bf95c2a51e32",
+      "projector_identity": "126b5bcfcb373e21794c948e7a695d43e3bf20fee8515f15ce4746651574eca7",
+      "qformer_adapter_sha256": "00b7b4aa6b6e3f39e0df0070607d5587c9553d2431ff20b0d62da640f0f6aedf"
+    },
+    "full": {
+      "adapter_identity": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector_identity": "daf714e1111c6e21a574bb87c52510ba4918b33ab6f385b35b7e5b1a541f5360",
+      "qformer_adapter_sha256": "0be4e26eecad1af7727a64b7b5f8b83f627a6766737f0c12bac5e047d37ffc8e"
+    }
+  },
+  "splits": {
+    "eval": {
+      "models": {
+        "joint": {
+          "records": 500,
+          "lingo_judge_accuracy": 0.472,
+          "token_f1": 0.31340525778706607,
+          "normalized_exact": 0.004
+        },
+        "qformer100k": {
+          "records": 500,
+          "lingo_judge_accuracy": 0.51,
+          "token_f1": 0.32345637792525955,
+          "normalized_exact": 0.006
+        },
+        "full": {
+          "records": 500,
+          "lingo_judge_accuracy": 0.542,
+          "token_f1": 0.31999287520618125,
+          "normalized_exact": 0.004
+        }
+      },
+      "paired": {
+        "joint_vs_qformer100k": {
+          "records": 500,
+          "lingo_judge_correct": {
+            "fixed": 45,
+            "regressed": 26,
+            "net_change_mean": 0.038
+          },
+          "token_f1": {
+            "fixed": 128,
+            "regressed": 117,
+            "net_change_mean": 0.010051120138194123
+          },
+          "normalized_exact": {
+            "fixed": 2,
+            "regressed": 1,
+            "net_change_mean": 0.002
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.004,
+            0.072
+          ]
+        },
+        "joint_vs_full": {
+          "records": 500,
+          "lingo_judge_correct": {
+            "fixed": 55,
+            "regressed": 20,
+            "net_change_mean": 0.07
+          },
+          "token_f1": {
+            "fixed": 135,
+            "regressed": 113,
+            "net_change_mean": 0.006587617419115497
+          },
+          "normalized_exact": {
+            "fixed": 1,
+            "regressed": 1,
+            "net_change_mean": 0.0
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.034,
+            0.108
+          ]
+        },
+        "qformer100k_vs_full": {
+          "records": 500,
+          "lingo_judge_correct": {
+            "fixed": 36,
+            "regressed": 20,
+            "net_change_mean": 0.032
+          },
+          "token_f1": {
+            "fixed": 107,
+            "regressed": 100,
+            "net_change_mean": -0.0034635027190786268
+          },
+          "normalized_exact": {
+            "fixed": 0,
+            "regressed": 1,
+            "net_change_mean": -0.002
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.004,
+            0.06
+          ]
+        }
+      }
+    }
+  },
+  "interpretation": "Scale changes both unique QA coverage and total updates; this does not isolate either causal contribution.",
+  "selected_model": "full",
+  "training": {
+    "full_training_config_present": true,
+    "records": 406212,
+    "optimizer_steps_total": 25389,
+    "reference_records": 100000,
+    "reference_optimizer_steps_total": 12500,
+    "same_initialization_and_training_recipe": true
+  },
+  "dev_selection": {
+    "models": {
+      "joint": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.5388888888888889,
+        "token_f1": 0.6256883126856293,
+        "normalized_exact": 0.09444444444444444
+      },
+      "qformer100k": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.5722222222222222,
+        "token_f1": 0.6389772685631109,
+        "normalized_exact": 0.10231481481481482
+      },
+      "full": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.600462962962963,
+        "token_f1": 0.6500588364767766,
+        "normalized_exact": 0.10833333333333334
+      }
+    },
+    "paired": {
+      "joint_vs_qformer100k": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 387,
+          "regressed": 243,
+          "net_change_mean": 0.03333333333333333
+        },
+        "token_f1": {
+          "fixed": 1130,
+          "regressed": 947,
+          "net_change_mean": 0.013288955877482135
+        },
+        "normalized_exact": {
+          "fixed": 107,
+          "regressed": 73,
+          "net_change_mean": 0.00787037037037037
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.020876347786189492,
+          0.04669260700389105
+        ]
+      },
+      "joint_vs_full": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 507,
+          "regressed": 241,
+          "net_change_mean": 0.06157407407407407
+        },
+        "token_f1": {
+          "fixed": 1255,
+          "regressed": 873,
+          "net_change_mean": 0.024370523791145904
+        },
+        "normalized_exact": {
+          "fixed": 121,
+          "regressed": 61,
+          "net_change_mean": 0.013888888888888888
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.04630060493252676,
+          0.07791609036422315
+        ]
+      },
+      "qformer100k_vs_full": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 320,
+          "regressed": 198,
+          "net_change_mean": 0.02824074074074074
+        },
+        "token_f1": {
+          "fixed": 978,
+          "regressed": 790,
+          "net_change_mean": 0.011081567913663827
+        },
+        "normalized_exact": {
+          "fixed": 96,
+          "regressed": 70,
+          "net_change_mean": 0.0060185185185185185
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.01652513197154005,
+          0.040725047080979286
+        ]
+      }
+    }
+  },
+  "full_evaluated": true
+}

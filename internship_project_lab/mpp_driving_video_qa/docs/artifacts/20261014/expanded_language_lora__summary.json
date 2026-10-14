@@ -1,0 +1,74 @@
+{
+  "completed": true,
+  "optimizer_steps": 5000,
+  "optimizer_steps_total": 5000,
+  "records": 40000,
+  "teacher_mode": "reference_only",
+  "micro_steps_per_rank": 20000,
+  "training_mode": "sft_control",
+  "final_bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final",
+  "elapsed_seconds_this_run": 9177.247086763382,
+  "cumulative_metrics": {
+    "ce_sum": 33827.48141479492,
+    "jsd_sum": 0.0,
+    "examples": 80000.0,
+    "rollouts": 0.0,
+    "eligible": 0.0,
+    "student_correct": 0.0,
+    "student_truncated": 0.0,
+    "teacher_attempts": 0.0,
+    "teacher_finished": 0.0,
+    "teacher_correct": 0.0,
+    "completion_tokens": 0.0,
+    "distilled_tokens": 0.0,
+    "context_skips": 0.0,
+    "action_examples": 51600.0,
+    "scenery_examples": 28400.0,
+    "action_eligible": 0.0,
+    "scenery_eligible": 0.0,
+    "teacher_cache_hits": 0.0,
+    "teacher_generations": 0.0,
+    "judge_cpu_fallbacks": 0.0
+  },
+  "tracked_parameter_delta_this_run": {
+    "language": 0.00048080924898386,
+    "projector": 0.0005274210125207901,
+    "qformer": 0.0009690573788248003,
+    "language_attn_c_proj": 0.0005652497638948262,
+    "language_mlp_w1": 0.0004644423897843808,
+    "language_mlp_w2": 0.0004594916827045381,
+    "language_mlp_c_proj": 0.00042003055568784475
+  },
+  "teacher_tracked_parameter_deltas": {},
+  "gpu_memory_rank0": {
+    "allocated_gib": 16.02073335647583,
+    "reserved_gib": 19.412109375,
+    "max_allocated_gib": 17.351182460784912,
+    "max_reserved_gib": 19.412109375,
+    "device_free_gib": 3.7529296875,
+    "device_total_gib": 23.56072998046875
+  },
+  "language_lora": {
+    "scope": "decoder_linear",
+    "r": 16,
+    "alpha": 32,
+    "dropout": 0.0,
+    "targets": [
+      "attn.c_attn",
+      "attn.c_proj",
+      "mlp.w1",
+      "mlp.w2",
+      "mlp.c_proj"
+    ],
+    "initialization": "qwen_qkv_to_decoder_linear_preserve_fp32_v1"
+  },
+  "trainable_parameters_by_group": {
+    "language": 35782656,
+    "projector": 3149824,
+    "qformer": 105162240
+  },
+  "eligible_rollout_rate": 0.0,
+  "teacher_finished_correction_rate": 0.0,
+  "actual_rollouts": 0,
+  "actual_distilled_tokens": 0
+}

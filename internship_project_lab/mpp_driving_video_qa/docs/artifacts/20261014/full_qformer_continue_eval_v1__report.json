@@ -1,0 +1,566 @@
+{
+  "title": "Full Q-Former continuation comparison",
+  "created_utc": "2026-10-05T07:22:35.459538+00:00",
+  "judge_protocol": "official_lower_strip_maxref_logit_gt0_maxlength128_v1",
+  "selection_split": "dev",
+  "models": {
+    "baseline": {
+      "adapter_identity": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector_identity": "daf714e1111c6e21a574bb87c52510ba4918b33ab6f385b35b7e5b1a541f5360",
+      "qformer_adapter_sha256": "0be4e26eecad1af7727a64b7b5f8b83f627a6766737f0c12bac5e047d37ffc8e"
+    },
+    "checkpoint-006000": {
+      "adapter_identity": "3dd52bd36f7ee7c0c4c1a3dbf1cdc68481e0205fd21494b51149e1f6eb239407",
+      "projector_identity": "49fd8cb9925c5542900cb7ac002aa65b092849b0abb6c584010fb2d6fcf189c9",
+      "qformer_adapter_sha256": "800d880dc60a7d8d57f8cdebccbdc397b50b5ee2c9ff34eca4b3ecca9d0271f6"
+    },
+    "checkpoint-012000": {
+      "adapter_identity": "0d698f6e33c07ca619b67f7f2a26e3c0e18367b442f740852cbaa7b36bc21c96",
+      "projector_identity": "d647a77678b68ccdfc5fd93198ce437588fe708b87ae52d48b662904e4a24584",
+      "qformer_adapter_sha256": "cfeee85a50d15e015d276d60cde3b06a4b8ef87d571f45111ad15bcd6a49745f"
+    },
+    "checkpoint-018000": {
+      "adapter_identity": "0487ce7c0477df740829e1169c8628ebbe6dc41522c01721b79d298df5b77ed4",
+      "projector_identity": "735036c8bb267fe80f534a27b3082542c730105c946c3d4d3314a0beaf1d23ec",
+      "qformer_adapter_sha256": "766d0243e99aedcd14495e83084f3c94ddeeaf4ec02ff29989dd5ec92d02e7dd"
+    },
+    "checkpoint-024000": {
+      "adapter_identity": "1757a6d65a381c30c6e4b4943be1ece6f10ea0f2c2033d483ce8691b62fef2b3",
+      "projector_identity": "2b2a9aa4a866084e78b0f8edfd86918b2f30a1338d862c918d90888595a884b1",
+      "qformer_adapter_sha256": "5b85736fd5256f7e971f3f757ecf27ba57b0d745e59b0cfaf0fcf050456fbd40"
+    },
+    "final": {
+      "adapter_identity": "450127a49ae61c2ab424da2c98d9f5d1fb605fe384f32652c57ad383cf12af46",
+      "projector_identity": "e30e87e3e36bf4c347f7e6be2c70cf56bb4ac19a318808bf6935cad5ef62b2f1",
+      "qformer_adapter_sha256": "c4997c2ab423604e414fe98f3381c2139139c6f7b1c66e6a68aa17783f51b4f8"
+    }
+  },
+  "splits": {
+    "action": {
+      "models": {
+        "baseline": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5858974358974359,
+          "token_f1": 0.6727572938685249,
+          "normalized_exact": 0.10384615384615385
+        },
+        "checkpoint-006000": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5737179487179487,
+          "token_f1": 0.6667882535215931,
+          "normalized_exact": 0.1
+        },
+        "checkpoint-012000": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5884615384615385,
+          "token_f1": 0.6754286351210603,
+          "normalized_exact": 0.10961538461538461
+        },
+        "checkpoint-018000": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.6032051282051282,
+          "token_f1": 0.6749634359209145,
+          "normalized_exact": 0.1064102564102564
+        },
+        "checkpoint-024000": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.6012820512820513,
+          "token_f1": 0.6800755380877976,
+          "normalized_exact": 0.1064102564102564
+        },
+        "final": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.6009615384615384,
+          "token_f1": 0.679905442073521,
+          "normalized_exact": 0.10576923076923077
+        }
+      },
+      "paired": {
+        "baseline_vs_checkpoint-006000": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 172,
+            "regressed": 210,
+            "net_change_mean": -0.01217948717948718
+          },
+          "token_f1": {
+            "fixed": 584,
+            "regressed": 644,
+            "net_change_mean": -0.0059690403469300456
+          },
+          "normalized_exact": {
+            "fixed": 61,
+            "regressed": 73,
+            "net_change_mean": -0.0038461538461538464
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            -0.025625,
+            0.0019336126329358686
+          ]
+        },
+        "baseline_vs_checkpoint-012000": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 173,
+            "regressed": 165,
+            "net_change_mean": 0.002564102564102564
+          },
+          "token_f1": {
+            "fixed": 621,
+            "regressed": 560,
+            "net_change_mean": 0.002671341252536958
+          },
+          "normalized_exact": {
+            "fixed": 66,
+            "regressed": 48,
+            "net_change_mean": 0.0057692307692307696
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            -0.010064935064935065,
+            0.015062213490504257
+          ]
+        },
+        "baseline_vs_checkpoint-018000": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 197,
+            "regressed": 143,
+            "net_change_mean": 0.01730769230769231
+          },
+          "token_f1": {
+            "fixed": 581,
+            "regressed": 550,
+            "net_change_mean": 0.0022061420523905102
+          },
+          "normalized_exact": {
+            "fixed": 55,
+            "regressed": 47,
+            "net_change_mean": 0.002564102564102564
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.002573174654229656,
+            0.03136882129277566
+          ]
+        },
+        "baseline_vs_checkpoint-024000": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 173,
+            "regressed": 125,
+            "net_change_mean": 0.015384615384615385
+          },
+          "token_f1": {
+            "fixed": 546,
+            "regressed": 421,
+            "net_change_mean": 0.007318244219275169
+          },
+          "normalized_exact": {
+            "fixed": 52,
+            "regressed": 44,
+            "net_change_mean": 0.002564102564102564
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.001932367149758454,
+            0.029150823827629912
+          ]
+        },
+        "baseline_vs_final": {
+          "records": 3120,
+          "lingo_judge_correct": {
+            "fixed": 174,
+            "regressed": 127,
+            "net_change_mean": 0.015064102564102564
+          },
+          "token_f1": {
+            "fixed": 545,
+            "regressed": 437,
+            "net_change_mean": 0.007148148204998297
+          },
+          "normalized_exact": {
+            "fixed": 51,
+            "regressed": 45,
+            "net_change_mean": 0.0019230769230769232
+          },
+          "unit": "segment_id",
+          "segments": 300,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.0016371971185330713,
+            0.02911392405063291
+          ]
+        }
+      }
+    },
+    "scenery": {
+      "models": {
+        "baseline": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6383333333333333,
+          "token_f1": 0.5910428472582332,
+          "normalized_exact": 0.12
+        },
+        "checkpoint-006000": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.64,
+          "token_f1": 0.5958602062593465,
+          "normalized_exact": 0.12083333333333333
+        },
+        "checkpoint-012000": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6541666666666667,
+          "token_f1": 0.5912807942520021,
+          "normalized_exact": 0.11833333333333333
+        },
+        "checkpoint-018000": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.655,
+          "token_f1": 0.5923692647024614,
+          "normalized_exact": 0.12416666666666666
+        },
+        "checkpoint-024000": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6608333333333334,
+          "token_f1": 0.5921334906445195,
+          "normalized_exact": 0.1225
+        },
+        "final": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6533333333333333,
+          "token_f1": 0.5918442333592508,
+          "normalized_exact": 0.1225
+        }
+      },
+      "paired": {
+        "baseline_vs_checkpoint-006000": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 48,
+            "regressed": 46,
+            "net_change_mean": 0.0016666666666666668
+          },
+          "token_f1": {
+            "fixed": 212,
+            "regressed": 196,
+            "net_change_mean": 0.004817359001113366
+          },
+          "normalized_exact": {
+            "fixed": 17,
+            "regressed": 16,
+            "net_change_mean": 0.0008333333333333334
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            -0.014166666666666666,
+            0.016666666666666666
+          ]
+        },
+        "baseline_vs_checkpoint-012000": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 54,
+            "regressed": 35,
+            "net_change_mean": 0.015833333333333335
+          },
+          "token_f1": {
+            "fixed": 194,
+            "regressed": 202,
+            "net_change_mean": 0.0002379469937689479
+          },
+          "normalized_exact": {
+            "fixed": 13,
+            "regressed": 15,
+            "net_change_mean": -0.0016666666666666668
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.0008333333333333334,
+            0.030833333333333334
+          ]
+        },
+        "baseline_vs_checkpoint-018000": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 56,
+            "regressed": 36,
+            "net_change_mean": 0.016666666666666666
+          },
+          "token_f1": {
+            "fixed": 197,
+            "regressed": 193,
+            "net_change_mean": 0.00132641744422857
+          },
+          "normalized_exact": {
+            "fixed": 14,
+            "regressed": 9,
+            "net_change_mean": 0.004166666666666667
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            -0.0016666666666666668,
+            0.034166666666666665
+          ]
+        },
+        "baseline_vs_checkpoint-024000": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 57,
+            "regressed": 30,
+            "net_change_mean": 0.0225
+          },
+          "token_f1": {
+            "fixed": 195,
+            "regressed": 183,
+            "net_change_mean": 0.0010906433862861147
+          },
+          "normalized_exact": {
+            "fixed": 12,
+            "regressed": 9,
+            "net_change_mean": 0.0025
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            0.0075,
+            0.03833333333333333
+          ]
+        },
+        "baseline_vs_final": {
+          "records": 1200,
+          "lingo_judge_correct": {
+            "fixed": 51,
+            "regressed": 33,
+            "net_change_mean": 0.015
+          },
+          "token_f1": {
+            "fixed": 200,
+            "regressed": 174,
+            "net_change_mean": 0.0008013861010175276
+          },
+          "normalized_exact": {
+            "fixed": 12,
+            "regressed": 9,
+            "net_change_mean": 0.0025
+          },
+          "unit": "segment_id",
+          "segments": 100,
+          "draws": 1000,
+          "net_change_95pct_interval": [
+            -0.0008333333333333334,
+            0.03
+          ]
+        }
+      }
+    }
+  },
+  "baseline_epoch_final_tensor_equality_verified": true,
+  "interpretation": "One additional SFT stage from the full-data parent, with a fresh optimizer and lower LR. The dataset and model architecture are retained. Bootstrap intervals are exploratory after checkpoint selection.",
+  "dev_combined": {
+    "models": {
+      "baseline": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.600462962962963,
+        "token_f1": 0.6500588364767766,
+        "normalized_exact": 0.10833333333333334
+      },
+      "checkpoint-006000": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.5921296296296297,
+        "token_f1": 0.6470860181709687,
+        "normalized_exact": 0.10578703703703704
+      },
+      "checkpoint-012000": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.606712962962963,
+        "token_f1": 0.6520542348796556,
+        "normalized_exact": 0.11203703703703703
+      },
+      "checkpoint-018000": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6175925925925926,
+        "token_f1": 0.6520206105824554,
+        "normalized_exact": 0.11134259259259259
+      },
+      "checkpoint-024000": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.617824074074074,
+        "token_f1": 0.6556471915757759,
+        "normalized_exact": 0.11087962962962963
+      },
+      "final": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6155092592592593,
+        "token_f1": 0.6554439952084461,
+        "normalized_exact": 0.11041666666666666
+      }
+    },
+    "paired": {
+      "baseline_vs_checkpoint-006000": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 220,
+          "regressed": 256,
+          "net_change_mean": -0.008333333333333333
+        },
+        "token_f1": {
+          "fixed": 796,
+          "regressed": 840,
+          "net_change_mean": -0.0029728183058068797
+        },
+        "normalized_exact": {
+          "fixed": 78,
+          "regressed": 89,
+          "net_change_mean": -0.0025462962962962965
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.018548574078367727,
+          0.0030204460966542753
+        ]
+      },
+      "baseline_vs_checkpoint-012000": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 227,
+          "regressed": 200,
+          "net_change_mean": 0.00625
+        },
+        "token_f1": {
+          "fixed": 815,
+          "regressed": 762,
+          "net_change_mean": 0.0019953984028791795
+        },
+        "normalized_exact": {
+          "fixed": 79,
+          "regressed": 63,
+          "net_change_mean": 0.003703703703703704
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.004376871688551025,
+          0.016282856478250757
+        ]
+      },
+      "baseline_vs_checkpoint-018000": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 253,
+          "regressed": 179,
+          "net_change_mean": 0.01712962962962963
+        },
+        "token_f1": {
+          "fixed": 778,
+          "regressed": 743,
+          "net_change_mean": 0.001961774105678861
+        },
+        "normalized_exact": {
+          "fixed": 69,
+          "regressed": 56,
+          "net_change_mean": 0.0030092592592592593
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.004773812230052284,
+          0.02902557014512785
+        ]
+      },
+      "baseline_vs_checkpoint-024000": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 230,
+          "regressed": 155,
+          "net_change_mean": 0.017361111111111112
+        },
+        "token_f1": {
+          "fixed": 741,
+          "regressed": 604,
+          "net_change_mean": 0.005588355099000428
+        },
+        "normalized_exact": {
+          "fixed": 64,
+          "regressed": 53,
+          "net_change_mean": 0.0025462962962962965
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.006232686980609419,
+          0.02825782344698739
+        ]
+      },
+      "baseline_vs_final": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 225,
+          "regressed": 160,
+          "net_change_mean": 0.015046296296296295
+        },
+        "token_f1": {
+          "fixed": 745,
+          "regressed": 611,
+          "net_change_mean": 0.005385158731670303
+        },
+        "normalized_exact": {
+          "fixed": 63,
+          "regressed": 54,
+          "net_change_mean": 0.0020833333333333333
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          0.003938832252085264,
+          0.02643171806167401
+        ]
+      }
+    }
+  },
+  "selected_model": "checkpoint-024000",
+  "selected_gain_supported_by_video_bootstrap": true,
+  "recommended_model": "checkpoint-024000",
+  "selection_note": "Dev combined Judge point estimate selects the candidate for official evaluation; ties retain baseline/earlier checkpoint. Retain baseline as main model if paired CI crosses zero. Official results are never used to choose a checkpoint.",
+  "training": {
+    "parent_run": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_lingoqa_qformer_all_1epoch_v1",
+    "parent_identity": {
+      "adapter_identity": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector_identity": "2866220b844ab296ac3133958ad977fdcac768a7d7f0738cd580ada7122fc960",
+      "qformer_adapter_sha256": "709bed56ee90cf6127e4aeceb4d08b161cdb12b6b9b522dc71641c1ea3b73b53"
+    },
+    "parent_optimizer_steps": 25389,
+    "records": 406212,
+    "new_optimizer_and_schedule": true,
+    "config_present": true,
+    "optimizer_steps_total": 25389,
+    "learning_rates": {
+      "lr": 2.5e-06,
+      "projector_lr": 2.5e-06,
+      "qformer_lr": 5e-06
+    },
+    "seed": 43
+  }
+}

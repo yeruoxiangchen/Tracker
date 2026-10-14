@@ -1,0 +1,298 @@
+{
+  "created_utc": "2026-10-10T10:11:14.739726+00:00",
+  "judge_protocol": "official_lower_strip_maxref_logit_gt0_maxlength128_v1",
+  "selection_split": "dev",
+  "models": {
+    "parent": {
+      "adapter_identity": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector_identity": "2866220b844ab296ac3133958ad977fdcac768a7d7f0738cd580ada7122fc960",
+      "qformer_adapter_sha256": "709bed56ee90cf6127e4aeceb4d08b161cdb12b6b9b522dc71641c1ea3b73b53"
+    },
+    "qkv_checkpoint-001000": {
+      "adapter_identity": "bc3ad3ea49a0ff571bbe3b74775d3dbb84eb5bdb4a4119598a4a5e6673802933",
+      "projector_identity": "bae430a956596782ccf35ec7e80aa5459b777e6bd21a96ad24dde10ee0e557a9",
+      "qformer_adapter_sha256": "4d339aa1ab241d15182f377874c0a048e7ad036c3cf22cc30199e86de214261b"
+    },
+    "qkv_checkpoint-002500": {
+      "adapter_identity": "504c94dccd5e955639741ee7a3692252a68284734e4a22804d3e737fa119b306",
+      "projector_identity": "5ca5fddfa8f18a209c9b4342bace7ff352075137dc01866e71bb9fdb6503a295",
+      "qformer_adapter_sha256": "09ccaa7657fef695049b6a34228dd3d6298febf6b0750d8e94b52de2146754b7"
+    },
+    "qkv_final": {
+      "adapter_identity": "49ba792d698c0576fa7f8d2c26f69f61f7d574c67566a76084a94afdb6d21bc1",
+      "projector_identity": "fca2896ac9eb7601ee6e4467d952dab1051457166518d7bbe338be793322c432",
+      "qformer_adapter_sha256": "d0456cef4780ee3361cbfeb6362da92a842a61216c45c668cfaede624da464f8"
+    },
+    "decoder_checkpoint-001000": {
+      "adapter_identity": "2573f12222dbf818154ff6197981bd57a4de782ea0969d7e46ffba564755393a",
+      "projector_identity": "0f5761d5693eed862a15894e26c634f8a5d44cbaeee5924e3d1965f929e1c8c0",
+      "qformer_adapter_sha256": "3cac2020318d9f5a808ba9003f9b0792915f0f5cb159d4b57d79cef0a246171a"
+    },
+    "decoder_checkpoint-002500": {
+      "adapter_identity": "85f148dde0f512a37db044ee0bbad342411e900beffb437dbe55c1cd3022201d",
+      "projector_identity": "bb1fe3dbd169a4e35e77b2d0b65adf78be76ac0acaeded8b2f4b8c9c8e3c32bd",
+      "qformer_adapter_sha256": "7538cdf364f92976972cf0465deb6b164cbf71f87f35e2a6a2836485ad21d8e5"
+    },
+    "decoder_final": {
+      "adapter_identity": "97b8956b12533558c669450449822e7c0ac628f09c2754cec750fab66a990308",
+      "projector_identity": "65021308ab625856de374a1d1caab83554682bf49ecd548b18876c564d71f12c",
+      "qformer_adapter_sha256": "774eba67692d86253f44bf9f76865756155277589868400f7a7fc30f553de911"
+    }
+  },
+  "checkpoint_specs": {
+    "qkv_checkpoint-001000": {
+      "branch": "qkv",
+      "label": "checkpoint-001000",
+      "step": 1000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/checkpoint-001000",
+      "metadata_sha256": "d79c94a79386c48e3997a0b8df06109ad82fbdd71527bf61b87830fc57166632",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 32,
+        "tensor_count": 64,
+        "module_types": [
+          "attn.c_attn"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "qkv_checkpoint-002500": {
+      "branch": "qkv",
+      "label": "checkpoint-002500",
+      "step": 2500,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/checkpoint-002500",
+      "metadata_sha256": "e2c71e8900646f78d639f1b35ec4b86e892140335df19ee28f437077d4abec69",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 32,
+        "tensor_count": 64,
+        "module_types": [
+          "attn.c_attn"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "qkv_final": {
+      "branch": "qkv",
+      "label": "final",
+      "step": 5000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final",
+      "metadata_sha256": "77f6ea49d5f86a8f917f841db38c12fcbf650392221d247bbadf762e3d79c781",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 32,
+        "tensor_count": 64,
+        "module_types": [
+          "attn.c_attn"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "decoder_checkpoint-001000": {
+      "branch": "decoder",
+      "label": "checkpoint-001000",
+      "step": 1000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/checkpoint-001000",
+      "metadata_sha256": "996d27279371599793ff87f137c4059398f3bb6fb4242d511c5ab8029c5d5395",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 160,
+        "tensor_count": 320,
+        "module_types": [
+          "attn.c_attn",
+          "attn.c_proj",
+          "mlp.w1",
+          "mlp.w2",
+          "mlp.c_proj"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "decoder_checkpoint-002500": {
+      "branch": "decoder",
+      "label": "checkpoint-002500",
+      "step": 2500,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/checkpoint-002500",
+      "metadata_sha256": "f6182832576ca38f298c816ed20e1cb169207229c0f6b28492bf5abc52360cc9",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 160,
+        "tensor_count": 320,
+        "module_types": [
+          "attn.c_attn",
+          "attn.c_proj",
+          "mlp.w1",
+          "mlp.w2",
+          "mlp.c_proj"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "decoder_final": {
+      "branch": "decoder",
+      "label": "final",
+      "step": 5000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final",
+      "metadata_sha256": "82cd7f33533bb8517a251745e39816d4f8ba83b57e6c95ac2dbfabe8c82883d5",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 160,
+        "tensor_count": 320,
+        "module_types": [
+          "attn.c_attn",
+          "attn.c_proj",
+          "mlp.w1",
+          "mlp.w2",
+          "mlp.c_proj"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    }
+  },
+  "split_sha256": {
+    "eval": "2f41b8ca22e100ab2c2e5fbfeccf80342fe0bcfd03e797592db43c4209c45aaf"
+  },
+  "splits": {
+    "eval": {
+      "models": {
+        "parent": {
+          "records": 500,
+          "lingo_judge_accuracy": 0.542,
+          "token_f1": 0.31955029855513906,
+          "normalized_exact": 0.004
+        },
+        "qkv_final": {
+          "records": 500,
+          "lingo_judge_accuracy": 0.554,
+          "token_f1": 0.31693690470802505,
+          "normalized_exact": 0.002
+        },
+        "decoder_final": {
+          "records": 500,
+          "lingo_judge_accuracy": 0.544,
+          "token_f1": 0.3196565047961548,
+          "normalized_exact": 0.002
+        }
+      }
+    }
+  },
+  "interpretation": "Same full-SFT parent, original QA, five frames and 5000-update CE budget. Only language LoRA coverage expands; rank remains 16. Historical QKV predictions are reused. The repeatedly used official 500 is not a new blind test.",
+  "dev_report_sha256": "6b1e9a6761488bf52029bbdd2f5a76223501a1e32c36912aff6525ffbaaba594",
+  "selected_checkpoints": {
+    "qkv": "qkv_final",
+    "decoder": "decoder_final"
+  },
+  "selected_model": "qkv_final",
+  "selected_comparison": {
+    "models": {
+      "parent": {
+        "records": 500,
+        "lingo_judge_accuracy": 0.542,
+        "token_f1": 0.31955029855513906,
+        "normalized_exact": 0.004
+      },
+      "qkv_final": {
+        "records": 500,
+        "lingo_judge_accuracy": 0.554,
+        "token_f1": 0.31693690470802505,
+        "normalized_exact": 0.002
+      },
+      "decoder_final": {
+        "records": 500,
+        "lingo_judge_accuracy": 0.544,
+        "token_f1": 0.3196565047961548,
+        "normalized_exact": 0.002
+      }
+    },
+    "paired": {
+      "parent_vs_qkv": {
+        "records": 500,
+        "lingo_judge_correct": {
+          "fixed": 23,
+          "regressed": 17,
+          "net_change_mean": 0.012
+        },
+        "token_f1": {
+          "fixed": 75,
+          "regressed": 83,
+          "net_change_mean": -0.0026133938471141456
+        },
+        "normalized_exact": {
+          "fixed": 0,
+          "regressed": 1,
+          "net_change_mean": -0.002
+        },
+        "unit": "segment_id",
+        "segments": 100,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.012,
+          0.036
+        ]
+      },
+      "parent_vs_decoder": {
+        "records": 500,
+        "lingo_judge_correct": {
+          "fixed": 21,
+          "regressed": 20,
+          "net_change_mean": 0.002
+        },
+        "token_f1": {
+          "fixed": 88,
+          "regressed": 78,
+          "net_change_mean": 0.00010620624101558124
+        },
+        "normalized_exact": {
+          "fixed": 0,
+          "regressed": 1,
+          "net_change_mean": -0.002
+        },
+        "unit": "segment_id",
+        "segments": 100,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.02,
+          0.026
+        ]
+      },
+      "qkv_vs_decoder": {
+        "records": 500,
+        "lingo_judge_correct": {
+          "fixed": 5,
+          "regressed": 10,
+          "net_change_mean": -0.01
+        },
+        "token_f1": {
+          "fixed": 48,
+          "regressed": 38,
+          "net_change_mean": 0.002719600088129727
+        },
+        "normalized_exact": {
+          "fixed": 0,
+          "regressed": 0,
+          "net_change_mean": 0.0
+        },
+        "unit": "segment_id",
+        "segments": 100,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.026,
+          0.004
+        ]
+      }
+    }
+  },
+  "selection_note": "Select each branch from steps 1000/2500/5000 by combined dev Judge; ties choose the earlier step."
+}

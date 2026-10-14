@@ -1,0 +1,491 @@
+{
+  "created_utc": "2026-10-10T09:59:59.760527+00:00",
+  "judge_protocol": "official_lower_strip_maxref_logit_gt0_maxlength128_v1",
+  "selection_split": "dev",
+  "models": {
+    "parent": {
+      "adapter_identity": "a4c0ff24fe3129f8896666966e747653abf92523260e701cf77c925515839526",
+      "projector_identity": "2866220b844ab296ac3133958ad977fdcac768a7d7f0738cd580ada7122fc960",
+      "qformer_adapter_sha256": "709bed56ee90cf6127e4aeceb4d08b161cdb12b6b9b522dc71641c1ea3b73b53"
+    },
+    "qkv_checkpoint-001000": {
+      "adapter_identity": "bc3ad3ea49a0ff571bbe3b74775d3dbb84eb5bdb4a4119598a4a5e6673802933",
+      "projector_identity": "bae430a956596782ccf35ec7e80aa5459b777e6bd21a96ad24dde10ee0e557a9",
+      "qformer_adapter_sha256": "4d339aa1ab241d15182f377874c0a048e7ad036c3cf22cc30199e86de214261b"
+    },
+    "qkv_checkpoint-002500": {
+      "adapter_identity": "504c94dccd5e955639741ee7a3692252a68284734e4a22804d3e737fa119b306",
+      "projector_identity": "5ca5fddfa8f18a209c9b4342bace7ff352075137dc01866e71bb9fdb6503a295",
+      "qformer_adapter_sha256": "09ccaa7657fef695049b6a34228dd3d6298febf6b0750d8e94b52de2146754b7"
+    },
+    "qkv_final": {
+      "adapter_identity": "49ba792d698c0576fa7f8d2c26f69f61f7d574c67566a76084a94afdb6d21bc1",
+      "projector_identity": "fca2896ac9eb7601ee6e4467d952dab1051457166518d7bbe338be793322c432",
+      "qformer_adapter_sha256": "d0456cef4780ee3361cbfeb6362da92a842a61216c45c668cfaede624da464f8"
+    },
+    "decoder_checkpoint-001000": {
+      "adapter_identity": "2573f12222dbf818154ff6197981bd57a4de782ea0969d7e46ffba564755393a",
+      "projector_identity": "0f5761d5693eed862a15894e26c634f8a5d44cbaeee5924e3d1965f929e1c8c0",
+      "qformer_adapter_sha256": "3cac2020318d9f5a808ba9003f9b0792915f0f5cb159d4b57d79cef0a246171a"
+    },
+    "decoder_checkpoint-002500": {
+      "adapter_identity": "85f148dde0f512a37db044ee0bbad342411e900beffb437dbe55c1cd3022201d",
+      "projector_identity": "bb1fe3dbd169a4e35e77b2d0b65adf78be76ac0acaeded8b2f4b8c9c8e3c32bd",
+      "qformer_adapter_sha256": "7538cdf364f92976972cf0465deb6b164cbf71f87f35e2a6a2836485ad21d8e5"
+    },
+    "decoder_final": {
+      "adapter_identity": "97b8956b12533558c669450449822e7c0ac628f09c2754cec750fab66a990308",
+      "projector_identity": "65021308ab625856de374a1d1caab83554682bf49ecd548b18876c564d71f12c",
+      "qformer_adapter_sha256": "774eba67692d86253f44bf9f76865756155277589868400f7a7fc30f553de911"
+    }
+  },
+  "checkpoint_specs": {
+    "qkv_checkpoint-001000": {
+      "branch": "qkv",
+      "label": "checkpoint-001000",
+      "step": 1000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/checkpoint-001000",
+      "metadata_sha256": "d79c94a79386c48e3997a0b8df06109ad82fbdd71527bf61b87830fc57166632",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 32,
+        "tensor_count": 64,
+        "module_types": [
+          "attn.c_attn"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "qkv_checkpoint-002500": {
+      "branch": "qkv",
+      "label": "checkpoint-002500",
+      "step": 2500,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/checkpoint-002500",
+      "metadata_sha256": "e2c71e8900646f78d639f1b35ec4b86e892140335df19ee28f437077d4abec69",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 32,
+        "tensor_count": 64,
+        "module_types": [
+          "attn.c_attn"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "qkv_final": {
+      "branch": "qkv",
+      "label": "final",
+      "step": 5000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_feedback_sft_control_40k_2epoch_v2/final",
+      "metadata_sha256": "77f6ea49d5f86a8f917f841db38c12fcbf650392221d247bbadf762e3d79c781",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 32,
+        "tensor_count": 64,
+        "module_types": [
+          "attn.c_attn"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "decoder_checkpoint-001000": {
+      "branch": "decoder",
+      "label": "checkpoint-001000",
+      "step": 1000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/checkpoint-001000",
+      "metadata_sha256": "996d27279371599793ff87f137c4059398f3bb6fb4242d511c5ab8029c5d5395",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 160,
+        "tensor_count": 320,
+        "module_types": [
+          "attn.c_attn",
+          "attn.c_proj",
+          "mlp.w1",
+          "mlp.w2",
+          "mlp.c_proj"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "decoder_checkpoint-002500": {
+      "branch": "decoder",
+      "label": "checkpoint-002500",
+      "step": 2500,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/checkpoint-002500",
+      "metadata_sha256": "f6182832576ca38f298c816ed20e1cb169207229c0f6b28492bf5abc52360cc9",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 160,
+        "tensor_count": 320,
+        "module_types": [
+          "attn.c_attn",
+          "attn.c_proj",
+          "mlp.w1",
+          "mlp.w2",
+          "mlp.c_proj"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    },
+    "decoder_final": {
+      "branch": "decoder",
+      "label": "final",
+      "step": 5000,
+      "bundle": "/home/zjr/Tracker/internship_project_lab/mpp_driving_video_qa/outputs/mpp_language_lora_decoder_40k_2epoch_v1/final",
+      "metadata_sha256": "82cd7f33533bb8517a251745e39816d4f8ba83b57e6c95ac2dbfabe8c82883d5",
+      "adapter_validation": {
+        "protocol": "peft_suffix_and_saved_ab_coverage_v1",
+        "num_layers": 32,
+        "module_count": 160,
+        "tensor_count": 320,
+        "module_types": [
+          "attn.c_attn",
+          "attn.c_proj",
+          "mlp.w1",
+          "mlp.w2",
+          "mlp.c_proj"
+        ],
+        "r": 16,
+        "alpha": 32
+      }
+    }
+  },
+  "split_sha256": {
+    "action": "014240747fa11038c62951e2003a8cca294672b1e7d7982955d4f0527e58eb30",
+    "scenery": "1ff6db1aa0b5b11f953af035d1cf68a997de917459e5124661b8bf30f088c3ad"
+  },
+  "splits": {
+    "action": {
+      "models": {
+        "parent": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5836538461538462,
+          "token_f1": 0.6725556425375576,
+          "normalized_exact": 0.10384615384615385
+        },
+        "qkv_checkpoint-001000": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5714743589743589,
+          "token_f1": 0.6692466670570213,
+          "normalized_exact": 0.1016025641025641
+        },
+        "qkv_checkpoint-002500": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5826923076923077,
+          "token_f1": 0.6688504638835283,
+          "normalized_exact": 0.09743589743589744
+        },
+        "qkv_final": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5875,
+          "token_f1": 0.6767650555617961,
+          "normalized_exact": 0.10256410256410256
+        },
+        "decoder_checkpoint-001000": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5714743589743589,
+          "token_f1": 0.6687904355767744,
+          "normalized_exact": 0.10192307692307692
+        },
+        "decoder_checkpoint-002500": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.5865384615384616,
+          "token_f1": 0.6703294053997536,
+          "normalized_exact": 0.09871794871794871
+        },
+        "decoder_final": {
+          "records": 3120,
+          "lingo_judge_accuracy": 0.583974358974359,
+          "token_f1": 0.6737742360664476,
+          "normalized_exact": 0.10096153846153846
+        }
+      }
+    },
+    "scenery": {
+      "models": {
+        "parent": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6425,
+          "token_f1": 0.5912517151103857,
+          "normalized_exact": 0.12083333333333333
+        },
+        "qkv_checkpoint-001000": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6475,
+          "token_f1": 0.592295231927667,
+          "normalized_exact": 0.12166666666666667
+        },
+        "qkv_checkpoint-002500": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6508333333333334,
+          "token_f1": 0.5871155606681681,
+          "normalized_exact": 0.11666666666666667
+        },
+        "qkv_final": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6491666666666667,
+          "token_f1": 0.590618083043868,
+          "normalized_exact": 0.11916666666666667
+        },
+        "decoder_checkpoint-001000": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6516666666666666,
+          "token_f1": 0.5939964658954223,
+          "normalized_exact": 0.12333333333333334
+        },
+        "decoder_checkpoint-002500": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.64,
+          "token_f1": 0.5870456626292889,
+          "normalized_exact": 0.11416666666666667
+        },
+        "decoder_final": {
+          "records": 1200,
+          "lingo_judge_accuracy": 0.6566666666666666,
+          "token_f1": 0.5906218748009521,
+          "normalized_exact": 0.11916666666666667
+        }
+      }
+    }
+  },
+  "interpretation": "Same full-SFT parent, original QA, five frames and 5000-update CE budget. Only language LoRA coverage expands; rank remains 16. Historical QKV predictions are reused. The repeatedly used official 500 is not a new blind test.",
+  "dev_combined": {
+    "models": {
+      "parent": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6,
+        "token_f1": 0.6499712182522316,
+        "normalized_exact": 0.10856481481481481
+      },
+      "qkv_checkpoint-001000": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.5925925925925926,
+        "token_f1": 0.6478712684099779,
+        "normalized_exact": 0.10717592592592592
+      },
+      "qkv_checkpoint-002500": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6016203703703704,
+        "token_f1": 0.646146324101483,
+        "normalized_exact": 0.10277777777777777
+      },
+      "qkv_final": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6046296296296296,
+        "token_f1": 0.6528353409734815,
+        "normalized_exact": 0.10717592592592592
+      },
+      "decoder_checkpoint-001000": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.59375,
+        "token_f1": 0.6480143328875091,
+        "normalized_exact": 0.10787037037037037
+      },
+      "decoder_checkpoint-002500": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6013888888888889,
+        "token_f1": 0.6471950324079568,
+        "normalized_exact": 0.10300925925925926
+      },
+      "decoder_final": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6041666666666666,
+        "token_f1": 0.6506763579371423,
+        "normalized_exact": 0.10601851851851851
+      }
+    },
+    "same_step_qkv_vs_decoder": {
+      "checkpoint-001000": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 70,
+          "regressed": 65,
+          "net_change_mean": 0.0011574074074074073
+        },
+        "token_f1": {
+          "fixed": 281,
+          "regressed": 282,
+          "net_change_mean": 0.0001430644775314925
+        },
+        "normalized_exact": {
+          "fixed": 19,
+          "regressed": 16,
+          "net_change_mean": 0.0006944444444444445
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.004153207198892478,
+          0.006786800842499415
+        ]
+      },
+      "checkpoint-002500": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 81,
+          "regressed": 82,
+          "net_change_mean": -0.0002314814814814815
+        },
+        "token_f1": {
+          "fixed": 323,
+          "regressed": 290,
+          "net_change_mean": 0.001048708306474072
+        },
+        "normalized_exact": {
+          "fixed": 24,
+          "regressed": 23,
+          "net_change_mean": 0.0002314814814814815
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.006276150627615063,
+          0.006189821182943604
+        ]
+      },
+      "final": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 67,
+          "regressed": 69,
+          "net_change_mean": -0.000462962962962963
+        },
+        "token_f1": {
+          "fixed": 277,
+          "regressed": 285,
+          "net_change_mean": -0.0021589830363392157
+        },
+        "normalized_exact": {
+          "fixed": 11,
+          "regressed": 16,
+          "net_change_mean": -0.0011574074074074073
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.006323185011709602,
+          0.005606166783461808
+        ]
+      }
+    }
+  },
+  "selected_checkpoints": {
+    "qkv": "qkv_final",
+    "decoder": "decoder_final"
+  },
+  "selected_model": "qkv_final",
+  "selected_comparison": {
+    "models": {
+      "parent": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6,
+        "token_f1": 0.6499712182522316,
+        "normalized_exact": 0.10856481481481481
+      },
+      "qkv_final": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6046296296296296,
+        "token_f1": 0.6528353409734815,
+        "normalized_exact": 0.10717592592592592
+      },
+      "decoder_final": {
+        "records": 4320,
+        "lingo_judge_accuracy": 0.6041666666666666,
+        "token_f1": 0.6506763579371423,
+        "normalized_exact": 0.10601851851851851
+      }
+    },
+    "paired": {
+      "parent_vs_qkv": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 195,
+          "regressed": 175,
+          "net_change_mean": 0.004629629629629629
+        },
+        "token_f1": {
+          "fixed": 728,
+          "regressed": 689,
+          "net_change_mean": 0.002864122721251178
+        },
+        "normalized_exact": {
+          "fixed": 57,
+          "regressed": 63,
+          "net_change_mean": -0.001388888888888889
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.0048320294523699955,
+          0.014094432699083862
+        ]
+      },
+      "parent_vs_decoder": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 201,
+          "regressed": 183,
+          "net_change_mean": 0.004166666666666667
+        },
+        "token_f1": {
+          "fixed": 724,
+          "regressed": 693,
+          "net_change_mean": 0.0007051396849119664
+        },
+        "normalized_exact": {
+          "fixed": 52,
+          "regressed": 63,
+          "net_change_mean": -0.0025462962962962965
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.005547850208044383,
+          0.014162990480612956
+        ]
+      },
+      "qkv_vs_decoder": {
+        "records": 4320,
+        "lingo_judge_correct": {
+          "fixed": 67,
+          "regressed": 69,
+          "net_change_mean": -0.000462962962962963
+        },
+        "token_f1": {
+          "fixed": 277,
+          "regressed": 285,
+          "net_change_mean": -0.0021589830363392157
+        },
+        "normalized_exact": {
+          "fixed": 11,
+          "regressed": 16,
+          "net_change_mean": -0.0011574074074074073
+        },
+        "unit": "segment_id",
+        "segments": 400,
+        "draws": 1000,
+        "net_change_95pct_interval": [
+          -0.006323185011709602,
+          0.005606166783461808
+        ]
+      }
+    }
+  },
+  "selection_note": "Select each branch from steps 1000/2500/5000 by combined dev Judge; ties choose the earlier step."
+}
