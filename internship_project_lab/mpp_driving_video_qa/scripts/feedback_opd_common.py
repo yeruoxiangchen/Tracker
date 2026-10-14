@@ -17,11 +17,13 @@ from scripts.evaluate_answers import load_judge, judge_score
 from scripts.generate_answers import directory_fingerprint
 from mpp_video_qa.opd_runtime import phase
 from mpp_video_qa.lora_expansion import LANGUAGE_LORA_SCOPES, scope_identity
+from mpp_video_qa.question_qformer import add_question_arguments, question_identity_from_args
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def add_runtime_arguments(parser):
+    add_question_arguments(parser)
     parser.add_argument("--data", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--initial-dir", default=str(ROOT / "outputs/mpp_lingoqa_qformer_all_1epoch_v1"))
@@ -98,6 +100,9 @@ def runtime_identity(args):
         result["teacher_mode"] = mode
     if getattr(args, "language_lora_scope", "qkv") != "qkv":
         result["language_lora"] = scope_identity(args.language_lora_scope)
+    question_identity = question_identity_from_args(args)
+    if question_identity:
+        result["question_qformer"] = question_identity
     return result
 
 

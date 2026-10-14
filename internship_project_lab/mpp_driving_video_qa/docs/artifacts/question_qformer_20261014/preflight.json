@@ -1,0 +1,23 @@
+{
+  "completed": true,
+  "records_checked": 44820,
+  "segments": 28099,
+  "max_question_tokens_observed": 29,
+  "question_qformer": {
+    "protocol": "mpp_question_qformer_v1",
+    "mode": "question",
+    "max_question_tokens": 128,
+    "tokenizer": {
+      "class": "BertTokenizer",
+      "do_lower_case": true,
+      "vocab_sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+      "config_sha256": "7160e1553ad2ca51d8c1cb066be533db31826e12d173824c1bb0cb1a4f187d20"
+    },
+    "text_initializer_sha256": "68d45e234eb4a928074dfd868cead0219ab85354cc53d20e772753c6bb9169d3",
+    "initialization": "inherit_trained_visual_keys_fill_text_from_bert_v1",
+    "attention": "bidirectional_query_and_question",
+    "visual_tokens_per_frame": 32
+  },
+  "optimizer_steps_total": 5000,
+  "new_training_started": false
+}

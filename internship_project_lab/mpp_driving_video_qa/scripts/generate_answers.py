@@ -18,6 +18,7 @@ from mpp_video_qa.model import (FEATURE_STAGE_PROJECTED, FEATURE_STAGES,
 from mpp_video_qa.core import PROTOCOL, TASK_INSTRUCTIONS, file_sha256
 from mpp_video_qa.visual_bridge import add_bridge_arguments
 from mpp_video_qa.region_views import add_region_arguments, region_runtime_identity
+from mpp_video_qa.question_qformer import question_identity_from_args
 
 
 def directory_fingerprint(path):
@@ -94,6 +95,9 @@ def main():
         identity.update(precision_protocol=args.precision_protocol, dtype=args.dtype,
                         qformer_mode=args.qformer_mode)
     identity.update(region_runtime_identity(args))
+    question_identity = question_identity_from_args(args)
+    if question_identity:
+        identity["question_qformer"] = question_identity
     manifest_path = output / "run_manifest.json"
     if manifest_path.is_file():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -131,6 +135,9 @@ def main():
         task_instruction=TASK_INSTRUCTIONS[args.task_instruction_version],
         feature_stage=args.feature_stage,
     ).to(device).eval()
+    bridge = getattr(model.backbone, "visual_bridge", None)
+    if getattr(bridge, "question_identity", None) != identity.get("question_qformer"):
+        raise ValueError("loaded question bridge differs from generation metadata; include its .question.json sidecar")
     torch.cuda.reset_peak_memory_stats(device)
     done = len(completed); latencies = []
     with open(destination, "a", encoding="utf-8") as handle:

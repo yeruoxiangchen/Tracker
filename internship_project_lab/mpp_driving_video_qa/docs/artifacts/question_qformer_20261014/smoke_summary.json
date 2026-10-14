@@ -1,0 +1,71 @@
+{
+  "completed": true,
+  "optimizer_steps": 2,
+  "accumulation": 4,
+  "real_qa_visits": 8,
+  "ce_losses": [
+    0.224609375,
+    0.58203125,
+    0.2177734375,
+    0.2080078125,
+    0.466796875,
+    0.375,
+    0.2734375,
+    0.333984375
+  ],
+  "question_qformer": {
+    "protocol": "mpp_question_qformer_v1",
+    "mode": "question",
+    "max_question_tokens": 128,
+    "tokenizer": {
+      "class": "BertTokenizer",
+      "do_lower_case": true,
+      "vocab_sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+      "config_sha256": "7160e1553ad2ca51d8c1cb066be533db31826e12d173824c1bb0cb1a4f187d20"
+    },
+    "text_initializer_sha256": "68d45e234eb4a928074dfd868cead0219ab85354cc53d20e772753c6bb9169d3",
+    "initialization": "inherit_trained_visual_keys_fill_text_from_bert_v1",
+    "attention": "bidirectional_query_and_question",
+    "visual_tokens_per_frame": 32
+  },
+  "initialization": {
+    "protocol": "mpp_question_qformer_v1",
+    "inherited_visual_keys": 256,
+    "inherited_visual_weights_exact": true,
+    "text_keys_initialized": 74,
+    "question_identity": {
+      "protocol": "mpp_question_qformer_v1",
+      "mode": "question",
+      "max_question_tokens": 128,
+      "tokenizer": {
+        "class": "BertTokenizer",
+        "do_lower_case": true,
+        "vocab_sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+        "config_sha256": "7160e1553ad2ca51d8c1cb066be533db31826e12d173824c1bb0cb1a4f187d20"
+      },
+      "text_initializer_sha256": "68d45e234eb4a928074dfd868cead0219ab85354cc53d20e772753c6bb9169d3",
+      "initialization": "inherit_trained_visual_keys_fill_text_from_bert_v1",
+      "attention": "bidirectional_query_and_question",
+      "visual_tokens_per_frame": 32
+    }
+  },
+  "tracked_parameter_deltas": {
+    "language": 1.0007526725530624e-05,
+    "projector": 1.0028481483459473e-05,
+    "qformer": 1.0021030902862549e-05,
+    "qformer_text": 1.0021030902862549e-05
+  },
+  "question_embedding_gradient": 14.718082427978516,
+  "visual_token_change_max": 2.1802916526794434,
+  "complete_checkpoint_keys": true,
+  "checkpoint_reload_weights_exact": true,
+  "generation": "I am accelerating because there is enough space to continue ahead.",
+  "gpu_memory": {
+    "allocated_gib": 15.236680507659912,
+    "reserved_gib": 19.12109375,
+    "max_allocated_gib": 18.839370250701904,
+    "max_reserved_gib": 19.12109375,
+    "mem_get_info_error": "ValueError('Expected a torch.device with a specified index or an integer, but got:cuda')"
+  },
+  "note": "Single-GPU implementation smoke, not four-GPU formal training or benchmark accuracy. Temporary tensor checkpoint was removed."
+}

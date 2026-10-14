@@ -74,6 +74,8 @@ def parse_args():
     args = configure_model(p.parse_args(), train=True)
     if args.language_lora_scope != "qkv" and args.training_mode != "sft_control":
         p.error("expanded language LoRA currently uses the pure CE SFT branch")
+    if args.qformer_text_input == "question" and args.training_mode != "sft_control":
+        p.error("question-input Q-Former uses the pure CE SFT branch")
     if (min(args.lr, args.projector_lr, args.qformer_lr, args.ce_weight, args.opd_weight) <= 0 or
             args.epochs < 1 or args.grad_accumulation < 1 or args.global_batch_size < 0 or args.chunk_tokens < 1 or
             not 0 <= args.warmup_ratio < 1 or args.gradient_bucket_mb < 0 or
@@ -114,6 +116,9 @@ def tracked_parameters(model):
     named = dict(model.named_parameters())
     patterns = {"language": ".lora_B.default.weight", "projector": "llm_proj.weight",
                 "qformer": ".crossattention.self.key.weight"}
+    bridge = getattr(getattr(model, "backbone", None), "visual_bridge", None)
+    if getattr(bridge, "question_input", False):
+        patterns["qformer_text"] = ".encoder.layer.0.intermediate.dense.weight"
     for module in ("attn.c_proj", "mlp.w1", "mlp.w2", "mlp.c_proj"):
         pattern = ".%s.lora_B.default.weight" % module
         if any(pattern in name and p.requires_grad for name, p in named.items()):
@@ -144,6 +149,8 @@ def training_config(args, identity, records, world, total_steps, probe_hash, che
     if checkpoints or args.teacher_mode != "reference_draft":
         config.update(teacher_mode=args.teacher_mode, checkpoint_steps=checkpoints)
     if getattr(args, "language_lora_scope", "qkv") != "qkv":
+        config.update(objective="assistant_only_ce", new_optimizer_and_schedule=True)
+    if "question_qformer" in identity:
         config.update(objective="assistant_only_ce", new_optimizer_and_schedule=True)
     if getattr(args, "global_batch_size", 0):
         config.update(global_batch_size=args.global_batch_size, global_batch_protocol=GLOBAL_BATCH_PROTOCOL)
@@ -254,6 +261,8 @@ def main(args):
         raise ValueError("unfinished run exists; use --resume-from")
     configure_model(args, train=True)
     identity = runtime_identity(args)
+    if "question_qformer" in identity and args.training_mode != "sft_control":
+        raise ValueError("question-input visual bridge currently uses pure SFT")
     probe_hash = training_probe_hash(args, identity)
     dataset = training_dataset(args)
     if args.global_batch_size:
@@ -294,6 +303,10 @@ def main(args):
             print(json.dumps(status), flush=True)
         if rank == loading_rank:
             student = build_student(args, device, train=True)
+            bridge = student.backbone.visual_bridge
+            if getattr(bridge, "initialization_report", None):
+                write_json_atomic(output / ("question_initialization_rank_%d.json" % rank), bridge.initialization_report)
+                print(json.dumps(dict(bridge.initialization_report, status="question_branch_initialized", rank=rank)), flush=True)
             expansion = getattr(student.backbone.llm_model, "_lora_expansion_report", None)
             if expansion:
                 write_json_atomic(output / ("lora_initialization_rank_%d.json" % rank), expansion)
@@ -468,6 +481,10 @@ def main(args):
                    "teacher_tracked_parameter_deltas": frozen_deltas, "gpu_memory_rank0": gpu_memory(device)}
         if args.language_lora_scope != "qkv":
             summary.update(language_lora=config["language_lora"],
+                           trainable_parameters_by_group={g["group_name"]: sum(p.numel() for p in g["params"])
+                                                          for g in optimizer.param_groups})
+        if "question_qformer" in config:
+            summary.update(question_qformer=config["question_qformer"],
                            trainable_parameters_by_group={g["group_name"]: sum(p.numel() for p in g["params"])
                                                           for g in optimizer.param_groups})
         totals = summary["cumulative_metrics"]

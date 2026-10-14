@@ -80,8 +80,20 @@ python3 scripts/export_experiment_snapshot.py
 该checkout实际修改了BaseModel分片加载和Qwen生成／设备兼容；归档在
 `patches/mpp_llava_baf617b_local.patch`。在新机器运行
 `bash scripts/setup_upstream.sh`即可获得相同版本并应用补丁；已应用时只检查。
+它同时连接upstream的cache／ckpt与持久资产目录，使原图视频推理可找到EVA权重。
 配置样例见`configs/environment.yml`和`configs/requirements-runtime.txt`。
 torch2.0.1+cu118、transformers4.39.2、Python3.8为原训练环境；PEFT实际使用0.13.2。
+
+新机器安装（环境与权重分开准备）：
+
+```bash
+conda env create -f configs/environment.yml
+conda activate mpp_llava
+python -m pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+python -m pip install -r configs/requirements-runtime.txt
+bash scripts/setup_upstream.sh
+python -m pip install --no-deps -e ../mpp_llava_video_workspace/third_party/MPP-LLaVA
+```
 
 复现简历实验与保留SFT的主要命令（需要先恢复对应数据和大模型资产）：
 

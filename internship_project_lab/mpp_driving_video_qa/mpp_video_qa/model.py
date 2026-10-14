@@ -149,6 +149,9 @@ def load_projector(backbone, path):
 
 
 def build_text_model(args, train, adapter="", projector=""):
+    if (getattr(args, "qformer_text_input", "auto") == "question" and
+            getattr(args, "feature_stage", FEATURE_STAGE_PROJECTED) != FEATURE_STAGE_EVA):
+        raise ValueError("question-input Q-Former requires original EVA patch features")
     add_upstream(args.upstream_root)
     from lavis.models.base_model import BaseModel
     model = TextBackbone(args)
@@ -175,7 +178,10 @@ def build_text_model(args, train, adapter="", projector=""):
             weights=getattr(args, "qformer_adapter", ""),
             mode=getattr(args, "qformer_mode", "auto"),
             compute_dtype=args.dtype if exact_precision else "fp32",
-            gradient_checkpointing=getattr(args, "qformer_gradient_checkpointing", False))
+            gradient_checkpointing=getattr(args, "qformer_gradient_checkpointing", False),
+            text_input=getattr(args, "qformer_text_input", "auto"),
+            question_max_len=getattr(args, "qformer_question_max_len", 128),
+            text_init=getattr(args, "qformer_text_init", ""))
         if model.visual_bridge.mode == "full" and not exact_precision:
             raise ValueError("full Q-Former weights require --precision-protocol fp32_trainables_v1")
     if projector:
@@ -265,9 +271,10 @@ class CachedVideoQA(nn.Module):
             raise ValueError("unknown feature stage: %s" % feature_stage)
         self.feature_stage = feature_stage
 
-    def _project_visual_features(self, features, target_dtype):
+    def _project_visual_features(self, features, target_dtype, questions=None):
         if self.feature_stage == FEATURE_STAGE_EVA:
-            features = self.backbone.visual_bridge(features)
+            bridge = self.backbone.visual_bridge
+            features = bridge(features, questions=questions) if getattr(bridge, "question_input", False) else bridge(features)
         if self.feature_stage == FEATURE_STAGE_PROJECTED:
             expected = qwen_core(self.backbone.llm_model).config.hidden_size
             if features.shape[-1] != expected:
@@ -302,7 +309,7 @@ class CachedVideoQA(nn.Module):
         mask = input_ids.eq(self.backbone.replace_image_token_id)
         if not torch.all(mask.sum(1).eq(frames * query_tokens)):
             raise RuntimeError("visual placeholder count does not match cached features")
-        visual_features = self._project_visual_features(features, embeddings.dtype)
+        visual_features = self._project_visual_features(features, embeddings.dtype, questions=questions)
         embeddings[mask] = visual_features.reshape(-1, visual_features.shape[-1])
         # Qwen uses re-entrant torch checkpointing.  Because the token
         # embeddings and cached visual features are frozen, its input would

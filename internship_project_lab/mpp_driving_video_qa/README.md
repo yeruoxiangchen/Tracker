@@ -11,6 +11,19 @@ remain under this project.
 
 ## Pipeline
 
+October 14: [question-input Q-Former SFT](docs/question_qformer_sft_20261014.md).
+Restore BERT text modules while inheriting the complete trained visual bridge, projector
+and language QKV LoRA. The original question guides per-frame feature extraction; Qwen
+still receives the original question and 32 visual tokens per frame. Reuse EVA patches and
+the unchanged 40k QA / two-epoch / four-GPU / 5,000-update CE recipe. Full bridge checkpoints
+include question metadata and automatically restore the correct inference path.
+Twelve new CPU tests and fourteen historical regressions passed. All 44,820 QA contracts
+and 28,099 EVA caches were verified. A real single-GPU two-update / accumulation-four smoke
+verified text gradients, all branch updates, question-dependent visual tokens, complete
+save/reload and free generation at 18.84 GiB peak allocated. Formal training and new accuracy
+evaluation have not started. Run `bash scripts/run_question_qformer_sft.sh train`; use
+`status`, `eval_dev`, and `eval_selected` as documented.
+
 Repository snapshot, October 14: [retained SFT, résumé experiments and checkpoint guide](docs/resume_checkpoint_guide_20261014.md).
 The retained CE model scores 60.46% on dev and 55.4% on the repeatedly reused official 500.
 The résumé describes the actual full-SFT parent (60.00% / 54.2%) followed by weight-1

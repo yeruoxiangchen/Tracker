@@ -15,6 +15,7 @@ from mpp_video_qa.core import build_generation_prompt, build_user_prompt, TASK_I
 from mpp_video_qa.model import (build_full_visual_model, build_visual_cache_model,
                                 build_text_model, CachedVideoQA)
 from mpp_video_qa.visual_bridge import add_bridge_arguments
+from mpp_video_qa.question_qformer import question_identity_from_args
 
 
 def read_uniform_frames(path, count):
@@ -49,6 +50,8 @@ def main():
     parser.add_argument("--lora-target-modules", nargs="+", default=["c_attn"])
     parser.add_argument("--task-instruction-version", choices=sorted(TASK_INSTRUCTIONS), default="legacy_v1")
     args = parser.parse_args()
+    if question_identity_from_args(args) and args.precision_protocol != "fp32_trainables_v1":
+        parser.error("question-input video inference requires --precision-protocol fp32_trainables_v1")
     if args.precision_protocol == "fp32_trainables_v1":
         # Use exactly the cached evaluation embedding/generation path, including
         # BF16 storage rounding at the frozen EVA boundary.
